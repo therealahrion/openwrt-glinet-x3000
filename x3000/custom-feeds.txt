@@ -14,20 +14,28 @@
 #
 # Lines starting with '#' and blank lines are ignored.
 
-# adb client (nmeum/android-tools port) with the bInterfaceNumber claim
-# patch needed for the RM520N's non-contiguous USB interface descriptors.
-android-tools           https://github.com/vjt/openwrt-android-tools.git           master  openwrt/android-tools
+# NOTE: this build uses the QModem stack (see feeds.conf) for the modem,
+# so three of vjt's ModemManager-era custom feeds are intentionally gone:
+#
+#   * android-tools (adb/fastboot) — OpenWrt 25.12 added its own base
+#     `adb` package (package/utils/adb), which collides with vjt's
+#     android-tools `adb` and makes the build fail the library-dependency
+#     check. adb is only for shelling into the modem's internal SoC — it's
+#     not part of the pcie_mhi data path — so it's dropped rather than
+#     force-overridden. To add it back later, override base adb via
+#     `scripts/feeds install -f` or rename vjt's package.
+#   * brotli — only existed to satisfy android-tools; gone with it. (The
+#     curl `--without-brotli` patch is dropped too: nothing pulls brotli
+#     into staging any more, so curl can't autodetect it.)
+#   * qfirehose — QModem ships its own qfirehose (1.4.21, newer than vjt's
+#     1.4.17 and integrated with luci-app-qmodem's flash flow), so we let
+#     the QModem feed provide it instead of vjt's fork.
 
-# Brotli 1.1.0 — not in 25.12 feeds, required by android-tools.
-brotli                  https://github.com/vjt/openwrt-android-tools.git           master  openwrt/brotli
-
-# qfirehose 1.4.17 (vjt fork). Upstream Quectel 1.4.11 bricks RM520N.
-qfirehose               https://github.com/vjt/qfirehose.git                       master  openwrt/qfirehose
-
-# Lua AT helpers (5g-info, 5g-monitor, …) + 5g-led-bars procd daemon
-# driving the panel signal LEDs from PCC RSRP + mbim-watchdog C daemon
-# that watches MBIM Connect indications and reissues `ifup` on PDN
-# deactivation. See https://github.com/vjt/quectel-5g-tools.
+# Lua AT helpers (5g-info, 5g-monitor, 5g-lock) + 5g-led-bars procd daemon
+# driving the X3000's panel signal LEDs from PCC/SCC NR-RSRP over the
+# USB-side AT port (/dev/ttyUSB2) — a transport separate from QModem's
+# PCIe /dev/mhi_DUN, so the two coexist. Patched at prepare time (0003)
+# to drop its ModemManager dependency. See https://github.com/vjt/quectel-5g-tools.
 quectel-5g-tools        https://github.com/vjt/quectel-5g-tools.git                master  openwrt/quectel-5g-tools
 
 # Prometheus collector for Wi-Fi dethrash detection across the fleet.

@@ -2,8 +2,9 @@
 CONFIG_TARGET_mediatek=y
 CONFIG_TARGET_mediatek_filogic=y
 CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-x3000=y
-# Custom packages baked into the image (rest pulled from local feed post-flash)
-CONFIG_PACKAGE_adb=y
+# Custom packages baked into the image (rest pulled from local feed post-flash).
+# qfirehose here resolves to QModem's 1.4.21 (the modem-firmware flasher);
+# adb/android-tools are intentionally absent — see x3000/custom-feeds.txt.
 CONFIG_PACKAGE_qfirehose=y
 CONFIG_PACKAGE_quectel-5g-tools=y
 CONFIG_PACKAGE_wifi-dethrash-collector=y

@@ -59,15 +59,6 @@ before it actually comes up and stays up under load:
    `0001-modemmanager-tty-honour-ignore-tty.patch` — is gone with
    it.)
 
-4. **curl autodetects the brotli we keep around for android-tools.**
-   `android-tools` pulls libbrotli into staging, OpenWrt's curl
-   Makefile has no DEPENDS line for it, and curl's configure happily
-   links libcurl against `libbrotlidec.so.1` if it sees the headers
-   — which trips the install-time `.so` sanity check with
-   _"Package libcurl is missing dependencies"_. Patched via
-   `x3000/patches/0002-curl-disable-brotli-autodetect.patch` to pass
-   `--without-brotli` explicitly.
-
 ## What's different from a stock OpenWrt 25.12 build
 
 Commits on top of upstream `openwrt-25.12`:
@@ -79,9 +70,11 @@ Commits on top of upstream `openwrt-25.12`:
     + variant split under `x3000/`)
   * `swap modem stack from umbim+watchdog to ModemManager` (vjt,
     historical)
-  * `patch curl to disable brotli autodetect`
   * the QModem swap (this fork): modem stack moved from
-    ModemManager + mainline MHI to QModem + vendor `pcie_mhi`
+    ModemManager + mainline MHI to QModem + vendor `pcie_mhi`, and
+    vjt's ModemManager-era extras reconciled to the QModem stack
+    (android-tools/adb + brotli dropped, qfirehose switched to
+    QModem's own — see below)
 
 Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
@@ -105,13 +98,10 @@ And adds:
     (ModemManager, luci-proto-modemmanager, dbus/glib2, libmbim,
     mbim-utils and all `kmod-mhi-*` mainline kmods are dropped from
     the config).
-  * **adb + fastboot** (nmeum/android-tools 35.0.2 with a small patch
-    fixing the libusb claim bug for non-contiguous USB interface
-    numbers — the RM520N publishes interfaces 0,1,2,3,5 and the
-    upstream client iterates by array index).
-  * **qfirehose** ([nippynetworks/qfirehose](https://github.com/nippynetworks/qfirehose)
-    1.4.17 packaged for OpenWrt; available on the device for one-off
-    modem firmware flashes, not used at runtime).
+  * **qfirehose** (QModem's own, 1.4.21; available on the device for
+    one-off modem firmware flashes, not used at runtime). vjt's
+    standalone qfirehose 1.4.17 fork is *not* used — QModem's is newer
+    and is what `luci-app-qmodem`'s flash flow expects.
   * **quectel-5g-tools** (Lua AT helpers `5g-info`, `5g-monitor`,
     `5g-lock`, `modem-debug` reading `/dev/ttyUSB2`; the `5g-led-bars`
     procd daemon driving the panel signal LEDs from PCC/SCC NR-RSRP;
@@ -133,6 +123,15 @@ And adds:
   * **procps-ng-ps**: real `ps` replacing busybox's stub, swapped in
     via the OpenWrt alternatives system at `/bin/ps`.
 
+Deliberately **not** carried over from vjt's build: **adb / fastboot**
+(nmeum/android-tools). OpenWrt 25.12 ships its own base `adb`
+(`package/utils/adb`) whose name collides with vjt's android-tools
+`adb`, breaking the library-dependency check. adb only exists here to
+shell into the modem's *internal* SoC over USB — it's not part of the
+`pcie_mhi` data path — so it's dropped rather than force-overridden. To
+add it back, either `scripts/feeds install -f` vjt's android-tools over
+the base package, or rename its package to avoid the clash.
+
 ## Hardware
 
 | Field | Value |
@@ -148,8 +147,7 @@ And adds:
 
   * Linux x86_64 (build also works on aarch64; see below)
   * ~25 GB free disk for the build tree, dl/, build_dir/ and staging_dir/
-  * 8+ GB RAM (toolchain build needs ~6 GB peak, android-tools' BoringSSL
-    + fmt are also memory-hungry)
+  * 8+ GB RAM (toolchain build needs ~6 GB peak)
   * The standard OpenWrt build dependencies — see
     https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem
     On Debian/Ubuntu:
@@ -315,7 +313,7 @@ which tracks fixes — handy during development but not reproducible.
 For production builds, replace each `master` with a commit SHA, e.g.
 
 ```
-android-tools https://github.com/vjt/openwrt-android-tools.git f24c199 openwrt/android-tools
+quectel-5g-tools https://github.com/vjt/quectel-5g-tools.git a1b2c3d openwrt/quectel-5g-tools
 ```
 
 Then `./x3000/prepare.sh` will fetch the repos and check out exactly
@@ -356,8 +354,7 @@ x3000/
                         `feeds install -a`. patch is invoked with
                         --forward and -F 0 so the loop is idempotent
                         AND a context drift is a hard fail. Currently:
-                          * 0001-modemmanager-tty-honour-ignore-tty.patch
-                          * 0002-curl-disable-brotli-autodetect.patch
+                          * 0003-quectel-5g-tools-drop-modemmanager.patch
 target/linux/generic/pending-6.12/
 └── gl-x3000-quectel-pci-id.patch   Kernel patch (commit 8cc71da72a).
 target/linux/mediatek/dts/
