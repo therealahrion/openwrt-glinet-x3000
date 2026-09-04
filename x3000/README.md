@@ -2,27 +2,36 @@
 
 A working OpenWrt 25.12 image for the GL.iNet GL-X3000 (Spitz AX),
 including the kernel and userspace pieces needed to drive the
-Quectel RM520N-GL 5G modem on the mainline `mhi_pci_generic` +
-`mhi_wwan_mbim` path with no proprietary out-of-tree bits, with
-ModemManager owning the data plane.
+Quectel RM520N-GL 5G modem on the Quectel *vendor* `pcie_mhi` path —
+the same out-of-tree MHI driver stack GL.iNet's stock firmware uses,
+packaged by the [QModem](https://github.com/FUjr/QModem) feed. It
+exposes the stock-style device nodes (`/dev/mhi_DUN` for AT,
+`/dev/mhi_QMI0` for QMI, an `rmnet_mhi0` netdev for data);
+`quectel-CM` dials under qmodem's control and `luci-app-qmodem` is
+the UI. (Upstream vjt drives the same modem on the mainline
+`mhi_pci_generic` + `mhi_wwan_mbim` + ModemManager path instead —
+that's the main delta of this fork.)
 
 ## Why this fork exists
 
 The GL.iNet stock firmware ships an old OpenWrt 21.02 + kernel 5.4
 + a vendor-patched `pcie_mhi` driver that's never been upstreamed.
 Vanilla OpenWrt 25.12 (kernel 6.12) supports the rest of the device
-out of the box but needs four small fixes before the modem actually
-comes up, stays up under load, and lets us keep using our own AT
-helpers alongside ModemManager:
+out of the box, but the modem needs a driver stack plus a few fixes
+before it actually comes up and stays up under load:
 
-1. **`mhi_pci_generic` doesn't recognise the RM520N-GL's PCI ID.**
-   Quectel's silicon variant in this device reports the Qualcomm
-   vendor ID + a Qualcomm subvendor ID (0x17cb / 0x0308 / 0x17cb /
-   0x5201) instead of Quectel's own. Mainline `mhi_pci_generic`
-   doesn't list that combination, so the modem never enumerates as
-   an MHI device. We carry a 12-line kernel patch under
+1. **The modem needs an MHI driver that claims its PCI ID.** This
+   fork uses QModem's `kmod-pcie_mhi` — Quectel's vendor driver
+   (v1.4, with kernel 6.12 support), which matches `17cb:0308`
+   (SDX62) with *no* subsystem-ID restriction, so the GLAP variant
+   in this device (subsystem `17cb:5201`) enumerates without any
+   kernel patching. For the mainline alternative, we still carry
+   vjt's 12-line patch under
    `target/linux/generic/pending-6.12/gl-x3000-quectel-pci-id.patch`
-   that adds it.
+   that teaches `mhi_pci_generic` the `0x17cb/0x0308/0x17cb/0x5201`
+   combination — it's inert while `kmod-mhi-pci-generic` isn't in
+   the build, but keeps the door open for A/B testing the mainline
+   stack.
 
 2. **PCIe runtime PM races with MHI's startup ramp.** When the root
    port is allowed to take the modem into D3hot during early MHI
@@ -32,21 +41,23 @@ helpers alongside ModemManager:
    reboot recovers — runtime sysfs toggles like `power/control=on`
    reach the device too late. We pin `pcie_port_pm=off` in the
    chosen bootargs (`target/linux/mediatek/dts/mt7981a-glinet-gl-x3000-xe3000-common.dtsi`)
-   so the kernel never tries to take the link down.
+   so the kernel never tries to take the link down. (vjt observed
+   this on the *mainline* driver; the vendor driver forces the link
+   awake around doorbells like the stock firmware does, so this is
+   belt-and-braces here — kept because it costs nothing on always-on
+   router hardware.)
 
-3. **ModemManager has no port blacklist without udev.** OpenWrt's
-   ModemManager package is built with `-Dudev=false` and gets its
-   port discovery via `/etc/hotplug.d/{tty,net,wwan}/25-modemmanager-*`
-   shell scripts that call `mmcli --report-kernel-event`. There's no
-   equivalent of udev's `ID_MM_DEVICE_IGNORE` blacklist in this
-   build, so MM grabs every tty it sees — including the RM520N's
-   USB-side `/dev/ttyUSB[0-3]` (DIAG/NMEA/AT/AT2), which our
-   `quectel-5g-tools` helpers (`5g-info`, `5g-monitor`, `5g-lock`,
-   `5g-led-bars`) need to talk raw AT to. We patch the tty hotplug
-   script via `x3000/patches/0001-modemmanager-tty-honour-ignore-tty.patch`
-   to honour an `/etc/modemmanager/ignore-tty` allow-list (shipped
-   by `quectel-5g-tools`) so MM keeps managing only the MHI control
-   surface (`/dev/wwan0at0`, `/dev/wwan0mbim0`).
+3. **Exactly one owner per AT port.** QModem's daemons
+   (`ubus-at-daemon`, `tom_modem`) own the PCIe-side AT channel
+   `/dev/mhi_DUN`; the `quectel-5g-tools` helpers (`5g-info`,
+   `5g-monitor`, `5g-lock`, `5g-led-bars`) keep talking to the
+   USB-side `/dev/ttyUSB2`. Two different physical paths into the
+   same modem, so they don't contend on a port — but don't point
+   both stacks at the same node, and expect confusion if both issue
+   conflicting mode/band commands. (ModemManager is not in this
+   image at all, so upstream vjt's patched MM tty-hotplug scheme —
+   `0001-modemmanager-tty-honour-ignore-tty.patch` — is gone with
+   it.)
 
 4. **curl autodetects the brotli we keep around for android-tools.**
    `android-tools` pulls libbrotli into staging, OpenWrt's curl
@@ -62,11 +73,15 @@ helpers alongside ModemManager:
 Commits on top of upstream `openwrt-25.12`:
 
   * `mhi_pci_generic: claim Quectel RM520N-GL with Qualcomm subvendor IDs`
+    (inert while the mainline MHI kmods aren't built — see above)
   * `mediatek: glinet gl-x3000: disable PCIe runtime PM via pcie_port_pm=off`
   * `x3000: persistent build configuration` (the build-prep machinery
     + variant split under `x3000/`)
-  * `swap modem stack from umbim+watchdog to ModemManager`
+  * `swap modem stack from umbim+watchdog to ModemManager` (vjt,
+    historical)
   * `patch curl to disable brotli autodetect`
+  * the QModem swap (this fork): modem stack moved from
+    ModemManager + mainline MHI to QModem + vendor `pcie_mhi`
 
 Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
@@ -80,12 +95,16 @@ recipe pulls in:
 
 And adds:
 
-  * **ModemManager + libmm-glib + dbus + luci-proto-modemmanager.**
-    MM owns the data plane: connect/reconnect, PIN unlock, signal
-    monitoring, RAT change handling, carrier-side disconnect
-    recovery. Replaces a previous DIY approach (umbim + a custom
-    `mbim-watchdog`) that couldn't reliably catch silent idle-timer
-    drops on this firmware.
+  * **QModem** ([FUjr/QModem](https://github.com/FUjr/QModem), pinned
+    by commit in `x3000/feeds.conf`): `qmodem` core + `modem_scan`
+    discovery + `luci-app-qmodem` UI, dialing via `quectel-CM-5G-M`,
+    AT plumbing via `ubus-at-daemon`/`tom_modem`/`sms-tool_q`, and —
+    the point of the exercise — **`kmod-pcie_mhi`**, Quectel's vendor
+    MHI driver producing stock-firmware-style `/dev/mhi_*` nodes.
+    Replaces upstream vjt's ModemManager + mainline-MHI stack
+    (ModemManager, luci-proto-modemmanager, dbus/glib2, libmbim,
+    mbim-utils and all `kmod-mhi-*` mainline kmods are dropped from
+    the config).
   * **adb + fastboot** (nmeum/android-tools 35.0.2 with a small patch
     fixing the libusb claim bug for non-contiguous USB interface
     numbers — the RM520N publishes interfaces 0,1,2,3,5 and the
@@ -96,13 +115,16 @@ And adds:
   * **quectel-5g-tools** (Lua AT helpers `5g-info`, `5g-monitor`,
     `5g-lock`, `modem-debug` reading `/dev/ttyUSB2`; the `5g-led-bars`
     procd daemon driving the panel signal LEDs from PCC/SCC NR-RSRP;
-    a Prometheus collector; the `/etc/modemmanager/ignore-tty`
-    config telling our patched MM hotplug script which tty ports
-    to leave alone).
+    a Prometheus collector). Patched at prepare time
+    (`x3000/patches/0003-quectel-5g-tools-drop-modemmanager.patch`) to
+    drop its `+modemmanager` dependency and omit the `5g-watchdog`
+    daemon — that piece drives recovery through `mmcli` +
+    `proto=modemmanager` and is meaningless without MM; session
+    recovery is quectel-CM's job under QModem. Still ships an inert
+    `/etc/modemmanager/ignore-tty` file — harmless, MM isn't
+    installed.
   * **pciutils + usbutils** (lspci / lsusb baked in for diagnosing
     modem PCIe / USB topology).
-  * **libmbim + mbim-utils**: pulled in by ModemManager and kept
-    available for diagnostics (`mbimcli`, `mbim-proxy`).
   * **speedtest-go**, **wifi-dethrash-collector**.
   * **telegraf-full** — *private variant only*. Useful if you've got
     a metrics endpoint to push to. Toggled in `x3000/config.private`;
@@ -348,21 +370,52 @@ target/linux/mediatek/dts/
 
 ## Post-flash modem config
 
-Sysupgrade preserves `/etc/config/*`, so the `network.wwan` section
-ends up whatever the previous image set it to. For a clean MM
-attach, set it manually after first boot:
+First boot sanity checks, in order:
 
 ```sh
-uci set network.wwan.proto='modemmanager'
-uci set network.wwan.device="$(readlink -f /sys/class/wwan/wwan0mbim0/device/../../..)"
-uci set network.wwan.apn='<your-apn>'
-uci set network.wwan.auth='none'
-uci set network.wwan.iptype='ipv4v6'
-uci commit network
-ifup wwan
+lspci -nn                    # expect 17cb:0308 (subsystem 17cb:5201)
+lsmod | grep pcie_mhi        # vendor driver loaded (init.d/pcie_mhi, START=70)
+ls /dev/mhi_*                # expect mhi_DUN / mhi_QMI0 / mhi_DIAG / ...
+ip link | grep rmnet         # rmnet_mhi0 data netdev
 ```
 
-The `device` field must point at the modem's PHYSICAL parent
-(PCI device for MHI, USB device for cdc-wdm) — not its wwan/usbmisc
-child. The `readlink ... /../..` form above resolves to the right
-place for the GL-X3000's PCIe-attached RM520N.
+Then configure the modem in LuCI: **Modem → QModem** (from
+`luci-app-qmodem`). `modem_scand` discovers the PCIe modem and binds
+it to its slot; set APN / PDP type / auth there and dial. QModem
+drives `quectel-CM` (the 5G-M fork) for the data session and manages
+the interface it creates.
+
+Quick AT smoke test without the UI (QModem's CLI AT tool, against
+the PCIe AT channel):
+
+```sh
+tom_modem -d /dev/mhi_DUN -c "ATI"
+```
+
+If `lspci` shows nothing in the modem slot or `/dev/mhi_*` never
+appears, check the modem hasn't been switched to USB data mode —
+from the USB AT port:
+
+```sh
+tom_modem -d /dev/ttyUSB2 -c 'AT+QCFG="data_interface"'   # 0,0 = USB mode
+tom_modem -d /dev/ttyUSB2 -c 'AT+QCFG="data_interface",1,0'  # set PCIe
+```
+
+then power-cycle the router (takes effect on modem reboot). Stock
+GL.iNet units ship in PCIe mode already, so this only bites if the
+modem was reconfigured or firmware-flashed along the way.
+
+Two migration gotchas:
+
+  * **Coming from a vjt/ModemManager image:** sysupgrade preserves
+    `/etc/config/*`, so a leftover `network.wwan` section with
+    `proto='modemmanager'` will reference a proto that no longer
+    exists. Delete or repurpose it (`uci delete network.wwan;
+    uci commit network`) and let QModem manage its own interface.
+  * **Coming from stock GL.iNet firmware:** flash WITHOUT keeping
+    settings — the stock config schema isn't compatible.
+
+The USB-side serial ports (`/dev/ttyUSB0-3`) still enumerate via
+`option`, so `quectel-5g-tools` (`5g-info`, `5g-monitor`,
+`5g-led-bars`) keep working unchanged on `/dev/ttyUSB2` alongside
+QModem on `/dev/mhi_DUN`.

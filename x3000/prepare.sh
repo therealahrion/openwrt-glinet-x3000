@@ -22,17 +22,20 @@
 #      /feeds.conf's `src-link custom` references.
 #   3. Copies x3000/feeds.conf -> /feeds.conf so OpenWrt's `feeds update`
 #      sees the standard 25.12 feeds plus our custom symlinks.
-#   4. Composes /.config from x3000/config.common + x3000/config.<variant>
-#      and runs `make defconfig` to expand it into a full config tree.
-#   5. Wipes /files/ and rebuilds it from x3000/files-common/ +
+#   4. Wipes /files/ and rebuilds it from x3000/files-common/ +
 #      x3000/files-<variant>/, so swapping variants leaves no stale
 #      overlay files behind.
-#   6. Records the active variant in /.x3000-variant for build.sh and
+#   5. Records the active variant in /.x3000-variant for build.sh and
 #      sanity checks.
-#   7. Runs `./scripts/feeds update -a && ./scripts/feeds install -a` so
+#   6. Runs `./scripts/feeds update -a && ./scripts/feeds install -a` so
 #      every Makefile is symlinked into package/feeds/.
-#   8. Applies x3000/patches/*.patch against feed-side files (modemmanager
-#      tty hotplug etc.).
+#   7. Applies x3000/patches/*.patch against feed-side files.
+#   8. Composes /.config from x3000/config.common + x3000/config.<variant>
+#      and runs `make defconfig` to expand it into a full config tree.
+#      This MUST come after feeds install: defconfig silently drops
+#      CONFIG_PACKAGE_* symbols it doesn't know yet, so composing before
+#      the feeds exist strips every feed package from the build on a
+#      fresh tree (first run / CI).
 
 set -euo pipefail
 
@@ -147,26 +150,6 @@ echo "==> Installing feeds.conf"
 sed "s|^src-link custom feeds-local\$|src-link custom $LOCAL|" \
     "$FEEDS_CONF_SRC" > "$ROOT/feeds.conf"
 
-# --- Compose .config from common + variant --------------------------------
-
-echo "==> Composing .config from config.common + config.$VARIANT$([ -f "$CONFIG_VARIANT_LOCAL" ] && echo " + config.$VARIANT.local")"
-{
-    cat "$CONFIG_COMMON"
-    echo
-    echo "# --- variant: $VARIANT ---"
-    cat "$CONFIG_VARIANT"
-    # Per-builder additions: x3000/config.<variant>.local is a gitignored
-    # slot for CONFIG_PACKAGE_… selections specific to your private build
-    # (e.g. private packages from custom-feeds.<variant>.local, or extra
-    # tooling you don't want in the public image).
-    if [[ -f "$CONFIG_VARIANT_LOCAL" ]]; then
-        echo
-        echo "# --- variant: $VARIANT.local ---"
-        cat "$CONFIG_VARIANT_LOCAL"
-    fi
-} > "$ROOT/.config"
-make defconfig FORCE=1 >/dev/null
-
 # --- Compose files/ overlay from files-common + files-<variant> ----------
 
 echo "==> Composing files/ from files-common + files-$VARIANT"
@@ -204,10 +187,11 @@ echo "==> feeds install -a"
 # --- Apply unified-diff patches against feed contents ---------------------
 #
 # OpenWrt's quilt-based patch system applies to upstream package SOURCES,
-# not to the OpenWrt-side `files/` overlays each package ships. We
-# nonetheless need to tweak one such file (modemmanager's tty hotplug,
-# see x3000/patches/0001-modemmanager-tty-honour-ignore-tty.patch for
-# the why), so we apply our patches here against the relevant feed paths.
+# not to the OpenWrt-side packaging files (feed Makefiles, `files/`
+# overlays). We nonetheless need to tweak those in a couple of places —
+# the curl feed Makefile (0002) and the quectel-5g-tools Makefile inside
+# its .build-deps/ checkout (0003) — so we apply our patches here against
+# the relevant paths under the build root.
 #
 # Idempotent: if a patch is already applied (e.g. re-running prepare.sh
 # without `feeds update -a` having happened in between), we detect that
@@ -235,6 +219,31 @@ if [[ -d "$PATCH_DIR" ]]; then
         fi
     done
 fi
+
+# --- Compose .config from common + variant --------------------------------
+#
+# Deliberately AFTER feeds install: `make defconfig` silently drops any
+# CONFIG_PACKAGE_* symbol whose package isn't known yet, so running it
+# before package/feeds/ is populated strips every feed package (qmodem,
+# custom, luci, …) from the build on a fresh tree.
+
+echo "==> Composing .config from config.common + config.$VARIANT$([ -f "$CONFIG_VARIANT_LOCAL" ] && echo " + config.$VARIANT.local")"
+{
+    cat "$CONFIG_COMMON"
+    echo
+    echo "# --- variant: $VARIANT ---"
+    cat "$CONFIG_VARIANT"
+    # Per-builder additions: x3000/config.<variant>.local is a gitignored
+    # slot for CONFIG_PACKAGE_… selections specific to your private build
+    # (e.g. private packages from custom-feeds.<variant>.local, or extra
+    # tooling you don't want in the public image).
+    if [[ -f "$CONFIG_VARIANT_LOCAL" ]]; then
+        echo
+        echo "# --- variant: $VARIANT.local ---"
+        cat "$CONFIG_VARIANT_LOCAL"
+    fi
+} > "$ROOT/.config"
+make defconfig FORCE=1 >/dev/null
 
 echo
 echo "Done. variant=$VARIANT"

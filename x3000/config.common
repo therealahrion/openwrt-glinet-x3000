@@ -13,32 +13,52 @@ CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT="/usr/local/go"
 # CONFIG_GOLANG_BUILD_BOOTSTRAP is not set
 # Speedtest-go binary (Go-based) for on-device speed checks.
 CONFIG_PACKAGE_speedtest-go=y
-# Modem stack: ModemManager driving MBIM over PCIe MHI (mainline
-# mhi_pci_generic + mhi_wwan_mbim). MM owns the data plane (connect,
-# reconnect on carrier-side disconnect, RAT change, signal monitoring,
-# PIN unlock); netifd's `proto modemmanager` is the bridge.
+# Modem stack: QModem driving the Quectel *vendor* pcie_mhi driver —
+# the same MHI stack GL.iNet's stock firmware uses. It exposes the
+# stock-style device nodes (/dev/mhi_DUN for AT, /dev/mhi_QMI0 for QMI,
+# an rmnet netdev for data) instead of the mainline wwan framework's
+# /dev/wwan0at0 + /dev/wwan0mbim0. quectel-CM (Tom's 5G-M fork) dials
+# under qmodem's control; luci-app-qmodem is the UI.
 #
-# We tell MM to ignore /dev/ttyUSB[0-3] via /etc/modemmanager/ignore-tty
-# (consumed by a patched 25-modemmanager-tty hotplug script — see
-# x3000/prepare.sh) so quectel-5g-tools keeps owning the AT port for our
-# 5g-info / 5g-monitor / 5g-lock / 5g-led-bars helpers. MM drives the
-# MHI control surface (/dev/wwan0at0, /dev/wwan0mbim0) which is plenty.
-CONFIG_PACKAGE_kmod-mhi-bus=y
-CONFIG_PACKAGE_kmod-mhi-net=y
-CONFIG_PACKAGE_kmod-mhi-pci-generic=y
-CONFIG_PACKAGE_kmod-mhi-wwan-ctrl=y
-CONFIG_PACKAGE_kmod-mhi-wwan-mbim=y
-CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
-CONFIG_PACKAGE_kmod-wwan=y
-CONFIG_PACKAGE_modemmanager=y
-CONFIG_PACKAGE_dbus=y
-CONFIG_PACKAGE_glib2=y
-CONFIG_PACKAGE_luci-proto-modemmanager=y
-# MM auto-pulls libmbim+libqmi via deps; keep these enabled so the proxy
-# binary + mbimcli are available for diagnostics and so libmbim ABI is
-# present for libmm-glib clients.
-CONFIG_PACKAGE_libmbim=y
-CONFIG_PACKAGE_mbim-utils=y
+# The mainline stack (kmod-mhi-pci-generic + kmod-mhi-wwan-* +
+# ModemManager) is deliberately ABSENT: both drivers match the RM520N's
+# PCI ID 17cb:0308 and whichever binds first owns the modem. The vendor
+# driver (v1.4, kernel 6.12 support) matches 17cb:0308 with no
+# subsystem-ID restriction, so the GLAP variant (subsystem 17cb:5201)
+# enumerates without extra patches; the kernel-side
+# gl-x3000-quectel-pci-id.patch stays in the tree but is inert while
+# kmod-mhi-pci-generic isn't built.
+#
+# qmodem hard-deps pull the USB-side stack (usb-serial-option for
+# /dev/ttyUSB[0-3], cdc-ether/mbim/ncm/rndis) so USB fallback dialing
+# stays possible; the VENDOR qmi-wwan choice below adds Quectel's
+# qmi_wwan_q for USB QMI.
+CONFIG_PACKAGE_qmodem=y
+CONFIG_PACKAGE_luci-app-qmodem=y
+CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_ADD_PCI_SUPPORT=y
+CONFIG_PACKAGE_luci-app-qmodem_VENDOR_MHI_PCIe_DRIVER=y
+CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_vendor-qmi-wwan=y
+CONFIG_PACKAGE_luci-app-qmodem_USE_TOM_CUSTOMIZED_QUECTEL_CM=y
+CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_ADD_QFIREHOSE_SUPPORT=y
+# Belt-and-braces: name the driver + dialer directly too, so the image
+# still contains them even if the luci-app-qmodem config plumbing ever
+# drifts upstream.
+CONFIG_PACKAGE_kmod-pcie_mhi=y
+CONFIG_PACKAGE_quectel-CM-5G-M=y
+# qmodem-seal is QModem's encrypted-feedback (bug-report) helper; not
+# needed on-box.
+# CONFIG_PACKAGE_qmodem_INCLUDE_SEAL is not set
+# The GL-X3000 device profile default-includes the mainline generic
+# qmi_wwan (kmod-usb-net-qmi-wwan) + uqmi. Generic qmi_wwan matches
+# the same RM520N USB interfaces as the vendor qmi_wwan_q above, and
+# whichever probes first claims the USB QMI data interface — kick the
+# generic one out so the vendor driver owns USB QMI, mirroring the
+# PCIe-side one-driver-per-transport rule. uqmi has to go with it:
+# it hard-depends on (kconfig-selects) the generic driver, which
+# would drag it straight back in. QModem's stack (quectel-CM +
+# tom_modem/ubus-at-daemon) covers everything uqmi did here.
+# CONFIG_PACKAGE_kmod-usb-net-qmi-wwan is not set
+# CONFIG_PACKAGE_uqmi is not set
 # Hardware enumeration tools (lspci / lsusb) for diagnosing modem topology.
 CONFIG_PACKAGE_pciutils=y
 CONFIG_PACKAGE_usbutils=y
@@ -147,3 +167,7 @@ CONFIG_PACKAGE_wpad-mbedtls=y
 # line commented-out, so apk silently ignores it but the build infra
 # still knows custom packages are selectable.
 CONFIG_FEED_custom=m
+# Same treatment for the qmodem feed: no
+# downloads.openwrt.org/releases/<v>/packages/<arch>/qmodem/ exists, so
+# =m keeps the distfeeds line commented-out instead of breaking apk.
+CONFIG_FEED_qmodem=m
