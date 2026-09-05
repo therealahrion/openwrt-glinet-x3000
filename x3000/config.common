@@ -19,7 +19,7 @@ CONFIG_PACKAGE_speedtest-go=y
 # stock-style device nodes (/dev/mhi_DUN for AT, /dev/mhi_QMI0 for QMI,
 # an rmnet netdev for data) instead of the mainline wwan framework's
 # /dev/wwan0at0 + /dev/wwan0mbim0. quectel-CM (Tom's 5G-M fork) dials
-# under qmodem's control; luci-app-qmodem is the UI.
+# under qmodem's control; luci-app-qmodem-next is the UI (see swap note).
 #
 # The mainline stack (kmod-mhi-pci-generic + kmod-mhi-wwan-* +
 # ModemManager) is deliberately ABSENT: both drivers match the RM520N's
@@ -35,17 +35,36 @@ CONFIG_PACKAGE_speedtest-go=y
 # stays possible; the VENDOR qmi-wwan choice below adds Quectel's
 # qmi_wwan_q for USB QMI.
 CONFIG_PACKAGE_qmodem=y
-CONFIG_PACKAGE_luci-app-qmodem=y
-CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_ADD_PCI_SUPPORT=y
-CONFIG_PACKAGE_luci-app-qmodem_VENDOR_MHI_PCIe_DRIVER=y
-CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_vendor-qmi-wwan=y
-CONFIG_PACKAGE_luci-app-qmodem_USE_TOM_CUSTOMIZED_QUECTEL_CM=y
-CONFIG_PACKAGE_luci-app-qmodem_INCLUDE_ADD_QFIREHOSE_SUPPORT=y
-# Belt-and-braces: name the driver + dialer directly too, so the image
-# still contains them even if the luci-app-qmodem config plumbing ever
-# drifts upstream.
+# UI swap (2026-09-05): the modern JS UI replaces luci-app-qmodem.
+# CRITICAL context for future edits: the OLD app's Package/config menu
+# DEFINED the driver-selection symbols (INCLUDE_ADD_PCI_SUPPORT,
+# VENDOR_MHI_PCIe_DRIVER, INCLUDE_vendor-qmi-wwan, USE_TOM_..._CM,
+# INCLUDE_ADD_QFIREHOSE_SUPPORT, the ndisc6 choice). With the old app
+# unset those symbols cease to exist and defconfig silently drops them —
+# so everything they used to derive is pinned DIRECTLY below. Never
+# re-enable luci-app-qmodem alongside -next (both own /etc/config/qmodem).
+CONFIG_PACKAGE_luci-app-qmodem-next=y
+# CONFIG_PACKAGE_luci-app-qmodem is not set
+# Direct pins — the modem stack named explicitly (formerly derived from
+# the old app's menu; pciutils + qfirehose were already direct elsewhere):
 CONFIG_PACKAGE_kmod-pcie_mhi=y
 CONFIG_PACKAGE_quectel-CM-5G-M=y
+CONFIG_PACKAGE_kmod-qmi_wwan_q=y
+CONFIG_PACKAGE_kmod-qmi_wwan_f=y
+CONFIG_PACKAGE_kmod-qmi_wwan_s=y
+CONFIG_PACKAGE_ndisc6=y
+# QModem feature set (2026-09-05 full-feed audit, see docs/): link
+# watchdog + its JS page (a next-family app — depends on -next), the SMS
+# forwarding daemon (hard dep of -next, pinned for clarity; the SMS UI
+# itself is built into -next), and the standalone fw4 TTL tool (inert
+# until configured). Old-UI-tied subapps (luci-app-qmodem-sms/-mwan/-ttl)
+# stay OUT: they hard-depend on the removed old app. -hc is other
+# vendors' SIM-switch hardware; rmnet-nss is Qualcomm-only silicon;
+# qmodem-seal (telemetry) stays out on privacy grounds.
+CONFIG_PACKAGE_qmodem_monitor=y
+CONFIG_PACKAGE_luci-app-qmodem-monitor=y
+CONFIG_PACKAGE_sms-forwarder-next=y
+CONFIG_PACKAGE_luci-app-qmodem-ttlfw4=y
 # qmodem-seal is QModem's encrypted-feedback (bug-report) helper; not
 # needed on-box.
 # CONFIG_PACKAGE_qmodem_INCLUDE_SEAL is not set
@@ -98,9 +117,16 @@ CONFIG_PACKAGE_kmod-tcp-bbr=y
 # TUN/TAP driver for OpenVPN and other tun-based VPNs. Baked in because
 # kmods can't be apk-add-ed later on a custom SNAPSHOT build: the official
 # kmod feed is keyed to the exact kernel vermagic/hash, which our build
-# does not match. WireGuard tunnels use the in-kernel kmod-wireguard
-# (pulled in by the wireguard-tools userland when needed). (#3)
+# does not match. (#3)
 CONFIG_PACKAGE_kmod-tun=y
+# WireGuard, baked platform-ready (2026-09-05): the kmod is vermagic-
+# locked, so it MUST be in the image to ever be usable — it stays fully
+# inert until a wg interface is configured. kmod-wireguard pulls the
+# aarch64 NEON chacha20/poly1305 crypto automatically; wireguard-tools +
+# luci-proto-wireguard make it usable from CLI and LuCI with no rebuild.
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
 CONFIG_PACKAGE_libattr=y
 CONFIG_PACKAGE_libexpat=y
 CONFIG_PACKAGE_libffi=y
@@ -223,6 +249,17 @@ CONFIG_PACKAGE_xdpdump=y
 # not packaged in OpenWrt); bake its runtime deps so it just works.
 CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_fping=y
+# --- Platform-ready additions (dormant; 2026-09-05) -------------------
+# ply: a tiny eBPF/BTF dynamic tracer (mini-bpftrace) for on-device
+# profiling — turns the baked BTF into actual measurement. Dormant: a
+# CLI tool, does nothing until run.
+CONFIG_PACKAGE_ply=y
+# zram compressed-RAM swap, platform-ready. kmod-zram is vermagic-locked
+# (must be in-image); zram-swap is the userspace init. Shipped DISABLED
+# via files-common/etc/uci-defaults/99-zram-disabled (the package init
+# auto-enables otherwise). Enable: /etc/init.d/zram enable; service zram start
+CONFIG_PACKAGE_kmod-zram=y
+CONFIG_PACKAGE_zram-swap=y
 
 # `src-link custom feeds-local` in feeds.conf is a build-only symlink
 # feed (vjt forks pulled in by x3000/prepare.sh). Defconfig would set

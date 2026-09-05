@@ -1,0 +1,9 @@
+#!/bin/sh
+# Ship zram-swap DORMANT (platform-ready, lever-off). The zram-swap
+# package's init (START=15) auto-enables compressed swap on boot; this
+# disables it so the capability is present but inactive until chosen.
+# Runs once on first boot after each flash (uci-defaults semantics).
+# Enable later:  /etc/init.d/zram enable && service zram start
+/etc/init.d/zram disable 2>/dev/null
+/etc/init.d/zram stop 2>/dev/null
+exit 0
