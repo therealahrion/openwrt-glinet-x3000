@@ -36,7 +36,10 @@
 # USB-side AT port (/dev/ttyUSB2) — a transport separate from QModem's
 # PCIe /dev/mhi_DUN, so the two coexist. Patched at prepare time (0003)
 # to drop its ModemManager dependency. See https://github.com/vjt/quectel-5g-tools.
-quectel-5g-tools        https://github.com/vjt/quectel-5g-tools.git                master  openwrt/quectel-5g-tools
+# Pinned to a commit (not master): master drifted 2026-09 — upstream added a
+# 5g-cell-lock init line that broke patch 0003 hunk #3. Bump deliberately and
+# refresh 0003 when you want newer upstream.
+quectel-5g-tools        https://github.com/vjt/quectel-5g-tools.git                e709ca45ba75c242bc168f9ae4808a798bb0f9c9  openwrt/quectel-5g-tools
 
 # Prometheus collector for Wi-Fi dethrash detection across the fleet.
 wifi-dethrash-collector https://github.com/vjt/openwrt-dethrash.git                master  openwrt/wifi-dethrash-collector

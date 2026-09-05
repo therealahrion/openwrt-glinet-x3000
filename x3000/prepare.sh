@@ -109,9 +109,15 @@ process_feed_list() {
 
         git -C "$clone_dir" fetch --quiet origin
         git -C "$clone_dir" -c advice.detachedHead=false checkout --quiet "$ref"
-        # If $ref is a branch, fast-forward; if it's a SHA the pull is a no-op.
+        # Force the working tree to exactly $ref, discarding any leftover edits
+        # from a previous run — e.g. a patch that applied some hunks before a
+        # later one failed. Without this the next run can't re-apply cleanly.
+        # Branch refs fast-forward to the fetched tip; SHAs/tags reset in place
+        # (the branch-only reset used to skip SHA pins, leaving partial state).
         if git -C "$clone_dir" rev-parse --verify --quiet "refs/remotes/origin/$ref" >/dev/null; then
             git -C "$clone_dir" reset --hard --quiet "origin/$ref"
+        else
+            git -C "$clone_dir" reset --hard --quiet "$ref"
         fi
 
         src_dir="$clone_dir/$subdir"
