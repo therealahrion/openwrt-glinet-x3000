@@ -83,6 +83,17 @@ CONFIG_PACKAGE_e2fsprogs=y
 CONFIG_PACKAGE_dosfstools=y
 CONFIG_PACKAGE_exfat-fsck=y
 CONFIG_PACKAGE_exfat-mkfs=y
+# TCP BBR congestion control. This symbol builds net/ipv4/tcp_bbr.c; the
+# tree carries target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch, which
+# replaces that file with Google's BBRv3 (CachyOS/ptr1337 backport, applies
+# clean on 6.12.103 — verified 0 rejects, and no overlap with OpenWrt's
+# generic TCP patches). So the `bbr` algorithm this package registers IS v3;
+# v1 and v3 can't coexist in one kernel. It governs only the router's OWN
+# TCP flows (its own downloads/updates), not forwarded client traffic. NOTE:
+# this package ships /etc/sysctl.d/12-tcp-bbr.conf (active), making bbr the
+# BOOT DEFAULT for router-local TCP — true since vjt's builds; now it's v3.
+# files-common/etc/sysctl.d/30-tcp-bbr.conf documents this and carries a
+# commented one-line opt-out back to CUBIC.
 CONFIG_PACKAGE_kmod-tcp-bbr=y
 # TUN/TAP driver for OpenVPN and other tun-based VPNs. Baked in because
 # kmods can't be apk-add-ed later on a custom SNAPSHOT build: the official
@@ -158,6 +169,60 @@ CONFIG_PACKAGE_dnsmasq-full=y
 # Wireless - add full wpad for 802.11r
 # CONFIG_PACKAGE_wpad-basic-mbedtls is not set
 CONFIG_PACKAGE_wpad-mbedtls=y
+
+# --- eBPF / XDP / QoS laboratory --------------------------------------
+# Kernel-side eBPF surface, baked at build time because KERNEL_* options
+# and kmods can never be installed post-flash on a custom build (the
+# official kmod feed never matches our vermagic). Base BPF + JIT are
+# already enabled in OpenWrt's generic 6.12 config; these unlock the
+# rest: tracing (kprobes/perf), cgroup-bpf, AF_XDP sockets, and BTF so
+# CO-RE eBPF binaries (bpftool, custom libbpf/xdp tools) run on-device.
+# BTF adds a few MB to the kernel (32 MB kernel partition: fine) and
+# pulls the in-tree pahole host build (tools/dwarves).
+CONFIG_KERNEL_CGROUP_BPF=y
+CONFIG_KERNEL_BPF_EVENTS=y
+CONFIG_KERNEL_KPROBES=y
+CONFIG_KERNEL_PERF_EVENTS=y
+CONFIG_KERNEL_XDP_SOCKETS=y
+CONFIG_KERNEL_DEBUG_INFO=y
+# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+CONFIG_KERNEL_DEBUG_INFO_BTF=y
+CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
+# Every qdisc/classifier kmod the QoS experiments need: cake (used by
+# BOTH sqm and qosify), the eBPF classifier hook, ifb for ingress
+# shaping, and the classic scheduler set for anything else.
+CONFIG_PACKAGE_kmod-sched-core=y
+CONFIG_PACKAGE_kmod-sched=y
+CONFIG_PACKAGE_kmod-sched-cake=y
+CONFIG_PACKAGE_kmod-sched-bpf=y
+CONFIG_PACKAGE_kmod-ifb=y
+CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
+# eBPF programs (qosify's classifier, libxdp) are compiled at BUILD
+# time by clang targeting BPF. Use the build host's clang — WSL and the
+# CI workflow both install it. (BPF_TOOLCHAIN_PREBUILT requires a
+# manually seeded llvm-bpf/ tarball and silently degrades to compiling
+# LLVM from source when absent; HOST is the sane choice. DEVEL exposes
+# the toolchain choice to defconfig.)
+CONFIG_DEVEL=y
+CONFIG_BPF_TOOLCHAIN_HOST=y
+# Userspace: BOTH QoS managers baked so A/B testing is a service
+# toggle, not a rebuild — run only ONE at a time (each wants to own
+# cake on the WAN). qosify ships with no interface configured, so it
+# stays inert until /etc/config/qosify gets one; sqm ships disabled.
+# sqm-scripts drags in iptables (legacy) for its ipopt bits — accepted.
+CONFIG_PACKAGE_luci-app-sqm=y
+CONFIG_PACKAGE_qosify=y
+# tc with eBPF loading support, replacing the default tiny tc.
+CONFIG_PACKAGE_tc-bpf=y
+# CONFIG_PACKAGE_tc-tiny is not set
+CONFIG_PACKAGE_libbpf=y
+CONFIG_PACKAGE_bpftool-full=y
+CONFIG_PACKAGE_xdp-loader=y
+CONFIG_PACKAGE_xdpdump=y
+# cake-autorate is a bash script installed on the device later (it is
+# not packaged in OpenWrt); bake its runtime deps so it just works.
+CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_fping=y
 
 # `src-link custom feeds-local` in feeds.conf is a build-only symlink
 # feed (vjt forks pulled in by x3000/prepare.sh). Defconfig would set
