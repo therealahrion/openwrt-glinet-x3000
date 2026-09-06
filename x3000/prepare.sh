@@ -29,13 +29,14 @@
 #      sanity checks.
 #   6. Runs `./scripts/feeds update -a && ./scripts/feeds install -a` so
 #      every Makefile is symlinked into package/feeds/.
-#   7. Applies x3000/patches/*.patch against feed-side files.
+#   7. Applies x3000/patches/*.patch against feed-side files (modemmanager
+#      tty hotplug etc.).
 #   8. Composes /.config from x3000/config.common + x3000/config.<variant>
 #      and runs `make defconfig` to expand it into a full config tree.
 #      This MUST come after feeds install: defconfig silently drops
 #      CONFIG_PACKAGE_* symbols it doesn't know yet, so composing before
 #      the feeds exist strips every feed package from the build on a
-#      fresh tree (first run / CI).
+#      fresh tree (first run after a clone / CI).
 
 set -euo pipefail
 
@@ -109,15 +110,9 @@ process_feed_list() {
 
         git -C "$clone_dir" fetch --quiet origin
         git -C "$clone_dir" -c advice.detachedHead=false checkout --quiet "$ref"
-        # Force the working tree to exactly $ref, discarding any leftover edits
-        # from a previous run — e.g. a patch that applied some hunks before a
-        # later one failed. Without this the next run can't re-apply cleanly.
-        # Branch refs fast-forward to the fetched tip; SHAs/tags reset in place
-        # (the branch-only reset used to skip SHA pins, leaving partial state).
+        # If $ref is a branch, fast-forward; if it's a SHA the pull is a no-op.
         if git -C "$clone_dir" rev-parse --verify --quiet "refs/remotes/origin/$ref" >/dev/null; then
             git -C "$clone_dir" reset --hard --quiet "origin/$ref"
-        else
-            git -C "$clone_dir" reset --hard --quiet "$ref"
         fi
 
         src_dir="$clone_dir/$subdir"
@@ -193,11 +188,10 @@ echo "==> feeds install -a"
 # --- Apply unified-diff patches against feed contents ---------------------
 #
 # OpenWrt's quilt-based patch system applies to upstream package SOURCES,
-# not to the OpenWrt-side packaging files (feed Makefiles, `files/`
-# overlays). We nonetheless need to tweak those in a couple of places —
-# the curl feed Makefile (0002) and the quectel-5g-tools Makefile inside
-# its .build-deps/ checkout (0003) — so we apply our patches here against
-# the relevant paths under the build root.
+# not to the OpenWrt-side `files/` overlays each package ships. We
+# nonetheless need to tweak one such file (modemmanager's tty hotplug,
+# see x3000/patches/0001-modemmanager-tty-honour-ignore-tty.patch for
+# the why), so we apply our patches here against the relevant feed paths.
 #
 # Idempotent: if a patch is already applied (e.g. re-running prepare.sh
 # without `feeds update -a` having happened in between), we detect that
@@ -230,8 +224,10 @@ fi
 #
 # Deliberately AFTER feeds install: `make defconfig` silently drops any
 # CONFIG_PACKAGE_* symbol whose package isn't known yet, so running it
-# before package/feeds/ is populated strips every feed package (qmodem,
-# custom, luci, …) from the build on a fresh tree.
+# before package/feeds/ is populated strips every feed package (the
+# custom feed, luci, packages, …) from the build on a fresh tree — the
+# first prepare.sh run after a clone used to produce an image missing
+# quectel-5g-tools, wifi-dethrash-collector and every other feed package.
 
 echo "==> Composing .config from config.common + config.$VARIANT$([ -f "$CONFIG_VARIANT_LOCAL" ] && echo " + config.$VARIANT.local")"
 {

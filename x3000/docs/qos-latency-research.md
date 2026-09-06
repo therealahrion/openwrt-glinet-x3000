@@ -850,3 +850,14 @@ L4S/DualPI2: [RFC 9332](https://datatracker.ietf.org/doc/rfc9332/),
 [cake-autorate](https://github.com/lynxthecat/cake-autorate) ·
 Tree facts (sch_fq in kmod-sched, fq_codel default, pie/fq-pie packaged,
 no dualpi2/prague/etf) verified directly against this repo's 25.12 checkout.
+
+## Branch state (2026-09-06): lean tree
+
+`openwrt-25.12` was reset to **vjt's latest tree + the lean optimization
+overlay** — see `x3000/docs/lean-overlay.md` for the exact contents and
+verification. QModem, qosify, sqm, zram, the modem-stack toggle and the
+rmnet MTU hotplug from the sections above are gone from this branch;
+they remain in git history (`ec64d13e08` and earlier). The research and
+field findings above stay valid as reference — the QModem-specific fixes
+(#1 MTU, #2 driver audit, #4 AT-MTU) do not apply to the ModemManager/
+MBIM data path this tree now builds.

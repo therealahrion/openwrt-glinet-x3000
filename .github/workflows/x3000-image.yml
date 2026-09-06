@@ -1,7 +1,8 @@
 name: Build X3000 image
 
 # Builds the public-variant GL-X3000 sysupgrade image (OpenWrt 25.12,
-# kernel 6.12, QModem vendor pcie_mhi modem stack).
+# kernel 6.12): vjt's stock modem stack (ModemManager + mainline MHI)
+# plus the lean optimization overlay — see x3000/docs/lean-overlay.md.
 #
 #   * manual runs:  Actions tab -> "Build X3000 image" -> Run workflow
 #   * tag runs:     push a tag matching x3000-r* (e.g. x3000-r1) to also
@@ -81,23 +82,21 @@ jobs:
           echo "CONFIG_CCACHE=y" >> .config
           make defconfig
 
-      # Fail fast (before ~4h of compiling) if the modem stack composed
-      # wrong: vendor pcie_mhi must be in, the mainline MHI/MM stack out.
+      # Fail fast (before ~4h of compiling) if the composition is wrong:
+      # vjt's stock modem stack must be in, the lean overlay must be in,
+      # and the excluded stacks (QModem, qosify/sqm, zram, tc-tiny) out.
       - name: Sanity-check composed .config
         run: |
           set -e
-          grep -q '^CONFIG_PACKAGE_kmod-pcie_mhi=y' .config
-          grep -q '^CONFIG_PACKAGE_qmodem=y' .config
-          grep -q '^CONFIG_PACKAGE_luci-app-qmodem=y' .config
-          grep -q '^CONFIG_PACKAGE_quectel-CM-5G-M=y' .config
-          if grep -q '^CONFIG_PACKAGE_kmod-mhi-pci-generic=y' .config; then
-            echo "mainline kmod-mhi-pci-generic leaked into the config" >&2
-            exit 1
-          fi
-          if grep -q '^CONFIG_PACKAGE_modemmanager=y' .config; then
-            echo "modemmanager leaked into the config" >&2
-            exit 1
-          fi
+          for s in modemmanager kmod-mhi-pci-generic luci-proto-modemmanager quectel-5g-tools \
+                   kmod-tcp-bbr kmod-sched-cake kmod-sched-bpf kmod-ifb tc-bpf libbpf \
+                   bpftool-full xdp-loader xdpdump fping kmod-wireguard luci-proto-wireguard; do
+            grep -q "^CONFIG_PACKAGE_$s=y" .config || { echo "missing: $s" >&2; exit 1; }
+          done
+          for s in qmodem kmod-pcie_mhi qosify sqm-scripts luci-app-sqm kmod-zram zram-swap tc-tiny ply; do
+            if grep -q "^CONFIG_PACKAGE_$s=y" .config; then echo "leaked in: $s" >&2; exit 1; fi
+          done
+          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-x3000=y' .config
           echo "config OK"
 

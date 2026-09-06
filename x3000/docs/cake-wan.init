@@ -1,0 +1,70 @@
+#!/bin/sh /etc/rc.common
+#
+# cake-wan — Phase-1 hand-driven cake shaper for the lean image (no sqm,
+# no qosify). NOT installed by apply.sh: the lever stays OFF until you
+# choose to pull it. To use, after baselining (Waveform bufferbloat +
+# a game session) with NO shaper:
+#
+#   scp cake-wan.init root@router:/etc/init.d/cake-wan
+#   ssh root@router 'chmod +x /etc/init.d/cake-wan; vi /etc/init.d/cake-wan'  # set the numbers
+#   ssh root@router '/etc/init.d/cake-wan enable; /etc/init.d/cake-wan start'
+#   ssh root@router 'tc -s qdisc show dev wwan0; tc -s qdisc show dev ifb4wwan0'
+#
+# Needs (all baked by the overlay): kmod-sched-cake, kmod-ifb,
+# kmod-sched-core (cls_u32/act_mirred/sch_ingress), tc-bpf.
+#
+# vjt's stack: the WAN netdev is the mainline MBIM interface wwan0
+# (ModemManager reconnects keep the same netdev, so a qdisc on it
+# survives redials; re-run 'start' if the interface is ever recreated).
+#
+# Starting point for T-Mobile 5G (tune from YOUR baseline numbers):
+#   * bandwidth: ~85-90% of measured DOWN, ~85-90% of measured UP.
+#   * cellular link: no fixed link-layer overhead worth encoding; leave
+#     'overhead' out (cake 'raw'), let cake-autorate move bandwidth later.
+#   * nat + dual-srchost/dual-dsthost: per-LAN-host fairness through NAT/CLAT.
+#   * ack-filter on egress helps an asymmetric uplink; 'ingress' on the
+#     ifb side tells cake it is shaping the far end of the bottleneck.
+#   * diffserv3 (default) honours DSCP for game/voice marks; besteffort
+#     if you find the carrier remarks everything anyway.
+
+START=99
+STOP=10
+
+WAN="wwan0"
+UP_KBIT="20000"        # <-- set: ~0.9 x your measured upload kbit/s
+DOWN_KBIT="250000"     # <-- set: ~0.9 x your measured download kbit/s
+IFB="ifb4${WAN}"
+EGRESS_OPTS="nat dual-srchost ack-filter"
+INGRESS_OPTS="nat dual-dsthost ingress"
+
+start() {
+    [ -d "/sys/class/net/$WAN" ] || { logger -t cake-wan "no $WAN yet, skipping"; return 0; }
+
+    # Egress (upload): cake straight on the WAN root.
+    tc qdisc replace dev "$WAN" root cake bandwidth "${UP_KBIT}kbit" $EGRESS_OPTS
+
+    # Ingress (download): redirect everything arriving on WAN into an ifb,
+    # shape there. u32 match-all is what sqm-scripts uses (cls_u32 is in
+    # kmod-sched-core; no dependency on cls_matchall).
+    ip link add "$IFB" type ifb 2>/dev/null
+    ip link set "$IFB" up
+    tc qdisc replace dev "$WAN" handle ffff: ingress
+    tc filter replace dev "$WAN" parent ffff: protocol all prio 10 u32 \
+        match u32 0 0 flowid 1:1 action mirred egress redirect dev "$IFB"
+    tc qdisc replace dev "$IFB" root cake bandwidth "${DOWN_KBIT}kbit" $INGRESS_OPTS
+
+    logger -t cake-wan "cake up: $WAN egress ${UP_KBIT}kbit [$EGRESS_OPTS]; $IFB ingress ${DOWN_KBIT}kbit [$INGRESS_OPTS]"
+}
+
+stop() {
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    tc qdisc del dev "$WAN" ingress 2>/dev/null
+    tc qdisc del dev "$IFB" root 2>/dev/null
+    ip link del "$IFB" 2>/dev/null
+    logger -t cake-wan "cake removed from $WAN"
+}
+
+restart() {
+    stop
+    start
+}

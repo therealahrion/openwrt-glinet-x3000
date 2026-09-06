@@ -2,9 +2,8 @@
 CONFIG_TARGET_mediatek=y
 CONFIG_TARGET_mediatek_filogic=y
 CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-x3000=y
-# Custom packages baked into the image (rest pulled from local feed post-flash).
-# qfirehose here resolves to QModem's 1.4.21 (the modem-firmware flasher);
-# adb/android-tools are intentionally absent — see x3000/custom-feeds.txt.
+# Custom packages baked into the image (rest pulled from local feed post-flash)
+CONFIG_PACKAGE_adb=y
 CONFIG_PACKAGE_qfirehose=y
 CONFIG_PACKAGE_quectel-5g-tools=y
 CONFIG_PACKAGE_wifi-dethrash-collector=y
@@ -14,71 +13,32 @@ CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT="/usr/local/go"
 # CONFIG_GOLANG_BUILD_BOOTSTRAP is not set
 # Speedtest-go binary (Go-based) for on-device speed checks.
 CONFIG_PACKAGE_speedtest-go=y
-# Modem stack: QModem driving the Quectel *vendor* pcie_mhi driver —
-# the same MHI stack GL.iNet's stock firmware uses. It exposes the
-# stock-style device nodes (/dev/mhi_DUN for AT, /dev/mhi_QMI0 for QMI,
-# an rmnet netdev for data) instead of the mainline wwan framework's
-# /dev/wwan0at0 + /dev/wwan0mbim0. quectel-CM (Tom's 5G-M fork) dials
-# under qmodem's control; luci-app-qmodem-next is the UI (see swap note).
+# Modem stack: ModemManager driving MBIM over PCIe MHI (mainline
+# mhi_pci_generic + mhi_wwan_mbim). MM owns the data plane (connect,
+# reconnect on carrier-side disconnect, RAT change, signal monitoring,
+# PIN unlock); netifd's `proto modemmanager` is the bridge.
 #
-# The mainline stack (kmod-mhi-pci-generic + kmod-mhi-wwan-* +
-# ModemManager) is deliberately ABSENT: both drivers match the RM520N's
-# PCI ID 17cb:0308 and whichever binds first owns the modem. The vendor
-# driver (v1.4, kernel 6.12 support) matches 17cb:0308 with no
-# subsystem-ID restriction, so the GLAP variant (subsystem 17cb:5201)
-# enumerates without extra patches; the kernel-side
-# gl-x3000-quectel-pci-id.patch stays in the tree but is inert while
-# kmod-mhi-pci-generic isn't built.
-#
-# qmodem hard-deps pull the USB-side stack (usb-serial-option for
-# /dev/ttyUSB[0-3], cdc-ether/mbim/ncm/rndis) so USB fallback dialing
-# stays possible; the VENDOR qmi-wwan choice below adds Quectel's
-# qmi_wwan_q for USB QMI.
-CONFIG_PACKAGE_qmodem=y
-# UI swap (2026-09-05): the modern JS UI replaces luci-app-qmodem.
-# CRITICAL context for future edits: the OLD app's Package/config menu
-# DEFINED the driver-selection symbols (INCLUDE_ADD_PCI_SUPPORT,
-# VENDOR_MHI_PCIe_DRIVER, INCLUDE_vendor-qmi-wwan, USE_TOM_..._CM,
-# INCLUDE_ADD_QFIREHOSE_SUPPORT, the ndisc6 choice). With the old app
-# unset those symbols cease to exist and defconfig silently drops them —
-# so everything they used to derive is pinned DIRECTLY below. Never
-# re-enable luci-app-qmodem alongside -next (both own /etc/config/qmodem).
-CONFIG_PACKAGE_luci-app-qmodem-next=y
-# CONFIG_PACKAGE_luci-app-qmodem is not set
-# Direct pins — the modem stack named explicitly (formerly derived from
-# the old app's menu; pciutils + qfirehose were already direct elsewhere):
-CONFIG_PACKAGE_kmod-pcie_mhi=y
-CONFIG_PACKAGE_quectel-CM-5G-M=y
-CONFIG_PACKAGE_kmod-qmi_wwan_q=y
-CONFIG_PACKAGE_kmod-qmi_wwan_f=y
-CONFIG_PACKAGE_kmod-qmi_wwan_s=y
-CONFIG_PACKAGE_ndisc6=y
-# QModem feature set (2026-09-05 full-feed audit, see docs/): link
-# watchdog + its JS page (a next-family app — depends on -next), the SMS
-# forwarding daemon (hard dep of -next, pinned for clarity; the SMS UI
-# itself is built into -next), and the standalone fw4 TTL tool (inert
-# until configured). Old-UI-tied subapps (luci-app-qmodem-sms/-mwan/-ttl)
-# stay OUT: they hard-depend on the removed old app. -hc is other
-# vendors' SIM-switch hardware; rmnet-nss is Qualcomm-only silicon;
-# qmodem-seal (telemetry) stays out on privacy grounds.
-CONFIG_PACKAGE_qmodem_monitor=y
-CONFIG_PACKAGE_luci-app-qmodem-monitor=y
-CONFIG_PACKAGE_sms-forwarder-next=y
-CONFIG_PACKAGE_luci-app-qmodem-ttlfw4=y
-# qmodem-seal is QModem's encrypted-feedback (bug-report) helper; not
-# needed on-box.
-# CONFIG_PACKAGE_qmodem_INCLUDE_SEAL is not set
-# The GL-X3000 device profile default-includes the mainline generic
-# qmi_wwan (kmod-usb-net-qmi-wwan) + uqmi. Generic qmi_wwan matches
-# the same RM520N USB interfaces as the vendor qmi_wwan_q above, and
-# whichever probes first claims the USB QMI data interface — kick the
-# generic one out so the vendor driver owns USB QMI, mirroring the
-# PCIe-side one-driver-per-transport rule. uqmi has to go with it:
-# it hard-depends on (kconfig-selects) the generic driver, which
-# would drag it straight back in. QModem's stack (quectel-CM +
-# tom_modem/ubus-at-daemon) covers everything uqmi did here.
-# CONFIG_PACKAGE_kmod-usb-net-qmi-wwan is not set
-# CONFIG_PACKAGE_uqmi is not set
+# We tell MM to ignore /dev/ttyUSB[0-3] via /etc/modemmanager/ignore-tty
+# (consumed by a patched 25-modemmanager-tty hotplug script — see
+# x3000/prepare.sh) so quectel-5g-tools keeps owning the AT port for our
+# 5g-info / 5g-monitor / 5g-lock / 5g-led-bars helpers. MM drives the
+# MHI control surface (/dev/wwan0at0, /dev/wwan0mbim0) which is plenty.
+CONFIG_PACKAGE_kmod-mhi-bus=y
+CONFIG_PACKAGE_kmod-mhi-net=y
+CONFIG_PACKAGE_kmod-mhi-pci-generic=y
+CONFIG_PACKAGE_kmod-mhi-wwan-ctrl=y
+CONFIG_PACKAGE_kmod-mhi-wwan-mbim=y
+CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+CONFIG_PACKAGE_kmod-wwan=y
+CONFIG_PACKAGE_modemmanager=y
+CONFIG_PACKAGE_dbus=y
+CONFIG_PACKAGE_glib2=y
+CONFIG_PACKAGE_luci-proto-modemmanager=y
+# MM auto-pulls libmbim+libqmi via deps; keep these enabled so the proxy
+# binary + mbimcli are available for diagnostics and so libmbim ABI is
+# present for libmm-glib clients.
+CONFIG_PACKAGE_libmbim=y
+CONFIG_PACKAGE_mbim-utils=y
 # Hardware enumeration tools (lspci / lsusb) for diagnosing modem topology.
 CONFIG_PACKAGE_pciutils=y
 CONFIG_PACKAGE_usbutils=y
@@ -102,31 +62,13 @@ CONFIG_PACKAGE_e2fsprogs=y
 CONFIG_PACKAGE_dosfstools=y
 CONFIG_PACKAGE_exfat-fsck=y
 CONFIG_PACKAGE_exfat-mkfs=y
-# TCP BBR congestion control. This symbol builds net/ipv4/tcp_bbr.c; the
-# tree carries target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch, which
-# replaces that file with Google's BBRv3 (CachyOS/ptr1337 backport, applies
-# clean on 6.12.103 — verified 0 rejects, and no overlap with OpenWrt's
-# generic TCP patches). So the `bbr` algorithm this package registers IS v3;
-# v1 and v3 can't coexist in one kernel. It governs only the router's OWN
-# TCP flows (its own downloads/updates), not forwarded client traffic. NOTE:
-# this package ships /etc/sysctl.d/12-tcp-bbr.conf (active), making bbr the
-# BOOT DEFAULT for router-local TCP — true since vjt's builds; now it's v3.
-# files-common/etc/sysctl.d/30-tcp-bbr.conf documents this and carries a
-# commented one-line opt-out back to CUBIC.
 CONFIG_PACKAGE_kmod-tcp-bbr=y
 # TUN/TAP driver for OpenVPN and other tun-based VPNs. Baked in because
 # kmods can't be apk-add-ed later on a custom SNAPSHOT build: the official
 # kmod feed is keyed to the exact kernel vermagic/hash, which our build
-# does not match. (#3)
+# does not match. WireGuard tunnels use the in-kernel kmod-wireguard
+# (pulled in by the wireguard-tools userland when needed). (#3)
 CONFIG_PACKAGE_kmod-tun=y
-# WireGuard, baked platform-ready (2026-09-05): the kmod is vermagic-
-# locked, so it MUST be in the image to ever be usable — it stays fully
-# inert until a wg interface is configured. kmod-wireguard pulls the
-# aarch64 NEON chacha20/poly1305 crypto automatically; wireguard-tools +
-# luci-proto-wireguard make it usable from CLI and LuCI with no rebuild.
-CONFIG_PACKAGE_kmod-wireguard=y
-CONFIG_PACKAGE_wireguard-tools=y
-CONFIG_PACKAGE_luci-proto-wireguard=y
 CONFIG_PACKAGE_libattr=y
 CONFIG_PACKAGE_libexpat=y
 CONFIG_PACKAGE_libffi=y
@@ -196,71 +138,6 @@ CONFIG_PACKAGE_dnsmasq-full=y
 # CONFIG_PACKAGE_wpad-basic-mbedtls is not set
 CONFIG_PACKAGE_wpad-mbedtls=y
 
-# --- eBPF / XDP / QoS laboratory --------------------------------------
-# Kernel-side eBPF surface, baked at build time because KERNEL_* options
-# and kmods can never be installed post-flash on a custom build (the
-# official kmod feed never matches our vermagic). Base BPF + JIT are
-# already enabled in OpenWrt's generic 6.12 config; these unlock the
-# rest: tracing (kprobes/perf), cgroup-bpf, AF_XDP sockets, and BTF so
-# CO-RE eBPF binaries (bpftool, custom libbpf/xdp tools) run on-device.
-# BTF adds a few MB to the kernel (32 MB kernel partition: fine) and
-# pulls the in-tree pahole host build (tools/dwarves).
-CONFIG_KERNEL_CGROUP_BPF=y
-CONFIG_KERNEL_BPF_EVENTS=y
-CONFIG_KERNEL_KPROBES=y
-CONFIG_KERNEL_PERF_EVENTS=y
-CONFIG_KERNEL_XDP_SOCKETS=y
-CONFIG_KERNEL_DEBUG_INFO=y
-# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
-CONFIG_KERNEL_DEBUG_INFO_BTF=y
-CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
-# Every qdisc/classifier kmod the QoS experiments need: cake (used by
-# BOTH sqm and qosify), the eBPF classifier hook, ifb for ingress
-# shaping, and the classic scheduler set for anything else.
-CONFIG_PACKAGE_kmod-sched-core=y
-CONFIG_PACKAGE_kmod-sched=y
-CONFIG_PACKAGE_kmod-sched-cake=y
-CONFIG_PACKAGE_kmod-sched-bpf=y
-CONFIG_PACKAGE_kmod-ifb=y
-CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
-# eBPF programs (qosify's classifier, libxdp) are compiled at BUILD
-# time by clang targeting BPF. Use the build host's clang — WSL and the
-# CI workflow both install it. (BPF_TOOLCHAIN_PREBUILT requires a
-# manually seeded llvm-bpf/ tarball and silently degrades to compiling
-# LLVM from source when absent; HOST is the sane choice. DEVEL exposes
-# the toolchain choice to defconfig.)
-CONFIG_DEVEL=y
-CONFIG_BPF_TOOLCHAIN_HOST=y
-# Userspace: BOTH QoS managers baked so A/B testing is a service
-# toggle, not a rebuild — run only ONE at a time (each wants to own
-# cake on the WAN). qosify ships with no interface configured, so it
-# stays inert until /etc/config/qosify gets one; sqm ships disabled.
-# sqm-scripts drags in iptables (legacy) for its ipopt bits — accepted.
-CONFIG_PACKAGE_luci-app-sqm=y
-CONFIG_PACKAGE_qosify=y
-# tc with eBPF loading support, replacing the default tiny tc.
-CONFIG_PACKAGE_tc-bpf=y
-# CONFIG_PACKAGE_tc-tiny is not set
-CONFIG_PACKAGE_libbpf=y
-CONFIG_PACKAGE_bpftool-full=y
-CONFIG_PACKAGE_xdp-loader=y
-CONFIG_PACKAGE_xdpdump=y
-# cake-autorate is a bash script installed on the device later (it is
-# not packaged in OpenWrt); bake its runtime deps so it just works.
-CONFIG_PACKAGE_bash=y
-CONFIG_PACKAGE_fping=y
-# --- Platform-ready additions (dormant; 2026-09-05) -------------------
-# ply: a tiny eBPF/BTF dynamic tracer (mini-bpftrace) for on-device
-# profiling — turns the baked BTF into actual measurement. Dormant: a
-# CLI tool, does nothing until run.
-CONFIG_PACKAGE_ply=y
-# zram compressed-RAM swap, platform-ready. kmod-zram is vermagic-locked
-# (must be in-image); zram-swap is the userspace init. Shipped DISABLED
-# via files-common/etc/uci-defaults/99-zram-disabled (the package init
-# auto-enables otherwise). Enable: /etc/init.d/zram enable; service zram start
-CONFIG_PACKAGE_kmod-zram=y
-CONFIG_PACKAGE_zram-swap=y
-
 # `src-link custom feeds-local` in feeds.conf is a build-only symlink
 # feed (vjt forks pulled in by x3000/prepare.sh). Defconfig would set
 # CONFIG_FEED_custom=y, which makes the apk image step template
@@ -270,7 +147,84 @@ CONFIG_PACKAGE_zram-swap=y
 # line commented-out, so apk silently ignores it but the build infra
 # still knows custom packages are selectable.
 CONFIG_FEED_custom=m
-# Same treatment for the qmodem feed: no
-# downloads.openwrt.org/releases/<v>/packages/<arch>/qmodem/ exists, so
-# =m keeps the distfeeds line commented-out instead of breaking apk.
-CONFIG_FEED_qmodem=m
+
+# ==========================================================================
+# LEAN OPTIMIZATION OVERLAY (branch `lean`, 2026-09-06) — appended after
+# vjt's stock selections so these lines win on any duplicate symbol.
+# Scope, and nothing else: kernel/CPU/threading, pacing, eBPF/XDP/BTF
+# platform, qdisc + TCP baseline, WireGuard. The modem stack above
+# (ModemManager + mainline MHI/MBIM, quectel-5g-tools with its
+# 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm, NO zram.
+# Companion pieces: target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch
+# (BBRv3), 3 lines appended to target/linux/mediatek/filogic/config-6.12
+# (IKCONFIG, IKCONFIG_PROC, PREEMPT_DYNAMIC — not menu-exposed, so they
+# can't live here), x3000/files-common/etc/sysctl.d/{11,20,30}-*.conf.
+# Rationale + verification: x3000/docs/lean-overlay.md
+# ==========================================================================
+# --- eBPF / XDP / BTF kernel platform (menu-exposed KERNEL_* symbols) ---
+# BTF (+modules) makes CO-RE eBPF binaries (bpftool, libbpf/xdp tools)
+# run on-device; cgroup-bpf/bpf-events/kprobes/perf for tracing and
+# classifier hooks; XDP sockets for AF_XDP. DEBUG_INFO is what BTF is
+# derived from (REDUCED must stay off or BTF generation fails).
+CONFIG_KERNEL_CGROUP_BPF=y
+CONFIG_KERNEL_BPF_EVENTS=y
+CONFIG_KERNEL_KPROBES=y
+CONFIG_KERNEL_PERF_EVENTS=y
+CONFIG_KERNEL_XDP_SOCKETS=y
+CONFIG_KERNEL_DEBUG_INFO=y
+# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+CONFIG_KERNEL_DEBUG_INFO_BTF=y
+CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
+
+# --- qdisc / classifier kmods (vermagic-locked: bake now or never) -----
+# cake for the Phase-1 WAN shaper (hand-driven via tc — no sqm), the
+# eBPF classifier hook, ifb for ingress redirection, xdp-sockets-diag
+# for ss/AF_XDP introspection. fq_codel/htb/hfsc come with sched-core.
+CONFIG_PACKAGE_kmod-sched-core=y
+CONFIG_PACKAGE_kmod-sched=y
+CONFIG_PACKAGE_kmod-sched-cake=y
+CONFIG_PACKAGE_kmod-sched-bpf=y
+CONFIG_PACKAGE_kmod-ifb=y
+CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
+
+# --- BBRv3 ---------------------------------------------------------------
+# vjt's config.common already sets kmod-tcp-bbr=y; with the 990 patch in
+# the tree that module IS BBRv3 (tcp_bbr.c 2407 lines, MODULE_VERSION 3).
+# The package's own /etc/sysctl.d/12-tcp-bbr.conf keeps bbr the boot
+# default, as it already is on vjt's builds. Restated here for clarity.
+CONFIG_PACKAGE_kmod-tcp-bbr=y
+
+# --- eBPF / XDP userland ---------------------------------------------------
+# tc-bpf = full-feature tc + BPF loading (also carries cake_mq support,
+# irrelevant on single-queue wwan0/ifb). tc-tiny stays out so /sbin/tc
+# is unambiguous.
+CONFIG_PACKAGE_tc-bpf=y
+# CONFIG_PACKAGE_tc-tiny is not set
+CONFIG_PACKAGE_libbpf=y
+CONFIG_PACKAGE_bpftool-full=y
+CONFIG_PACKAGE_xdp-loader=y
+CONFIG_PACKAGE_xdpdump=y
+
+# --- cake-autorate prerequisites -------------------------------------------
+# cake-autorate itself is a bash script dropped in post-flash (not a
+# package); it needs bash + fping on the box.
+CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_fping=y
+
+# --- WireGuard (kmod = bake-now-or-never; inert until a wg iface exists) --
+# kmod-wireguard pulls the aarch64 NEON chacha20/poly1305 crypto in
+# automatically; wireguard-tools + luci-proto-wireguard make it usable
+# from CLI and LuCI with no rebuild.
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
+# --- Explicitly OUT of the lean image (guards; last line wins) ------------
+# CONFIG_PACKAGE_qosify is not set
+# CONFIG_PACKAGE_sqm-scripts is not set
+# CONFIG_PACKAGE_luci-app-sqm is not set
+# CONFIG_PACKAGE_kmod-zram is not set
+# CONFIG_PACKAGE_zram-swap is not set
+# CONFIG_PACKAGE_ply is not set
+# (No qmodem guards: that feed is not in this tree at all, so its
+#  symbols don't exist here — nothing to guard against.)
