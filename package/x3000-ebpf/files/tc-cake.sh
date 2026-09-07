@@ -18,7 +18,7 @@
 
 set -e
 PIN=/sys/fs/bpf/tc_cake
-OBJ=${OBJ:-/root/tc_cake_mark.o}
+OBJ=${OBJ:-/lib/bpf/tc_cake_mark.o}
 
 bpffs() { mkdir -p /sys/fs/bpf; mount | grep -q 'type bpf' || mount -t bpf bpf /sys/fs/bpf; }
 u32() { printf '%02x %02x %02x %02x' $(($1 & 255)) $((($1>>8)&255)) $((($1>>16)&255)) $((($1>>24)&255)); }

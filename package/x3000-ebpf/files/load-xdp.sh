@@ -19,7 +19,7 @@
 
 set -e
 PIN=/sys/fs/bpf/xdp_filter
-OBJ=${OBJ:-/root/xdp_filter.o}
+OBJ=${OBJ:-/lib/bpf/xdp_filter.o}
 
 bpffs() { mkdir -p /sys/fs/bpf; mount | grep -q 'type bpf' || mount -t bpf bpf /sys/fs/bpf; }
 

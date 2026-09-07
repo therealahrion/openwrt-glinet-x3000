@@ -217,6 +217,11 @@ CONFIG_PACKAGE_libbpf=y
 CONFIG_PACKAGE_bpftool-full=y
 CONFIG_PACKAGE_xdp-loader=y
 CONFIG_PACKAGE_xdpdump=y
+# Our own XDP + tc-bpf programs, compiled in-tree (package/x3000-ebpf,
+# CompileBPF like qosify) and baked to /lib/bpf with the x3000-xdp /
+# x3000-tc-cake CLIs. Lever-off: nothing attaches at boot. Selecting it
+# pulls the BPF toolchain (prebuilt LLVM where the host offers one).
+CONFIG_PACKAGE_x3000-ebpf=y
 
 # --- cake-autorate prerequisites -------------------------------------------
 # cake-autorate itself is a bash script dropped in post-flash (not a

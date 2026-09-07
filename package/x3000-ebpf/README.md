@@ -58,31 +58,38 @@ shapes. Marks by dest port (`port_dscp`) or proto default into cake's
 diffserv tins. **Marking correctness (checksum fixups) is a runtime
 concern the verifier cannot check — bench before trusting.**
 
-## Build (WSL) and install
+## Build (in-tree — all-inclusive)
+
+This is an OpenWrt package (`package/x3000-ebpf`). It compiles both
+programs during the normal image build and bakes them in — no host
+Makefile, no scp. Just select it (already `=y` in `x3000/config.common`)
+and build the image. To build only this package while iterating:
 
 ```sh
-cd x3000/ebpf && make            # clang -target bpf; apt install libbpf-dev if headers missing
-make push ROUTER=root@<router>   # objects + both scripts to /root/
+make package/x3000-ebpf/{clean,compile} V=s
 ```
+
+Objects land at `/lib/bpf/{xdp_filter,tc_cake_mark}.o`; loaders at
+`/usr/sbin/x3000-xdp` and `/usr/sbin/x3000-tc-cake`.
 
 ## Use (router)
 
 ```sh
 # XDP ingress filter
-sh /root/load-xdp.sh load
-sh /root/load-xdp.sh attach wwan0 rawip        # native, needs 992 in the kernel
-sh /root/load-xdp.sh attach eth0 eth           # native
-sh /root/load-xdp.sh attach phy0-ap0 eth generic
-sh /root/load-xdp.sh block4 203.0.113.7
-sh /root/load-xdp.sh block-port 23
-sh /root/load-xdp.sh stats
-sh /root/load-xdp.sh unload
+x3000-xdp load
+x3000-xdp attach wwan0 rawip        # native, needs 992 in the kernel
+x3000-xdp attach eth0 eth           # native
+x3000-xdp attach phy0-ap0 eth generic
+x3000-xdp block4 203.0.113.7
+x3000-xdp block-port 23
+x3000-xdp stats
+x3000-xdp unload
 
 # tc egress DSCP classifier (pairs with cake on the WAN)
-sh /root/tc-cake.sh load
-sh /root/tc-cake.sh attach wwan0 rawip
-sh /root/tc-cake.sh mark 3074 46               # e.g. game port -> EF
-sh /root/tc-cake.sh unload
+x3000-tc-cake load
+x3000-tc-cake attach wwan0 rawip
+x3000-tc-cake mark 3074 46          # e.g. game port -> EF
+x3000-tc-cake unload
 ```
 
 Confirm native attach: `bpftool net show` — `driver` = native,
