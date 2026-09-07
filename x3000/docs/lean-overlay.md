@@ -20,6 +20,11 @@ so the zero-reject BBRv3 verification carries over intact.
 | kernel / verification | `CONFIG_IKCONFIG=y` + `CONFIG_IKCONFIG_PROC=y` — `zcat /proc/config.gz` on the live box | same fragment |
 | eBPF / XDP / BTF platform | `KERNEL_CGROUP_BPF`, `BPF_EVENTS`, `KPROBES`, `PERF_EVENTS`, `XDP_SOCKETS`, `DEBUG_INFO` (+`_BTF`, `_BTF_MODULES`; `_REDUCED` off) | `x3000/config.common` (lean block at the end) |
 | qdisc / classifier kmods | `kmod-sched-core`, `kmod-sched`, `kmod-sched-cake`, `kmod-sched-bpf`, `kmod-ifb`, `kmod-xdp-sockets-diag` — vermagic-locked, bake now or never | `x3000/config.common` |
+| software flow offload (2026-09-07) | `kmod-nft-offload` — nft flowtable fast path; lever-OFF (firewall `flow_offloading '0'`). Interface-agnostic, so it shortcuts LAN↔wwan0 flows yet still hits the egress qdisc (cake keeps shaping). Verify cake interaction empirically before trusting | `x3000/config.common` |
+| WAN GRO via gro_cells (2026-09-07) | `991` kernel patch: MBIM RX delivered through per-CPU NAPI + `napi_gro_receive` instead of per-datagram `netif_rx` — batches the ~21-datagram 32KB NTB bursts (the RM520N controller sets `mru_default=32768`), and makes `wwan0` threaded-NAPI real. Kill-switch: `ethtool -K wwan0 gro off`. **BENCH-FIRST**: iperf3 downlink CPU + latency-under-load A/B before trusting | `target/linux/mediatek/patches-6.12/991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` |
+| WAN native XDP (2026-09-07) | `992` kernel patch (applies after 991): `ndo_bpf` + per-datagram `bpf_prog_run_xdp` on the MBIM RX path — verdicts PASS / DROP / TX (TX re-enters via `dev_queue_xmit`, so cake still applies); REDIRECT deliberately rejected (would bypass the shaper). Inert with no program attached (one `rcu_dereference` per datagram). **BENCH-FIRST** | `target/linux/mediatek/patches-6.12/992-net-wwan-mhi_wwan_mbim-native-xdp.patch` |
+| eBPF/XDP suite (2026-09-07, L4 + tc) | `x3000/ebpf/`: **verifier-checked** (compiled -Werror, accepted by the in-kernel BPF verifier). `xdp_filter` = L2/L3/**L4** ingress (per-CPU stats, v4/v6 source blocklist, dest-port blocklist; eth/raw-IP per ifindex). `tc_cake_mark` = clsact **egress DSCP classifier** feeding cake tins — cake-cooperative (runs before the qdisc, does not bypass it), unlike XDP_REDIRECT. Loaders `load-xdp.sh`/`tc-cake.sh`, lever-off. NO XDP hardware offload exists on this SoC (no driver has `XDP_SETUP_PROG_HW`); native = driver-mode software; wireless LAN = generic-mode only | `x3000/ebpf/` |
+| zram, kmod-only (2026-09-07) | `kmod-zram` — the module + its compression kmods; capability only, **no** `zram-swap`, **no** uci-default, so no swap is enabled at boot | `x3000/config.common` |
 | eBPF userland | `tc-bpf` (tc-tiny unset), `libbpf`, `bpftool-full`, `xdp-loader`, `xdpdump` | `x3000/config.common` |
 | cake-autorate prereqs | `bash`, `fping` (the script itself is dropped in post-flash) | `x3000/config.common` |
 | WireGuard | `kmod-wireguard`, `wireguard-tools`, `luci-proto-wireguard` — inert until a wg interface exists | `x3000/config.common` |
@@ -32,18 +37,20 @@ so the zero-reject BBRv3 verification carries over intact.
   rmnet MTU hotplug (vendor-driver-specific; dead code on MBIM `wwan0`).
 * **qosify, sqm-scripts, luci-app-sqm** — Phase-1 cake is hand-driven; see
   `x3000/docs/cake-wan.init` (reference script, NOT installed; lever off).
-* **zram** (`kmod-zram`, `zram-swap`) and its uci-default.
+* **zram-swap** (the auto-mkswap/swapon package) and its uci-default — the
+  `kmod-zram` module IS baked now (see table above), but nothing enables
+  swap on boot; that stays a manual choice.
 * **ply** (needs the ftrace stack; deferred as before).
 * `CONFIG_SCHED_DEBUG` — would expose the runtime
   `/sys/kernel/debug/sched/preempt` toggle; deps are already satisfied and
   it is introspection-only, but it was never baked/validated. Opt in with
   one line appended to the filogic fragment.
-* Every HELD research item: mt76 bump, MHI-GRO (vendor driver only anyway),
-  fullcone NAT, safexcel. Flow offload is vjt's stock setting.
-* "memory" bucket: zram was the only item and it is excluded — nothing
-  else was ever baked there.
+* Every HELD research item: mt76 bump, fullcone NAT, safexcel. (MHI-GRO
+  graduated 2026-09-07: its mainline equivalent is the 991 gro_cells
+  patch above — still bench-first.) Hardware flow offload (PPE/WED) stays off and is
+  moot for the cellular WAN anyway (wwan0 is not an mtk_eth port).
 
-Guard lines (`# CONFIG_PACKAGE_qosify is not set`, sqm, zram, ply,
+Guard lines (`# CONFIG_PACKAGE_qosify is not set`, sqm, zram-swap, ply,
 tc-tiny) sit at the very end of `config.common`; the composed `.config`
 is common + `config.<variant>` + optional `.local`, and `config.public`
 is empty, so nothing can re-select them behind the guards.
@@ -57,9 +64,9 @@ Build the **public** variant — vjt's `private` variant is his fleet image
 # fresh WSL clone of THIS branch — keep the qmodem build tree separate
 git clone -b lean <your fork> ~/x3000-lean && cd ~/x3000-lean
 ./x3000/prepare.sh public
-# gate before spending hours in make — expect 8 then 0:
-grep -c '^CONFIG_PACKAGE_\(kmod-sched-cake\|tc-bpf\|xdp-loader\|fping\|kmod-wireguard\|luci-proto-wireguard\|quectel-5g-tools\|modemmanager\)=y' .config
-grep -c '^CONFIG_PACKAGE_\(qosify\|sqm-scripts\|luci-app-sqm\|kmod-zram\|tc-tiny\)=y' .config
+# gate before spending hours in make — expect 10 then 0:
+grep -c '^CONFIG_PACKAGE_\(kmod-sched-cake\|tc-bpf\|xdp-loader\|fping\|kmod-wireguard\|luci-proto-wireguard\|quectel-5g-tools\|modemmanager\|kmod-nft-offload\|kmod-zram\)=y' .config
+grep -c '^CONFIG_PACKAGE_\(qosify\|sqm-scripts\|luci-app-sqm\|zram-swap\|tc-tiny\)=y' .config
 make -j$(nproc)            # or ./x3000/build.sh public → bin-x3000-public/
 ```
 

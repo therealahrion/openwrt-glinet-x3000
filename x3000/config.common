@@ -154,7 +154,8 @@ CONFIG_FEED_custom=m
 # Scope, and nothing else: kernel/CPU/threading, pacing, eBPF/XDP/BTF
 # platform, qdisc + TCP baseline, WireGuard. The modem stack above
 # (ModemManager + mainline MHI/MBIM, quectel-5g-tools with its
-# 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm, NO zram.
+# 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm. zram is
+# kmod-only (module baked, no zram-swap auto-enable — added 2026-09-07).
 # Companion pieces: target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch
 # (BBRv3), 3 lines appended to target/linux/mediatek/filogic/config-6.12
 # (IKCONFIG, IKCONFIG_PROC, PREEMPT_DYNAMIC — not menu-exposed, so they
@@ -186,6 +187,18 @@ CONFIG_PACKAGE_kmod-sched-cake=y
 CONFIG_PACKAGE_kmod-sched-bpf=y
 CONFIG_PACKAGE_kmod-ifb=y
 CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
+
+# --- software flow offload (kmod = bake-now-or-never; lever-OFF) -----------
+# Provides nft_flow_offload + nf_flow_table — the SOFTWARE flowtable fast
+# path. Added 2026-09-07. Unlike MediaTek HW offload (PPE/WED, which can't
+# touch the wwan0 MBIM path at all), the software flowtable is interface-
+# agnostic and shortcuts conntrack/netfilter for established LAN<->wwan0
+# flows while STILL re-transmitting through the egress qdisc, so cake keeps
+# shaping. Ships INERT: firewall `flow_offloading '1'` is off by default.
+# Caveat: offloaded flows skip per-packet nft rules (MSS clamp is fine — it
+# acts at SYN). Prove the cake interaction with a bufferbloat run on/off
+# before trusting it in production.
+CONFIG_PACKAGE_kmod-nft-offload=y
 
 # --- BBRv3 ---------------------------------------------------------------
 # vjt's config.common already sets kmod-tcp-bbr=y; with the 990 patch in
@@ -219,11 +232,19 @@ CONFIG_PACKAGE_kmod-wireguard=y
 CONFIG_PACKAGE_wireguard-tools=y
 CONFIG_PACKAGE_luci-proto-wireguard=y
 
+# --- zram (kmod ONLY = bake-now-or-never; capability, no swap) -------------
+# Re-added 2026-09-07 as the module alone. This creates the /dev/zram
+# capability + pulls its compression kmods; it does NOT enable swap. The
+# zram-swap package (auto-mkswap/swapon on boot, START=15) is deliberately
+# still OUT, and no uci-default ships — so nothing is active until you set
+# it up by hand. To use later: opkg/apk install zram-swap, or configure a
+# zram block device manually.
+CONFIG_PACKAGE_kmod-zram=y
+
 # --- Explicitly OUT of the lean image (guards; last line wins) ------------
 # CONFIG_PACKAGE_qosify is not set
 # CONFIG_PACKAGE_sqm-scripts is not set
 # CONFIG_PACKAGE_luci-app-sqm is not set
-# CONFIG_PACKAGE_kmod-zram is not set
 # CONFIG_PACKAGE_zram-swap is not set
 # CONFIG_PACKAGE_ply is not set
 # (No qmodem guards: that feed is not in this tree at all, so its
