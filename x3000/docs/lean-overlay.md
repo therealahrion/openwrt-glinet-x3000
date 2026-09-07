@@ -23,7 +23,6 @@ so the zero-reject BBRv3 verification carries over intact.
 | software flow offload (2026-09-07) | `kmod-nft-offload` — nft flowtable fast path; lever-OFF (firewall `flow_offloading '0'`). Interface-agnostic, so it shortcuts LAN↔wwan0 flows yet still hits the egress qdisc (cake keeps shaping). Verify cake interaction empirically before trusting | `x3000/config.common` |
 | WAN GRO via gro_cells (2026-09-07) | `991` kernel patch: MBIM RX delivered through per-CPU NAPI + `napi_gro_receive` instead of per-datagram `netif_rx` — batches the ~21-datagram 32KB NTB bursts (the RM520N controller sets `mru_default=32768`), and makes `wwan0` threaded-NAPI real. Kill-switch: `ethtool -K wwan0 gro off`. **BENCH-FIRST**: iperf3 downlink CPU + latency-under-load A/B before trusting | `target/linux/mediatek/patches-6.12/991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` |
 | WAN native XDP (2026-09-07) | `992` kernel patch (applies after 991): `ndo_bpf` + per-datagram `bpf_prog_run_xdp` on the MBIM RX path — verdicts PASS / DROP / TX (TX re-enters via `dev_queue_xmit`, so cake still applies); REDIRECT deliberately rejected (would bypass the shaper). Inert with no program attached (one `rcu_dereference` per datagram). **BENCH-FIRST** | `target/linux/mediatek/patches-6.12/992-net-wwan-mhi_wwan_mbim-native-xdp.patch` |
-| eBPF/XDP suite — **package** `package/x3000-ebpf` (2026-09-07) | In-tree OpenWrt package: `xdp_filter` (L2/L3/L4 XDP ingress) + `tc_cake_mark` (clsact egress DSCP for cake) compiled via `CompileBPF` (like qosify) and **baked to `/lib/bpf`** with CLIs `/usr/sbin/x3000-{xdp,tc-cake}`. No host build, no scp. Both **verifier-checked** (compiled -Werror, accepted by the in-kernel verifier). Lever-off; nothing attaches at boot. Pulls the BPF toolchain at build (prebuilt LLVM where offered). No XDP HW offload exists on this SoC; native = driver-mode software; wifi = generic-mode only | `package/x3000-ebpf/`, `CONFIG_PACKAGE_x3000-ebpf=y` |
 | zram, kmod-only (2026-09-07) | `kmod-zram` — the module + its compression kmods; capability only, **no** `zram-swap`, **no** uci-default, so no swap is enabled at boot | `x3000/config.common` |
 | eBPF userland | `tc-bpf` (tc-tiny unset), `libbpf`, `bpftool-full`, `xdp-loader`, `xdpdump` | `x3000/config.common` |
 | cake-autorate prereqs | `bash`, `fping` (the script itself is dropped in post-flash) | `x3000/config.common` |
@@ -41,6 +40,12 @@ so the zero-reject BBRv3 verification carries over intact.
   `kmod-zram` module IS baked now (see table above), but nothing enables
   swap on boot; that stays a manual choice.
 * **ply** (needs the ftrace stack; deferred as before).
+* **Custom in-tree BPF programs** (`xdp_filter`, `tc_cake_mark`) — dropped
+  2026-09-07 (recoverable from git history). The 991/992 kernel hooks and
+  the full BPF/XDP/BTF platform stay; upstream `xdp-filter` (packages feed,
+  not currently enabled) covers ingress filtering, and cake shapes fine
+  without bespoke DSCP marking. Shipping bespoke `.o` plus a build-time LLVM
+  toolchain wasn’t worth it for two lever-off utilities.
 * `CONFIG_SCHED_DEBUG` — would expose the runtime
   `/sys/kernel/debug/sched/preempt` toggle; deps are already satisfied and
   it is introspection-only, but it was never baked/validated. Opt in with
