@@ -55,3 +55,7 @@ git-src
 .cproject
 .ccache
 .vscode*
+
+# Cowork desktop app drops delivered files here (inside the connected
+# folder); never track them.
+Claude outputs/

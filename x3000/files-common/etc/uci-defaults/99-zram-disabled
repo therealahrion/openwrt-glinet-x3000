@@ -1,0 +1,11 @@
+#!/bin/sh
+# Ship zram-swap present-but-DORMANT (see x3000/config.common). The package
+# init (/etc/init.d/zram, START=15) would otherwise run mkswap + swapon at
+# every boot. Keep this image's "capability baked, lever off" posture:
+# disable the service (and stop it if this boot already started it). uci-
+# defaults run once on first boot from S10boot -> uci_apply_defaults, i.e.
+# before S15zram, then this script deletes itself. Turn zram swap on later:
+#     /etc/init.d/zram enable && /etc/init.d/zram start
+/etc/init.d/zram disable 2>/dev/null
+/etc/init.d/zram stop 2>/dev/null
+exit 0
