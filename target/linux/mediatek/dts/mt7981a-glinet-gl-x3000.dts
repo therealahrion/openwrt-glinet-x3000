@@ -6,3 +6,28 @@
 	model = "GL.iNet GL-X3000";
 	compatible = "glinet,gl-x3000", "mediatek,mt7981";
 };
+
+/*
+ * Crash diagnostics. mt7981b.dtsi reserves 64 KiB at 0x42ff0000 for
+ * ramoops but leaves record-size at 4 KiB, which is smaller than
+ * pstore's kmsg_bytes (10 KiB by default). pstore therefore splits a
+ * crash log into parts and ramoops_pstore_write() refuses everything
+ * after the first with -ENOSPC ("pstore: backend (ramoops) writing
+ * error (-28)"), losing the tail of the trace.
+ *
+ * Re-partition the same window -- base and size are fixed, because
+ * 0x42ff0000 + 0x10000 butts directly against secmon@43000000 (BL31):
+ *
+ *   console-size 32 KiB : rolling console log, written continuously,
+ *                         so it survives a watchdog reset or a silent
+ *                         hang -- cases that produce no oops and
+ *                         therefore no dump record at all.
+ *   dump area    32 KiB : 2 x 16 KiB records. 16 KiB > kmsg_bytes, so
+ *                         a crash log is always a single part.
+ *
+ * Both values must be powers of two; ramoops rounds down otherwise.
+ */
+&{/reserved-memory/ramoops@42ff0000} {
+	record-size = <0x4000>;
+	console-size = <0x8000>;
+};

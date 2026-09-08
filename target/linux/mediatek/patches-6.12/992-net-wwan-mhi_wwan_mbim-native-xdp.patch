@@ -18,6 +18,25 @@ intentionally not implemented (it would bypass the shaper); it warns
 and drops. When no program is attached the cost is one rcu_dereference
 per datagram.
 
+The program run is bracketed by bpf_net_ctx_set()/bpf_net_ctx_clear().
+Since 401cb7dae813 the redirect helpers read struct bpf_redirect_info
+out of current->bpf_net_context, and bpf_net_ctx_get_ri() dereferences
+that pointer unchecked; the core establishes it only in net_rx_action(),
+napi_threaded_poll_loop(), __napi_busy_loop(), busy_poll_stop(),
+sch_handle_ingress/egress(), cpu_map_bpf_prog_run() and run_lwt_bpf().
+An XDP hook driven from a bus callback rather than a NAPI poll gets
+none of those, so any program calling bpf_redirect_map() -- including
+libxdp's xsk_def_prog, which `xdp-loader load` installs by default --
+oopsed on NULL+0x38 on the first datagram received:
+
+  Unable to handle kernel read from unreadable memory at 0x38
+  pc : xsk_map_redirect+0xc/0x90
+  lr : bpf_prog_0718da224c8f0178_xsk_def_prog+0x5c/0x78
+  Call trace:
+    xsk_map_redirect / bpf_dispatcher_xdp_func
+    mhi_process_data_event_ring [mhi] / mhi_ev_task [mhi]
+    tasklet_action_common / handle_softirqs
+
 Reflected XDP_TX frames get skb->protocol and the network header set
 explicitly: they never traverse __netif_receive_skb_core(), which is
 what normally does both, and without them cake_handle_diffserv() reads
@@ -55,7 +74,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -254,6 +261,135 @@
+@@ -254,6 +261,160 @@
  	return ret;
  }
  
@@ -83,6 +102,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +static bool mhi_mbim_xdp_rx(struct mhi_mbim_link *link,
 +			    struct bpf_prog *xdp_prog, struct sk_buff *skbn)
 +{
++	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
 +	void *orig_data, *orig_data_end;
 +	struct xdp_buff xdp;
 +	int delta;
@@ -103,7 +123,25 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	orig_data = xdp.data;
 +	orig_data_end = xdp.data_end;
 +
++	/* Establish the per-task bpf_net_context that the redirect
++	 * helpers reach for. bpf_net_ctx_get_ri() dereferences
++	 * current->bpf_net_context with no NULL check, and the core only
++	 * sets one up in net_rx_action(), napi_threaded_poll_loop(),
++	 * __napi_busy_loop(), busy_poll_stop(), sch_handle_ingress(),
++	 * sch_handle_egress(), cpu_map_bpf_prog_run() and run_lwt_bpf().
++	 * This hook runs from the MHI DL tasklet, which is none of them,
++	 * so without this any attached program that calls
++	 * bpf_redirect_map() and friends -- e.g. libxdp's xsk_def_prog,
++	 * which every `xdp-loader load` of an AF_XDP program installs --
++	 * faults reading NULL + offsetof(struct bpf_redirect_info,
++	 * kern_flags) on the first datagram received. Nesting-safe:
++	 * bpf_net_ctx_set() returns NULL when a context is already active
++	 * and bpf_net_ctx_clear(NULL) is a no-op. Cleared before the
++	 * XDP_TX dev_queue_xmit() below, so egress tc establishes its own.
++	 */
++	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 +	act = bpf_prog_run_xdp(xdp_prog, &xdp);
++	bpf_net_ctx_clear(bpf_net_ctx);
 +
 +	switch (act) {
 +	case XDP_PASS:
@@ -139,7 +177,13 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +		dev_queue_xmit(skbn);
 +		return false;
 +	case XDP_REDIRECT:
-+		/* Not implemented (would bypass the qdisc/shaper anyway) */
++		/* Not implemented, and not merely as policy: these skbs are
++		 * kmalloc-backed, so xdp_convert_buff_to_frame() would hand
++		 * xdp_return_frame() a slab address to page_frag_free() under
++		 * MEM_TYPE_PAGE_SHARED. Doing it properly would mean
++		 * xdp_do_generic_redirect(), which bypasses the egress
++		 * qdisc/shaper anyway.
++		 */
 +		fallthrough;
 +	default:
 +		bpf_warn_invalid_xdp_action(link->ndev, xdp_prog, act);
@@ -191,7 +235,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -307,6 +443,8 @@
+@@ -307,6 +468,8 @@
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -200,7 +244,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -318,13 +456,22 @@
+@@ -318,13 +481,22 @@
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -224,7 +268,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			switch (skbn->data[0] & 0xf0) {
  			case 0x40:
  				skbn->protocol = htons(ETH_P_IP);
-@@ -545,6 +692,7 @@
+@@ -545,6 +717,7 @@
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
@@ -232,7 +276,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -571,6 +719,15 @@
+@@ -571,6 +744,15 @@
  	if (err)
  		return err;
  
@@ -248,7 +292,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	/* Already protected by RTNL lock */
  	hlist_add_head_rcu(&link->hlnode, &mbim->link_list[LINK_HASH(if_id)]);
  
-@@ -578,9 +735,15 @@
+@@ -578,9 +760,15 @@
  	if (err) {
  		hlist_del_init_rcu(&link->hlnode);
  		synchronize_rcu();
@@ -265,7 +309,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	return err;
  }
  
-@@ -592,6 +755,8 @@
+@@ -592,6 +780,8 @@
  	hlist_del_init_rcu(&link->hlnode);
  	synchronize_rcu();
  
@@ -274,7 +318,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  
  	unregister_netdevice_queue(ndev, head);
-@@ -607,6 +772,7 @@
+@@ -607,6 +797,7 @@
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
  	ndev->features |= NETIF_F_GRO;
  	ndev->hw_features |= NETIF_F_GRO;
