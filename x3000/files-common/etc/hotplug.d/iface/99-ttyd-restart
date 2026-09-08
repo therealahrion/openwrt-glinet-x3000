@@ -1,0 +1,15 @@
+# ttyd binds to the LAN interface ADDRESS: its shipped config sets
+# `option interface '@lan'`, which the init script resolves to `-i br-lan`.
+# But ttyd's init runs at START=99 before br-lan necessarily has an address,
+# so lws_socket_bind() fails with EADDRNOTAVAIL (errno 99), lws_create_vhost()
+# fails, and the daemon exits — no web terminal until someone restarts it by
+# hand. Its own service_triggers() registers only procd_add_reload_trigger
+# (a ttyd-CONFIG change), never a network trigger, so nothing ever retries.
+#
+# Restart it once `lan` is actually up. Guarded on ttyd not already running,
+# so repeated ifup events can't bounce a live session. No `exit` here:
+# hotplug.d scripts are sourced, and exiting would abort the whole
+# hotplug-call chain for this event.
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "lan" ] && {
+	pgrep -x ttyd >/dev/null 2>&1 || /etc/init.d/ttyd restart
+}

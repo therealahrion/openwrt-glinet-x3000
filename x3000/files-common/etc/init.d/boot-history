@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# Record every boot, and whether the previous shutdown was orderly.
+#
+# stop() only runs during a clean shutdown/reboot, so a missing marker on
+# the next boot means the box went down without one — panic, watchdog, or
+# power loss. That distinguishes a real crash from a deliberate reboot
+# (yours, or vjt's 5g-watchdog at_mute_reboot) without needing anyone
+# present to observe it.
+#
+# The log lives in /root, which x3000/files-common/etc/sysupgrade.conf
+# preserves across sysupgrade.
+START=99
+STOP=01
+start() {
+	if [ -f /root/.clean-shutdown ]; then R=clean; else R=UNCLEAN; fi
+	rm -f /root/.clean-shutdown
+	echo "$(date -Is) boot prev_shutdown=$R" >> /root/boot-history.log
+}
+stop() {
+	touch /root/.clean-shutdown
+}

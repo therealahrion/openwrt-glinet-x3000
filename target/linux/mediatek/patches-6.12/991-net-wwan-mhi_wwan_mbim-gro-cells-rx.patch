@@ -26,6 +26,17 @@ Details:
   * NETIF_F_GRO is advertised and set: gro_cells_receive() falls back
     to netif_rx() when the feature bit is off, so `ethtool -K <dev>
     gro off` is a live kill-switch back to today's behaviour.
+  * mac/network headers are anchored at skb->data before hand-off.
+    netdev_alloc_skb() leaves mac_header at the ~0U "unset" sentinel.
+    netif_rx() tolerated that, but gro_cells feeds napi_gro_receive(),
+    and consumers that do mac_header-relative arithmetic (generic XDP's
+    unguarded __skb_push() in do_xdp_generic(), packet taps, GSO
+    helpers) then compute skb->data - skb_mac_header(skb) against the
+    sentinel, underflow, and walk before skb->head. Anchoring makes
+    mac_len 0 and that difference 0. rmnet_deliver_skb() does the same;
+    cf. upstream fixes qmi_wwan "Add missing skb_reset_mac_header-call"
+    (skb_under_panic on a raw-IP wwan0) and 6lowpan "reset mac_header
+    after decompress to fix panic".
   * TX path, MBIM framing, MRU handling: untouched.
 
 Out-of-tree patch for the GL-X3000 lean build; bench before trusting
@@ -59,16 +70,27 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -344,7 +346,7 @@
+@@ -345,7 +347,18 @@
  			u64_stats_add(&link->rx_bytes, skbn->len);
  			u64_stats_update_end(&link->rx_syncp);
  
 -			netif_rx(skbn);
++			/* Raw-IP device: no L2 header exists. Anchor mac_header
++			 * at skb->data so skb_reset_mac_len() yields 0 instead of
++			 * wrapping off the unset ~0U sentinel, and consumers that
++			 * do mac_header-relative arithmetic (generic XDP, packet
++			 * taps, GSO helpers) cannot walk before skb->head. Same
++			 * recipe as rmnet_deliver_skb(); cf. upstream fixes
++			 * qmi_wwan "Add missing skb_reset_mac_header-call" and
++			 * 6lowpan "reset mac_header after decompress to fix panic".
++			 */
++			skb_reset_network_header(skbn);
++			skb_reset_mac_header(skbn);
 +			gro_cells_receive(&link->gcells, skbn);
  		}
  unlock:
  		rcu_read_unlock();
-@@ -550,6 +552,7 @@
+@@ -550,6 +563,7 @@
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  	struct mhi_mbim_context *mbim = ctxt;
@@ -76,7 +98,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	link->mbim = mbim;
  	link->session = mhi_mbim_get_link_mux_id(link->mbim->mdev->mhi_cntrl) + if_id;
-@@ -563,10 +566,21 @@
+@@ -564,10 +578,21 @@
  	}
  	rcu_read_unlock();
  
@@ -99,7 +121,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  }
  
  static void mhi_mbim_dellink(void *ctxt, struct net_device *ndev,
-@@ -577,6 +591,8 @@
+@@ -578,6 +603,8 @@
  	hlist_del_init_rcu(&link->hlnode);
  	synchronize_rcu();
  
@@ -108,7 +130,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  	unregister_netdevice_queue(ndev, head);
  }
  
-@@ -588,6 +604,8 @@
+@@ -589,6 +616,8 @@
  	ndev->hard_header_len = 0;
  	ndev->addr_len = 0;
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
