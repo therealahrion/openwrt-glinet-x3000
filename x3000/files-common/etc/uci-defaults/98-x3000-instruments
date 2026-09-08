@@ -2,10 +2,16 @@
 # Init scripts dropped in via files/ get no rc.d symlink from the image
 # build, so enable them on first boot. Runs once, then uci-defaults
 # deletes this script.
-for s in pcie-modem-nopm boot-history; do
-	[ -x "/etc/init.d/$s" ] && {
-		"/etc/init.d/$s" enable
-		"/etc/init.d/$s" start
-	}
+#
+# chmod defensively: Windows git runs with core.filemode=false, so the +x
+# bit can be lost between the checkout and the image. prepare.sh sets the
+# modes when composing files/, but without +x an /etc/rc.d/S* symlink is
+# silently never executed, which is a failure that looks exactly like
+# success -- so belt-and-braces here too.
+for s in boot-history; do
+	[ -f "/etc/init.d/$s" ] || continue
+	chmod 0755 "/etc/init.d/$s"
+	"/etc/init.d/$s" enable
+	"/etc/init.d/$s" start
 done
 exit 0
