@@ -68,14 +68,14 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  		}
  unlock:
  		rcu_read_unlock();
-@@ -549,6 +551,7 @@
+@@ -550,6 +552,7 @@
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  	struct mhi_mbim_context *mbim = ctxt;
 +	int err;
  
- 	link->session = if_id;
  	link->mbim = mbim;
+ 	link->session = mhi_mbim_get_link_mux_id(link->mbim->mdev->mhi_cntrl) + if_id;
 @@ -563,10 +566,21 @@
  	}
  	rcu_read_unlock();

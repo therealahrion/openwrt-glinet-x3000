@@ -18,6 +18,17 @@ intentionally not implemented (it would bypass the shaper); it warns
 and drops. When no program is attached the cost is one rcu_dereference
 per datagram.
 
+Reflected XDP_TX frames get skb->protocol and the network header set
+explicitly: they never traverse __netif_receive_skb_core(), which is
+what normally does both, and without them cake_handle_diffserv() reads
+protocol 0 and a bogus network offset — every reflection would land in
+the besteffort tin with its DSCP ignored.
+
+XDP_DROP is accounted to the core rx_dropped counter rather than
+rx_errors: a policy drop is not a receive error, and conflating them
+makes a healthily filtering link look faulty in `ip -s link`.
+XDP_ABORTED and invalid verdicts still count as rx_errors.
+
 Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
@@ -44,10 +55,25 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -253,6 +260,103 @@
+@@ -254,6 +261,135 @@
  	return ret;
  }
  
++/* Raw-IP framing: the first nibble of the datagram selects the L3
++ * protocol. Returns 0 (unknown) for anything else.
++ */
++static __be16 mhi_mbim_ip_proto(const struct sk_buff *skb)
++{
++	switch (skb->data[0] & 0xf0) {
++	case 0x40:
++		return htons(ETH_P_IP);
++	case 0x60:
++		return htons(ETH_P_IPV6);
++	default:
++		return 0;
++	}
++}
++
 +/* Run the attached XDP program on one de-aggregated datagram.
 + * Returns true if the skb should continue to the stack (XDP_PASS),
 + * false if it was consumed (dropped or reflected).
@@ -98,9 +124,17 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +		if (act == XDP_PASS)
 +			return true;
 +
-+		/* XDP_TX: reflect back out this interface. Goes through
-+		 * dev_queue_xmit so the egress qdisc still applies.
++		/* XDP_TX: reflect back out this interface via
++		 * dev_queue_xmit so the egress qdisc still applies. This
++		 * skb never went through the RX stack, which is what
++		 * normally calls skb_reset_network_header() and sets
++		 * skb->protocol. Without both, cake_handle_diffserv()
++		 * sees protocol 0 and a bogus network offset, so every
++		 * reflected packet lands in besteffort with its DSCP
++		 * ignored.
 +		 */
++		skb_reset_network_header(skbn);
++		skbn->protocol = mhi_mbim_ip_proto(skbn);
 +		skbn->dev = link->ndev;
 +		dev_queue_xmit(skbn);
 +		return false;
@@ -111,12 +145,21 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +		bpf_warn_invalid_xdp_action(link->ndev, xdp_prog, act);
 +		fallthrough;
 +	case XDP_ABORTED:
++		/* Program fault or invalid verdict: a genuine RX error. */
 +		trace_xdp_exception(link->ndev, xdp_prog, act);
-+		fallthrough;
-+	case XDP_DROP:
 +		u64_stats_update_begin(&link->rx_syncp);
 +		u64_stats_inc(&link->rx_errors);
 +		u64_stats_update_end(&link->rx_syncp);
++		dev_kfree_skb_any(skbn);
++		return false;
++	case XDP_DROP:
++		/* Deliberate policy drop, not an error: counting it in
++		 * rx_errors makes `ip -s link` show a healthily filtered
++		 * link as faulty. Use the core rx_dropped counter, which
++		 * dev_get_stats() merges on top of ndo_get_stats64() —
++		 * the same thing gro_cells does on its own drop path.
++		 */
++		dev_core_stats_rx_dropped_inc(link->ndev);
 +		dev_kfree_skb_any(skbn);
 +		return false;
 +	}
@@ -148,7 +191,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -306,6 +410,8 @@
+@@ -307,6 +443,8 @@
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -157,7 +200,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -317,13 +423,22 @@
+@@ -318,13 +456,22 @@
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -181,7 +224,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			switch (skbn->data[0] & 0xf0) {
  			case 0x40:
  				skbn->protocol = htons(ETH_P_IP);
-@@ -544,6 +659,7 @@
+@@ -545,6 +692,7 @@
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
@@ -189,7 +232,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -570,6 +686,15 @@
+@@ -571,6 +719,15 @@
  	if (err)
  		return err;
  
@@ -205,7 +248,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	/* Already protected by RTNL lock */
  	hlist_add_head_rcu(&link->hlnode, &mbim->link_list[LINK_HASH(if_id)]);
  
-@@ -577,9 +702,15 @@
+@@ -578,9 +735,15 @@
  	if (err) {
  		hlist_del_init_rcu(&link->hlnode);
  		synchronize_rcu();
@@ -222,7 +265,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	return err;
  }
  
-@@ -591,6 +722,8 @@
+@@ -592,6 +755,8 @@
  	hlist_del_init_rcu(&link->hlnode);
  	synchronize_rcu();
  
@@ -231,7 +274,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  
  	unregister_netdevice_queue(ndev, head);
-@@ -606,6 +739,7 @@
+@@ -607,6 +772,7 @@
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
  	ndev->features |= NETIF_F_GRO;
  	ndev->hw_features |= NETIF_F_GRO;
