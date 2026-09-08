@@ -12,6 +12,13 @@
 START=99
 STOP=01
 start() {
+	# uci-defaults both enables the S99 symlink and starts this on the
+	# first boot after a flash, so two invocations can land in the same
+	# boot -- and the second, finding the marker already removed, logs a
+	# spurious UNCLEAN. /tmp is tmpfs, so this flag is gone by the next
+	# boot: exactly one line per boot, whichever caller wins the race.
+	[ -f /tmp/.boot-history-logged ] && return 0
+	: > /tmp/.boot-history-logged
 	if [ -f /root/.clean-shutdown ]; then R=clean; else R=UNCLEAN; fi
 	rm -f /root/.clean-shutdown
 	echo "$(date -Is) boot prev_shutdown=$R" >> /root/boot-history.log

@@ -43,4 +43,8 @@ make -j"$(nproc)" BIN_DIR="$BIN_DIR" "$@"
 
 echo
 echo "Done. variant=$VARIANT"
-echo "Artifacts under: $BIN_DIR/targets/mediatek/filogic/"
+# BIN_DIR is the *leaf* output directory in OpenWrt -- it already stands in
+# for bin/targets/<board>/<subtarget> -- so overriding it puts the images
+# flat in $BIN_DIR, not under a targets/ subtree.
+echo "Artifacts under: $BIN_DIR/"
+ls -1 "$BIN_DIR"/*sysupgrade.bin 2>/dev/null | sed 's/^/  /' || true

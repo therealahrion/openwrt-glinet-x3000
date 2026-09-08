@@ -235,7 +235,11 @@ Common contents:
     used by `apk mkndx` on your feed builder), and the feed URL in
     `etc/apk/repositories.d/customfeeds.list`.
   * **Telegraf config** at `etc/telegraf.conf` if you've enabled
-    `telegraf-full` via the `private` variant.
+    `telegraf-full` via the `private` variant. Without one,
+    `files-common/etc/uci-defaults/97-telegraf-guard` disables the service
+    on first boot rather than letting it log `no outputs found` on every
+    boot; re-enable with `/etc/init.d/telegraf enable start` once a config
+    with an `[[outputs.*]]` section is in place.
   * Anything else infra-specific.
 
 ### Baking your own packages

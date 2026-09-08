@@ -1,0 +1,19 @@
+#!/bin/sh
+# telegraf-full ships in the private variant only, and expects its config at
+# /etc/telegraf.conf, supplied through x3000/files-private/. That directory is
+# gitignored by design, so a builder who has not dropped a telegraf.conf in
+# gets a service that starts, finds no [[outputs.*]] section, and logs
+#   E! [telegraf] Error running agent: no outputs found ...
+# on every boot.
+#
+# Rather than invent a metrics endpoint, leave the service enabled only when
+# it actually has somewhere to send. No-op on the public variant, where
+# telegraf is not installed at all.
+#
+# After adding a config later:  /etc/init.d/telegraf enable start
+if [ -x /etc/init.d/telegraf ] && \
+   ! grep -qs '^[[:space:]]*\[\[outputs\.' /etc/telegraf.conf; then
+	/etc/init.d/telegraf stop 2>/dev/null
+	/etc/init.d/telegraf disable 2>/dev/null
+fi
+exit 0

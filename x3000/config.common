@@ -139,16 +139,13 @@ CONFIG_PACKAGE_vim-full=y
 CONFIG_PACKAGE_tcpdump=y
 CONFIG_PACKAGE_ip-full=y
 CONFIG_PACKAGE_ethtool=y
-# Kernel-panic capture. This board exposes no serial console, has no pstore
-# (CONFIG_PSTORE is off in the generic config and mt7981 defines no ramoops
-# node), and runs CONFIG_PANIC_ON_OOPS=y with CONFIG_PANIC_TIMEOUT=1 -- so an
-# oops reboots in one second and leaves no trace anywhere. netconsole prints
-# from inside printk via netpoll, which works from panic context, so it
-# streams the oops and stack to a LAN listener as it happens. Inert unless
-# loaded:
-#   modprobe netconsole netconsole=6665@<router-ip>/br-lan,6666@<pc-ip>/<pc-mac>
-# and on the listener:  nc -u -l -p 6666
-CONFIG_PACKAGE_kmod-netconsole=y
+# Kernel-panic capture is pstore/ramoops, not netconsole. The claim that this
+# target has no pstore was wrong: the filogic subtarget sets CONFIG_PSTORE_RAM=y
+# (target/linux/mediatek/filogic/config-6.12) and 117-complete-mt7981b-dtsi.patch
+# defines ramoops@42ff0000, sized in the board DTS. With CONFIG_PANIC_ON_OOPS=y
+# and CONFIG_PANIC_TIMEOUT=1 an oops still reboots in about a second, but the
+# dump survives it in /sys/fs/pstore/ -- verified end to end on a real oops.
+# That needs no listener and no LAN, so kmod-netconsole is dropped.
 CONFIG_PACKAGE_iftop=y
 CONFIG_PACKAGE_iperf3=y
 CONFIG_PACKAGE_bind-dig=y
