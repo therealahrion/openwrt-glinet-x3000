@@ -163,6 +163,17 @@ mkdir -p "$ROOT/files"
 rsync -a --exclude='.gitkeep' "$FILES_COMMON"/ "$ROOT/files/"
 rsync -a --exclude='.gitkeep' "$FILES_VARIANT"/ "$ROOT/files/"
 
+# Windows/OneDrive checkouts commonly run git with core.filemode=false, so
+# the executable bit on files/ content does not survive a commit. Anything
+# procd runs via /etc/rc.d/S* MUST be +x or it silently never executes (the
+# init script ships, `enable` looks fine, and nothing runs at boot).
+# uci-defaults and hotplug.d scripts are sourced, so they do not care.
+# Set the modes here so the image is correct regardless of what the
+# checkout filesystem preserved.
+if [[ -d "$ROOT/files/etc/init.d" ]]; then
+    find "$ROOT/files/etc/init.d" -type f -exec chmod 0755 {} +
+fi
+
 # --- Record the variant ---------------------------------------------------
 
 echo "$VARIANT" > "$VARIANT_MARKER"
