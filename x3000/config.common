@@ -203,6 +203,22 @@ CONFIG_KERNEL_DEBUG_INFO=y
 CONFIG_KERNEL_DEBUG_INFO_BTF=y
 CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
 
+# --- MHI bus debugfs (modem downlink diagnostics) -------------------------
+# Exposes /sys/kernel/debug/mhi/<device>/ with per-channel state: read and
+# write pointers, free descriptor counts, event ring and register dumps.
+#
+# Added 2026-09-09 to diagnose a downlink stall. The symptom is that wwan0
+# rx_packets freezes for minutes at a time while tx_packets keeps moving,
+# and the modem's downlink MSI vector stops firing entirely, so no packets
+# reach the host at all. Two causes look identical from outside the kernel:
+# the modem has gone quiet, or the DL descriptor ring has run out of host
+# buffers and the modem has nowhere to write. The channel view separates
+# them; without it there is nothing to read but interrupt counters.
+#
+# Costs a little kernel size and nothing at runtime unless debugfs is read.
+# Drop this line once the stall is understood.
+CONFIG_KERNEL_MHI_BUS_DEBUG=y
+
 # --- qdisc / classifier kmods (vermagic-locked: bake now or never) -----
 # cake for the Phase-1 WAN shaper (hand-driven via tc — no sqm), the
 # eBPF classifier hook, ifb for ingress redirection, xdp-sockets-diag
