@@ -32,6 +32,19 @@ Details:
   * newlink additionally un-hashes the link when register_netdevice()
     fails. Upstream left it hashed on that error path, so RX could still
     find a half-dead link; dellink is otherwise untouched by this patch.
+  * a cheap 4-tuple hash is set on each datagram before hand-off, purely
+    so GRO can bucket. dev_gro_receive() indexes napi->gro_hash[] with
+    skb_get_hash_raw() and gro_list_prepare() uses the same value as a
+    fast reject; netdev_alloc_skb() leaves it 0, so every flow shares
+    bucket 0 of GRO_HASH_BUCKETS(8) and MAX_GRO_SKBS(8) then caps the
+    device at eight flows held mid-aggregation instead of sixty-four,
+    with the cheap reject never firing. Tagged PKT_HASH_TYPE_NONE, so
+    l4_hash/sw_hash stay clear and skb_get_hash() still computes a
+    canonical hash for anything needing real flow isolation (fq_codel,
+    RPS) -- this value never leaves GRO's fast path. A full flow
+    dissection here would cost more than it saves: GRO merges N datagrams
+    into fewer skbs before the qdisc ever asks for a hash, so it would
+    pay N dissections to avoid M, with M < N.
   * NETIF_F_GRO is advertised and set: gro_cells_receive() falls back
     to netif_rx() when the feature bit is off, so `ethtool -K <dev>
     gro off` is a live kill-switch back to today's behaviour.
@@ -63,15 +76,25 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
            It implements MBIM over MHI, for IP data aggregation and muxing.
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
-@@ -27,6 +27,7 @@
+@@ -15,6 +15,8 @@
+ #include <linux/if_arp.h>
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/jhash.h>
+ #include <linux/mhi.h>
+ #include <linux/mii.h>
+ #include <linux/mod_devicetable.h>
+@@ -27,6 +29,8 @@
  #include <linux/usb/usbnet.h>
  #include <linux/usb/cdc_ncm.h>
  #include <linux/wwan.h>
 +#include <net/gro_cells.h>
++#include <net/ip.h>
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -48,6 +49,7 @@
+@@ -48,6 +52,7 @@
  	struct mhi_mbim_context *mbim;
  	struct net_device *ndev;
  	unsigned int session;
@@ -79,7 +102,95 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -345,7 +347,18 @@
+@@ -252,6 +257,87 @@
+ 	return ret;
+ }
+ 
++/* Cheap per-flow hash, for GRO bucketing only.
++ *
++ * dev_gro_receive() selects its bucket with skb_get_hash_raw(), and
++ * gro_list_prepare() uses the same value as a fast reject before the
++ * per-protocol matcher runs. Datagrams from netdev_alloc_skb() carry hash
++ * 0, so every flow lands in bucket 0 of GRO_HASH_BUCKETS (8) and
++ * MAX_GRO_SKBS (8) then caps the whole device at eight flows held
++ * mid-aggregation rather than sixty-four -- and because the hashes all
++ * compare equal, the cheap reject never fires and inet_gro_receive() is
++ * invoked against every held skb for every datagram that arrives.
++ *
++ * Tagged PKT_HASH_TYPE_NONE deliberately: that leaves l4_hash and sw_hash
++ * clear, so skb_get_hash() still computes a canonical hash for anything
++ * needing real flow isolation (fq_codel, RPS), and this value never
++ * escapes GRO's fast path. It therefore only has to be stable per flow
++ * and reasonably spread; a collision costs nothing but one rejected
++ * comparison. A full flow dissection here would cost more than it saves,
++ * since GRO merges N datagrams into fewer skbs before the qdisc ever asks
++ * for a hash -- this would pay N dissections to avoid M, with M < N.
++ *
++ * Bounds are checked against skb->len at every step: this parses data the
++ * modem supplied.
++ */
++static void mhi_mbim_set_gro_hash(struct sk_buff *skb)
++{
++	unsigned int hlen = 0, len = skb->len;
++	const u8 *d = skb->data;
++	u32 a = 0, b = 0, ports = 0;
++	u8 proto = 0;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP): {
++		const struct iphdr *iph = (const struct iphdr *)d;
++
++		if (len < sizeof(*iph))
++			return;
++		hlen = iph->ihl * 4;
++		if (hlen < sizeof(*iph) || len < hlen)
++			return;
++		a = (__force u32)iph->saddr;
++		b = (__force u32)iph->daddr;
++		proto = iph->protocol;
++		/* Only the first fragment carries the L4 ports. */
++		if (iph->frag_off & htons(IP_MF | IP_OFFSET))
++			hlen = 0;
++		break;
++	}
++	case htons(ETH_P_IPV6): {
++		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)d;
++
++		if (len < sizeof(*ip6h))
++			return;
++		hlen = sizeof(*ip6h);
++		a = (__force u32)ip6h->saddr.s6_addr32[0] ^
++		    (__force u32)ip6h->saddr.s6_addr32[1] ^
++		    (__force u32)ip6h->saddr.s6_addr32[2] ^
++		    (__force u32)ip6h->saddr.s6_addr32[3];
++		b = (__force u32)ip6h->daddr.s6_addr32[0] ^
++		    (__force u32)ip6h->daddr.s6_addr32[1] ^
++		    (__force u32)ip6h->daddr.s6_addr32[2] ^
++		    (__force u32)ip6h->daddr.s6_addr32[3];
++		/* Extension headers are not walked: hash addresses only. */
++		proto = ip6h->nexthdr;
++		break;
++	}
++	default:
++		return;
++	}
++
++	if (hlen && len >= hlen + 4 &&
++	    (proto == IPPROTO_TCP || proto == IPPROTO_UDP)) {
++		__be16 sport, dport;
++
++		memcpy(&sport, d + hlen, sizeof(sport));
++		memcpy(&dport, d + hlen + 2, sizeof(dport));
++		ports = ((u32)(__force u16)sport << 16) | (__force u16)dport;
++	}
++
++	skb_set_hash(skb, jhash_3words(a, b, ports, proto), PKT_HASH_TYPE_NONE);
++}
++
+ static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
+ {
+ 	int ndpoffset;
+@@ -345,7 +431,19 @@
  			u64_stats_add(&link->rx_bytes, skbn->len);
  			u64_stats_update_end(&link->rx_syncp);
  
@@ -95,11 +206,12 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
 +			 */
 +			skb_reset_network_header(skbn);
 +			skb_reset_mac_header(skbn);
++			mhi_mbim_set_gro_hash(skbn);
 +			gro_cells_receive(&link->gcells, skbn);
  		}
  unlock:
  		rcu_read_unlock();
-@@ -538,7 +551,32 @@
+@@ -538,7 +636,32 @@
  	return 0;
  }
  
@@ -132,7 +244,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  	.ndo_open = mhi_mbim_ndo_open,
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
-@@ -550,6 +588,7 @@
+@@ -550,6 +673,7 @@
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  	struct mhi_mbim_context *mbim = ctxt;
@@ -140,7 +252,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	link->mbim = mbim;
  	link->session = mhi_mbim_get_link_mux_id(link->mbim->mdev->mhi_cntrl) + if_id;
-@@ -567,7 +606,13 @@
+@@ -567,7 +691,13 @@
  	/* Already protected by RTNL lock */
  	hlist_add_head_rcu(&link->hlnode, &mbim->link_list[LINK_HASH(if_id)]);
  
@@ -155,7 +267,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  }
  
  static void mhi_mbim_dellink(void *ctxt, struct net_device *ndev,
-@@ -589,6 +634,8 @@
+@@ -589,6 +719,8 @@
  	ndev->hard_header_len = 0;
  	ndev->addr_len = 0;
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;

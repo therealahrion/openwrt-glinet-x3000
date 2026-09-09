@@ -56,7 +56,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
-@@ -27,7 +27,12 @@
+@@ -29,8 +29,13 @@
  #include <linux/usb/usbnet.h>
  #include <linux/usb/cdc_ncm.h>
  #include <linux/wwan.h>
@@ -65,11 +65,12 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +#include <linux/filter.h>
 +#include <linux/rtnetlink.h>
  #include <net/gro_cells.h>
+ #include <net/ip.h>
 +#include <net/xdp.h>
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -50,6 +55,8 @@
+@@ -53,6 +58,8 @@
  	struct net_device *ndev;
  	unsigned int session;
  	struct gro_cells gcells;
@@ -78,7 +79,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -254,6 +261,160 @@
+@@ -257,6 +264,160 @@
  	return ret;
  }
  
@@ -236,10 +237,10 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	}
 +}
 +
- static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
- {
- 	int ndpoffset;
-@@ -307,6 +468,8 @@
+ /* Cheap per-flow hash, for GRO bucketing only.
+  *
+  * dev_gro_receive() selects its bucket with skb_get_hash_raw(), and
+@@ -391,6 +552,8 @@
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -248,7 +249,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -318,13 +481,22 @@
+@@ -402,13 +565,22 @@
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -272,13 +273,12 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			switch (skbn->data[0] & 0xf0) {
  			case 0x40:
  				skbn->protocol = htons(ETH_P_IP);
-@@ -563,14 +735,40 @@
+@@ -648,14 +820,40 @@
  static int mhi_mbim_ndo_init(struct net_device *ndev)
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
 +	int err;
- 
--	return gro_cells_init(&link->gcells, ndev);
++
 +	err = gro_cells_init(&link->gcells, ndev);
 +	if (err)
 +		return err;
@@ -291,7 +291,8 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +					 NULL);
 +	if (err)
 +		goto err_rxq;
-+
+ 
+-	return gro_cells_init(&link->gcells, ndev);
 +	return 0;
 +
 +err_rxq:
@@ -314,7 +315,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  }
  
-@@ -581,6 +779,7 @@
+@@ -666,6 +864,7 @@
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
@@ -322,7 +323,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -636,6 +835,7 @@
+@@ -721,6 +920,7 @@
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
  	ndev->features |= NETIF_F_GRO;
  	ndev->hw_features |= NETIF_F_GRO;
