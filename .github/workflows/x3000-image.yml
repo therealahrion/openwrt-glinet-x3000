@@ -84,20 +84,26 @@ jobs:
 
       # Fail fast (before ~4h of compiling) if the composition is wrong:
       # vjt's stock modem stack must be in, the lean overlay must be in,
-      # and the excluded stacks (QModem, qosify/sqm, zram, tc-tiny) out.
+      # and the excluded stacks (QModem, qosify/sqm, tc-tiny) out. zram is
+      # shipped but dormant, so it is asserted PRESENT and asserted disabled.
       - name: Sanity-check composed .config
         run: |
           set -e
           for s in modemmanager kmod-mhi-pci-generic luci-proto-modemmanager quectel-5g-tools \
                    kmod-tcp-bbr kmod-sched-cake kmod-sched-bpf kmod-ifb tc-bpf libbpf \
-                   bpftool-full xdp-loader xdpdump fping kmod-wireguard luci-proto-wireguard; do
+                   bpftool-full xdp-loader xdpdump fping kmod-wireguard luci-proto-wireguard \
+                   kmod-zram zram-swap; do
             grep -q "^CONFIG_PACKAGE_$s=y" .config || { echo "missing: $s" >&2; exit 1; }
           done
-          for s in qmodem kmod-pcie_mhi qosify sqm-scripts luci-app-sqm kmod-zram zram-swap tc-tiny ply; do
+          for s in qmodem kmod-pcie_mhi qosify sqm-scripts luci-app-sqm tc-tiny ply; do
             if grep -q "^CONFIG_PACKAGE_$s=y" .config; then echo "leaked in: $s" >&2; exit 1; fi
           done
           grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-x3000=y' .config
+          # zram ships dormant: the package is in, the service is disabled on
+          # first boot. If that uci-default ever goes missing, zram would come
+          # up live on a 512 MB box -- so gate on it.
+          test -f x3000/files-common/etc/uci-defaults/99-zram-disabled
           echo "config OK"
 
       - name: Download sources
