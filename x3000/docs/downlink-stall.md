@@ -151,26 +151,87 @@ settle it directly.
 - **The Windows NCSI indicator.** Real but cosmetic: `dns.msftncsi.com`
   publishes a ULA AAAA that dnsmasq's rebind protection strips.
 
-## What is left
+## Measured: the doorbell is only ever rung by a power transition
 
-**1. A burst-mode doorbell that stops being rung.** Both data channels are
-`MHI_DB_BRST_ENABLE`, where `mhi_db_brstmode()` writes the doorbell register
-only while `db_mode` is set and clears it after each write. The modem re-arms
-it by sending `MHI_EV_CC_DB_MODE`. If that event is missed or never sent, the
-host keeps posting buffers and updating `wp` in shared memory but never pokes
-the doorbell, and the modem never learns the buffers are there. Testing it
-means switching channels 100 and 101 to `MHI_DB_BRST_DISABLE`, which makes the
-host write the doorbell on every posted buffer, at the cost of one MMIO write
-each.
+Capture of 2026-09-09 17:27 to 17:36, with `kptr_restrict=1` so the driver's
+own ring pointers are readable. Nine minutes at 1 Hz. This settles the
+mechanism.
 
-Note `doorbell_mode_switch` is true for these channels, so an M3 to M0 power
-transition re-arms `db_mode` and rings the doorbell. That is a plausible
-explanation for why replugging the LAN cable - which makes a client re-DHCP,
-generating traffic that forces a resume - appears to clear the stall.
+**The host ring is healthy and never starved.** `dl_qd` traces a clean sawtooth
+between about 65 and 127 posted buffers. That floor is not arbitrary:
+`mhi_mbim_dl_callback()` schedules a refill only once free descriptors reach
+half the queue (`free_desc_count >= mbim->rx_queue_sz / 2`, i.e. 63 of 127), so
+the ring is meant to drain to ~64 before being topped up. The measurement
+matches the driver exactly, which also validates the instrument.
 
-**2. The modem firmware simply stops sending.** The cellular LED has been seen
-dropping from three bars to one and back around a stall. Distinguishing this
-needs the modem's own registration and RRC state during a freeze.
+**The completion ring is never backed up.** Downlink event-ring backlog is one
+element essentially always, peaking at five, against a 1024-element ring, while
+both CPUs sit at 0-5 percent. The unbounded drain loop keeps up easily, so 991's
+per-datagram work in that loop is not a factor. (An earlier version of
+`dlwatch.sh` reported a recurring backlog of 14352 here. That was a bug of mine:
+`off()` masked every pointer to the 0x800 data-ring size, so event offsets
+straddling a 0x800 boundary inverted the subtraction. Fixed; the value is
+reproducible from the bug and was never real.)
+
+**And the finding.** From 17:27:40 to 17:32:51 - five minutes of continuous
+traffic - `dl_db` sat frozen at index 68 and the modem's `dev_rp` at 99, while
+`dl_wp` cycled right around the ring many times. The host posted hundreds of
+buffers and wrote the doorbell register **zero** times.
+
+At 17:32:54 both began moving. The reason is in the `m0`/`m3` columns: the
+controller's power-transition counters had been static at 253/252 for that whole
+five minutes, and resumed incrementing at 17:32:56. From then on every single
+`m0` increment is matched one-for-one by a step in `dl_db`:
+
+| time | m0 | dl_db | dev_rp |
+|---|---|---|---|
+| 17:27:40 - 17:32:51 | 253 | 68 | 99 |
+| 17:32:54 | 254 | 24 | 35 |
+| 17:33:20 | 255 | 22 | 64 |
+| 17:34:14 | 256 | 79 | 11 |
+| 17:34:34 | 256 | 77 | 80 |
+| 17:34:54 | 258 | 12 | 14 |
+| 17:35:35 | 260 | 10 | 62 |
+| 17:35:55 | 262 | 73 | 109 |
+
+So on this hardware **the only thing that ever writes the downlink doorbell is
+an M3 to M0 transition.** That follows from the code: both data channels are
+`MHI_DB_BRST_ENABLE`, where `mhi_db_brstmode()` writes the register only while
+`db_mode` is set and clears it after each write; `mhi_pm_m0_transition()` re-arms
+`db_mode` because `doorbell_mode_switch` is true for these channels; and the
+only other re-arm is a `MHI_EV_CC_DB_MODE` event from the modem, which evidently
+is not arriving. It also explains why `dev_rp` looked frozen: the modem
+republishes its read pointer around those same transitions and not otherwise.
+
+The consequence is the important part. **Under sustained traffic the modem never
+suspends, so the doorbell is never written** - exactly the condition in which a
+stall does the most damage. If the modem stops and waits for a doorbell during
+that window, nothing on the host will ring it until traffic drops long enough
+for a suspend/resume cycle, or until something forces a wake. Replugging the LAN
+cable forces one: the client re-DHCPs, that traffic drives a resume, and the
+resume rings the bell.
+
+## The radio is also genuinely marginal
+
+In the same window: RSRP -101 to -103 dBm, RSRQ -10 dB, SINR 15-16 on a 90 MHz
+n41 carrier, with the SCC n25 aggregated but reporting no RSRP or SINR at all.
+Round trips to 1.1.1.1 range from 28 ms to 689 ms with occasional timeouts,
+while `rx_dropped` does not move at all - so the loss is upstream of the router,
+not inside it.
+
+## Where that leaves it
+
+One theory covers everything observed: **the radio supplies the pause, and the
+missing doorbell makes it persist.** A marginal link stalls briefly; that should
+be a blip, but with no doorbell coming it becomes a freeze lasting until a power
+transition or a forced wake. That accounts for the random timing, the duration
+being far longer than any plausible radio dip, the LAN-replug workaround, the
+clean dmesg, the healthy host ring, and the idle CPU.
+
+The test is to switch channels 100 and 101 to `MHI_DB_BRST_DISABLE`, making the
+host write the doorbell on every posted buffer at the cost of one MMIO write
+each. Prediction: the long freezes disappear, while the high round trips and
+timeouts remain, since nothing there touches the radio.
 
 ## Upstream, and prior reports
 

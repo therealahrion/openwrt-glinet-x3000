@@ -40,9 +40,13 @@
 # Columns and what they would mean:
 #
 #   dl_qd     downlink buffers the host has posted and not yet reaped, out of
-#             127. High is healthy - the host keeps the ring stuffed. Falling
-#             toward 0 means the host could not post fast enough, which would
-#             make the stall ours.
+#             127. Healthy looks like a sawtooth between about 65 and 127, and
+#             that bound is not arbitrary: mhi_mbim_dl_callback() only schedules
+#             a refill once free descriptors reach half the queue, so the ring
+#             drains to ~64 posted before being topped back up. Values hovering
+#             near 0 would mean the host could not post fast enough, which
+#             would make the stall ours. Measured 2026-09-09: a clean sawtooth
+#             with a floor of 65-72, i.e. never starved.
 #   dl_free   127 - dl_qd, i.e. what mhi_get_free_desc_count() returns.
 #   er3_bk    unprocessed entries in the downlink completion ring, out of 1024.
 #             mhi_ev_task() drains that ring with no budget (event_quota is
@@ -86,7 +90,11 @@ echo $$ > "$PIDFILE"
 
 # Offset within the ring, taken from the last four hex characters so a 64-bit
 # kernel pointer never overflows shell arithmetic.
-off() { L=${1#0x}; L=${L#${L%????}}; echo $(( 0x$L & (RBYTES - 1) )); }
+# Byte offset within a ring, from the last four hex characters so a 64-bit
+# kernel pointer never overflows shell arithmetic. The ring size must be passed
+# because the data rings are 0x800 and the event rings 0x4000; masking an event
+# pointer to 0x800 silently inverts the subtraction below.
+off() { L=${1#0x}; L=${L#${L%????}}; echo $(( 0x$L & (${2:-RBYTES} - 1) )); }
 real() { case "$1" in 0xffff*) return 0;; *) return 1;; esac; }
 gap() { echo $(( ($1 - $2 + $3) % $3 )); }
 
@@ -115,11 +123,13 @@ while :; do
 		DWP=-1; DDB=-1; DRP=-1; QD=-1; FREE=-1
 	fi
 
+	# Event-ring backlog in elements, not bytes. $11 is the ring length, so the
+	# mask follows the ring rather than being assumed.
 	E3=-1; E2=-1
 	set -- $(awk '/^Index: 3 /{ print $9, $11, $13, $15 }' "$MHI_DIR/events" 2>/dev/null)
-	[ $# -eq 4 ] && E3=$(gap "$(( ($(off "$3")) ))" "$(( ($(off "$4")) ))" "$2")
+	[ $# -eq 4 ] && E3=$(( $(gap "$(off "$3" "$2")" "$(off "$4" "$2")" "$2") / 16 ))
 	set -- $(awk '/^Index: 2 /{ print $9, $11, $13, $15 }' "$MHI_DIR/events" 2>/dev/null)
-	[ $# -eq 4 ] && E2=$(gap "$(( ($(off "$3")) ))" "$(( ($(off "$4")) ))" "$2")
+	[ $# -eq 4 ] && E2=$(( $(gap "$(off "$3" "$2")" "$(off "$4" "$2")" "$2") / 16 ))
 
 	set -- $(awk '/^cpu[01] /{ t=0; for(i=2;i<=NF;i++) t+=$i; print t, $5, $8 }' /proc/stat)
 	C0T=$1; C0I=$2; C0S=$3; C1T=$4; C1I=$5; C1S=$6
