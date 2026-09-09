@@ -110,6 +110,30 @@ the freeze also kills ICMP, which BBR does not touch. `PCI_DEBUG` only adds log
 messages. `PREEMPT_DYNAMIC` changes when work runs, not whether the modem
 writes.
 
+### Correction: this covers the freeze, not entry into it
+
+The argument above proves the patched code does not run *while* the link is
+stalled. It does not prove the patched code cannot cause the stall to start,
+and a later observation makes that distinction matter: the stall only appears
+above roughly 200-300 Mbps.
+
+`mhi_ev_task()` drains the downlink completion ring with no budget - the quota
+it passes is `U32_MAX` - and calls `mhi_mbim_dl_callback()` inline for every
+entry. So NTB de-aggregation, the per-datagram `netdev_alloc_skb`, the copy,
+and everything 991 added (a per-datagram flow hash, then `gro_cells_receive`)
+all execute inside that single unbounded loop, in a tasklet, on whichever CPU
+took the interrupt. All four MHI vectors land on CPU0, so uplink and downlink
+event processing share one A53 core.
+
+That makes 991 a live suspect again for *entering* the stall, by slowing the
+drain loop until the modem has nowhere left to report completions. 992 is not:
+with no XDP program attached it costs one `rcu_dereference` per datagram.
+
+`er3_bk` in `dlwatch.sh` measures this directly - unprocessed entries in the
+downlink completion ring, out of 1024. If it climbs toward 1023 as throughput
+rises, the drain loop is the bottleneck. If it stays at 1 right up to the
+freeze, the loop is keeping up and the fault is still below the driver.
+
 **So the stall should be present on `jeeves-r8` as well.** That is an inference
 from the diff, not a measurement. Flashing `jeeves-r8` and reproducing would
 settle it directly.
