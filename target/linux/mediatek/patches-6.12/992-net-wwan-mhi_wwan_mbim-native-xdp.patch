@@ -1,50 +1,31 @@
 From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
-Subject: net: wwan: mhi_wwan_mbim: native XDP hook on the RX datagram path
+Subject: net: wwan: mhi_wwan_mbim: XDP hook on the RX datagram path
 
 Stage 2 on top of the gro_cells conversion (991): run an attached XDP
-program on every de-aggregated MBIM datagram, before GRO/stack
-delivery. Implements ndo_bpf (XDP_SETUP_PROG), a per-link rcu-protected
-prog pointer, an xdp_rxq_info registered per link netdev, and
-NETDEV_XDP_ACT_BASIC advertisement so ip/libxdp attach in driver mode.
-The xdp_rxq_info is registered from ndo_init and torn down in ndo_uninit,
-alongside the gro_cells 991 put there, so the core unwinds both on a
-failed register_netdevice() and neither newlink nor dellink needs an
-error ladder of its own.
+program on every de-aggregated MBIM datagram, before GRO/stack delivery.
+Implements ndo_bpf (XDP_SETUP_PROG), a per-link rcu-protected prog
+pointer, and NETDEV_XDP_ACT_BASIC|REDIRECT advertisement, so ip/libxdp
+attach in driver mode.
 
-An XDP frame must fit in one page, so a datagram larger than
-MHI_MBIM_XDP_MAX_MTU cannot be handed to a program at all. ndo_bpf refuses
-to attach above that MTU, and ndo_change_mtu refuses to grow past it while
-a program is attached -- without the second guard the first is trivially
-defeated by attaching at a small MTU and raising it afterwards. Should an
-oversized datagram arrive regardless (dgram_len is a u16 read from the NTB
-and is never validated against the MTU) it is now dropped and counted
-rather than passed to the stack: walking a frame around an attached filter
-is a bypass, not a fast path, and previously it happened silently.
+The program is run through do_xdp_generic() rather than by hand. That is
+deliberate and load-bearing in three separate ways.
 
-ndo_bpf returns -EOPNOTSUPP rather than -EINVAL for commands this driver
-does not implement -- the request is well formed, the driver simply does
-not support it, and userspace distinguishes the two.
+Completeness. do_xdp_generic() implements XDP_PASS, XDP_DROP,
+XDP_ABORTED, XDP_TX and XDP_REDIRECT. A module cannot implement the last
+two itself: generic_xdp_tx() and xdp_do_generic_redirect() are both
+private to net/core. Hand-rolling the hook therefore means refusing
+XDP_REDIRECT -- and refusing XDP_REDIRECT means refusing AF_XDP, since
+every `xdp-loader load` of an AF_XDP program installs libxdp's
+xsk_def_prog, whose only verdict is bpf_redirect_map(). drivers/net/tun.c
+makes the same call from its own driver context for the same reason.
 
-Honest ceiling, by design: MBIM NTB aggregation means datagrams share
-one 32KB DMA buffer, so each is copied out before the program runs —
-this hook buys the earliest possible drop point and driver-context
-filtering, not the zero-copy page-flip fast path XDP has on real NICs.
-Verdicts: XDP_PASS (head/tail/meta adjustments propagated to the skb),
-XDP_DROP/XDP_ABORTED (counted in rx_errors, traced), XDP_TX (reflected
-via dev_queue_xmit, so the egress qdisc still applies). XDP_REDIRECT is
-intentionally not implemented (it would bypass the shaper); it warns
-and drops. When no program is attached the cost is one rcu_dereference
-per datagram.
-
-The program run is bracketed by bpf_net_ctx_set()/bpf_net_ctx_clear().
-Since 401cb7dae813 the redirect helpers read struct bpf_redirect_info
-out of current->bpf_net_context, and bpf_net_ctx_get_ri() dereferences
-that pointer unchecked; the core establishes it only in net_rx_action(),
-napi_threaded_poll_loop(), __napi_busy_loop(), busy_poll_stop(),
-sch_handle_ingress/egress(), cpu_map_bpf_prog_run() and run_lwt_bpf().
-An XDP hook driven from a bus callback rather than a NAPI poll gets
-none of those, so any program calling bpf_redirect_map() -- including
-libxdp's xsk_def_prog, which `xdp-loader load` installs by default --
+Safety. Since 401cb7dae813 the redirect helpers read struct
+bpf_redirect_info out of current->bpf_net_context, and
+bpf_net_ctx_get_ri() dereferences that pointer unchecked. The core
+establishes it only in net_rx_action(), napi_threaded_poll_loop(),
+__napi_busy_loop(), busy_poll_stop(), sch_handle_ingress/egress(),
+cpu_map_bpf_prog_run() and run_lwt_bpf(). This hook is driven from the
+MHI DL tasklet, which is none of them, so a bare bpf_prog_run_xdp() here
 oopsed on NULL+0x38 on the first datagram received:
 
   Unable to handle kernel read from unreadable memory at 0x38
@@ -55,59 +36,72 @@ oopsed on NULL+0x38 on the first datagram received:
     mhi_process_data_event_ring [mhi] / mhi_ev_task [mhi]
     tasklet_action_common / handle_softirqs
 
-Reflected XDP_TX frames get skb->protocol and the network header set
-explicitly: they never traverse __netif_receive_skb_core(), which is
-what normally does both, and without them cake_handle_diffserv() reads
-protocol 0 and a bogus network offset — every reflection would land in
-the besteffort tin with its DSCP ignored.
+do_xdp_generic() sets up and tears down that context itself, so the
+failure mode cannot recur here.
 
-XDP_DROP is accounted to the core rx_dropped counter rather than
-rx_errors: a policy drop is not a receive error, and conflating them
-makes a healthily filtering link look faulty in `ip -s link`.
-XDP_ABORTED and invalid verdicts still count as rx_errors.
+GRO. The program is kept on link->xdp_prog, not dev->xdp_prog.
+dev->xdp_prog is what netif_elide_gro() tests, and gro_cells_receive()
+checks it on every datagram, falling back to netif_rx(); attaching the
+same program in XDP_MODE_SKB would therefore silently switch off the GRO
+991 exists to provide. Owning ndo_bpf also makes XDP_MODE_DRV the default
+attach mode for this device (dev_xdp_mode()), so `ip link set dev wwan0
+xdp ...` lands here rather than in the generic path.
+
+Two ordering requirements the core imposes on the caller, both satisfied
+before the program runs. bpf_prog_run_generic_xdp() computes mac_len as
+skb->data - skb_mac_header(skb) and pushes that much: netdev_alloc_skb()
+leaves the mac header at its ~0U sentinel, so it must be anchored first
+or the arithmetic walks off the front of the buffer. And skb->protocol
+must already be set, because generic_xdp_tx() and
+dev_map_generic_redirect() both end in dev_queue_xmit(), which does not
+re-derive it. On a raw-IP link mac_len is 0, so the program sees the IP
+header at offset 0 -- programs written against an Ethernet header will
+misparse silently here, reading the first two octets of the source
+address as an EtherType.
+
+XDP_PACKET_HEADROOM is reserved in front of each datagram whenever a
+program is attached, so netif_skb_check_for_xdp() never has to
+pskb_expand_head(). When no program is attached the cost of this hook is
+one rcu_dereference per datagram.
+
+Honest ceiling, by design: MBIM NTB aggregation means datagrams share one
+32KB DMA buffer, so each is copied out before the program runs. This hook
+buys the earliest available drop point and driver-context filtering, not
+the zero-copy page-flip fast path XDP has on real NICs.
 
 Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
-@@ -22,6 +22,7 @@
- #include <linux/mod_devicetable.h>
- #include <linux/module.h>
- #include <linux/netdevice.h>
-+#include <linux/netlink.h>
- #include <linux/skbuff.h>
- #include <linux/u64_stats_sync.h>
- #include <linux/usb.h>
-@@ -29,8 +30,13 @@
- #include <linux/usb/usbnet.h>
- #include <linux/usb/cdc_ncm.h>
- #include <linux/wwan.h>
+@@ -11,6 +11,7 @@
+  *
+  */
+ 
 +#include <linux/bpf.h>
-+#include <linux/bpf_trace.h>
-+#include <linux/filter.h>
-+#include <linux/rtnetlink.h>
+ #include <linux/ethtool.h>
+ #include <linux/if_arp.h>
+ #include <linux/if_vlan.h>
+@@ -31,6 +32,7 @@
+ #include <linux/wwan.h>
  #include <net/gro_cells.h>
  #include <net/ip.h>
 +#include <net/xdp.h>
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -53,6 +59,8 @@
+@@ -53,6 +55,7 @@
  	struct net_device *ndev;
  	unsigned int session;
  	struct gro_cells gcells;
 +	struct bpf_prog __rcu *xdp_prog;
-+	struct xdp_rxq_info xdp_rxq;
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -257,6 +265,194 @@
- 	return ret;
+@@ -338,6 +341,106 @@
+ 	skb_set_hash(skb, jhash_3words(a, b, ports, proto), PKT_HASH_TYPE_NONE);
  }
  
-+/* Raw-IP framing: the first nibble of the datagram selects the L3
-+ * protocol. Returns 0 (unknown) for anything else.
-+ */
++/* Raw-IP link: the version nibble is the only protocol indicator. */
 +static __be16 mhi_mbim_ip_proto(const struct sk_buff *skb)
 +{
 +	switch (skb->data[0] & 0xf0) {
@@ -120,149 +114,71 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	}
 +}
 +
-+/* An XDP frame must fit in a single page: XDP_PACKET_HEADROOM at the front
-+ * for bpf_xdp_adjust_head(), and room at the back for the skb_shared_info
-+ * that bpf_xdp_adjust_tail() grows into. A datagram larger than this cannot
-+ * be handed to a program at all, so it also bounds the MTU at which XDP can
-+ * be used on this device -- enforced in ndo_bpf and ndo_change_mtu below.
-+ */
-+#define MHI_MBIM_XDP_MAX_MTU	(PAGE_SIZE - XDP_PACKET_HEADROOM - \
-+				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
-+
 +/* Run the attached XDP program on one de-aggregated datagram.
-+ * Returns true if the skb should continue to the stack (XDP_PASS),
-+ * false if it was consumed (dropped or reflected).
-+ * Called under rcu_read_lock() from the NTB parsing loop; the skb is
-+ * linear, private, and was allocated with XDP_PACKET_HEADROOM.
++ *
++ * This defers to do_xdp_generic(), which is EXPORT_SYMBOL_GPL and implements
++ * the complete action set: XDP_PASS, XDP_DROP, XDP_ABORTED, XDP_TX and
++ * XDP_REDIRECT.  A module cannot implement the last two itself --
++ * generic_xdp_tx() and xdp_do_generic_redirect() are both private to
++ * net/core -- so hand-rolling the hook would mean refusing REDIRECT, which
++ * also refuses AF_XDP: every `xdp-loader load` of an AF_XDP program installs
++ * libxdp's xsk_def_prog, whose only verdict is bpf_redirect_map().
++ * drivers/net/tun.c uses this same call for its own fallback path.
++ *
++ * do_xdp_generic() also establishes its own bpf_net_context.  Since
++ * 401cb7dae813 the redirect helpers read struct bpf_redirect_info out of
++ * current->bpf_net_context and bpf_net_ctx_get_ri() dereferences it
++ * unchecked; the core sets one up only in net_rx_action(),
++ * napi_threaded_poll_loop(), __napi_busy_loop(), busy_poll_stop(),
++ * sch_handle_ingress/egress(), cpu_map_bpf_prog_run() and run_lwt_bpf().
++ * This hook runs from the MHI DL tasklet, which is none of them.
++ *
++ * The program stays on link->xdp_prog rather than dev->xdp_prog.  That
++ * distinction is load-bearing: dev->xdp_prog is what netif_elide_gro()
++ * tests, and gro_cells_receive() checks it on every datagram
++ * (net/core/gro_cells.c), so attaching in XDP_MODE_SKB instead would
++ * silently disable the GRO this driver was converted to use.
++ *
++ * Returns true when the caller should keep processing *pskb, false when it
++ * has been consumed.  *pskb may be replaced: netif_skb_check_for_xdp()
++ * reallocates when headroom is short.  It will not be here -- the RX loop
++ * reserves XDP_PACKET_HEADROOM whenever a program is attached -- but the
++ * contract is honoured regardless.
 + */
 +static bool mhi_mbim_xdp_rx(struct mhi_mbim_link *link,
-+			    struct bpf_prog *xdp_prog, struct sk_buff *skbn)
++			    struct bpf_prog *xdp_prog, struct sk_buff **pskb)
 +{
-+	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
-+	void *orig_data, *orig_data_end;
-+	struct xdp_buff xdp;
-+	int delta;
-+	u32 act;
++	struct sk_buff *skbn = *pskb;
 +
-+	/* Cannot happen while a program is attached: ndo_bpf refuses to
-+	 * attach above MHI_MBIM_XDP_MAX_MTU and ndo_change_mtu refuses to
-+	 * grow past it. A datagram this large therefore violates the MTU the
-+	 * attached program was validated against. Drop it: passing it would
-+	 * silently walk it around the filter, which for a filtering program
-+	 * is a bypass rather than a performance note. Counted and logged so
-+	 * the event is diagnosable if it ever does occur.
++	/* bpf_prog_run_generic_xdp() computes mac_len as
++	 * skb->data - skb_mac_header(skb) and __skb_push()es that much before
++	 * running the program.  netdev_alloc_skb() leaves the mac header at
++	 * its ~0U sentinel, so it has to be anchored first or that arithmetic
++	 * walks off the front of the buffer.  Raw IP: mac_len is 0, so the
++	 * push is a no-op and the program sees the IP header at offset 0.
++	 *
++	 * protocol is needed here too, not just on the XDP_PASS path:
++	 * generic_xdp_tx() and dev_map_generic_redirect() both end in
++	 * dev_queue_xmit(), and neither re-derives it.
 +	 */
-+	if (unlikely(skbn->len > MHI_MBIM_XDP_MAX_MTU)) {
-+		net_warn_ratelimited("%s: %u-byte datagram exceeds the %lu-byte XDP limit, dropping\n",
-+				     netdev_name(link->ndev), skbn->len,
-+				     (unsigned long)MHI_MBIM_XDP_MAX_MTU);
-+		dev_core_stats_rx_dropped_inc(link->ndev);
-+		dev_kfree_skb_any(skbn);
++	skb_reset_network_header(skbn);
++	skb_reset_mac_header(skbn);
++	skbn->protocol = mhi_mbim_ip_proto(skbn);
++
++	if (do_xdp_generic(xdp_prog, pskb) != XDP_PASS)
 +		return false;
-+	}
 +
-+	xdp_init_buff(&xdp,
-+		      skb_end_offset(skbn) +
-+		      SKB_DATA_ALIGN(sizeof(struct skb_shared_info)),
-+		      &link->xdp_rxq);
-+	xdp_prepare_buff(&xdp, skbn->head, skb_headroom(skbn), skbn->len,
-+			 true);
-+	orig_data = xdp.data;
-+	orig_data_end = xdp.data_end;
-+
-+	/* Establish the per-task bpf_net_context that the redirect
-+	 * helpers reach for. bpf_net_ctx_get_ri() dereferences
-+	 * current->bpf_net_context with no NULL check, and the core only
-+	 * sets one up in net_rx_action(), napi_threaded_poll_loop(),
-+	 * __napi_busy_loop(), busy_poll_stop(), sch_handle_ingress(),
-+	 * sch_handle_egress(), cpu_map_bpf_prog_run() and run_lwt_bpf().
-+	 * This hook runs from the MHI DL tasklet, which is none of them,
-+	 * so without this any attached program that calls
-+	 * bpf_redirect_map() and friends -- e.g. libxdp's xsk_def_prog,
-+	 * which every `xdp-loader load` of an AF_XDP program installs --
-+	 * faults reading NULL + offsetof(struct bpf_redirect_info,
-+	 * kern_flags) on the first datagram received. Nesting-safe:
-+	 * bpf_net_ctx_set() returns NULL when a context is already active
-+	 * and bpf_net_ctx_clear(NULL) is a no-op. Cleared before the
-+	 * XDP_TX dev_queue_xmit() below, so egress tc establishes its own.
-+	 */
-+	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
-+	act = bpf_prog_run_xdp(xdp_prog, &xdp);
-+	bpf_net_ctx_clear(bpf_net_ctx);
-+
-+	switch (act) {
-+	case XDP_PASS:
-+	case XDP_TX:
-+		/* Propagate head/tail adjustments back to the skb */
-+		delta = orig_data - xdp.data;
-+		if (delta > 0)
-+			skb_push(skbn, delta);
-+		else if (delta < 0)
-+			skb_pull(skbn, -delta);
-+		delta = xdp.data_end - orig_data_end;
-+		if (delta > 0)
-+			skb_put(skbn, delta);
-+		else if (delta < 0)
-+			__skb_trim(skbn, skbn->len + delta);
-+		skb_metadata_set(skbn, xdp.data - xdp.data_meta);
-+
-+		if (act == XDP_PASS)
-+			return true;
-+
-+		/* XDP_TX: reflect back out this interface via
-+		 * dev_queue_xmit so the egress qdisc still applies. This
-+		 * skb never went through the RX stack, which is what
-+		 * normally calls skb_reset_network_header() and sets
-+		 * skb->protocol. Without both, cake_handle_diffserv()
-+		 * sees protocol 0 and a bogus network offset, so every
-+		 * reflected packet lands in besteffort with its DSCP
-+		 * ignored.
-+		 */
-+		skb_reset_network_header(skbn);
-+		skbn->protocol = mhi_mbim_ip_proto(skbn);
-+		skbn->dev = link->ndev;
-+		dev_queue_xmit(skbn);
-+		return false;
-+	case XDP_REDIRECT:
-+		/* Not implemented, and not merely as policy: these skbs are
-+		 * kmalloc-backed, so xdp_convert_buff_to_frame() would hand
-+		 * xdp_return_frame() a slab address to page_frag_free() under
-+		 * MEM_TYPE_PAGE_SHARED. Doing it properly would mean
-+		 * xdp_do_generic_redirect(), which bypasses the egress
-+		 * qdisc/shaper anyway.
-+		 */
-+		fallthrough;
-+	default:
-+		bpf_warn_invalid_xdp_action(link->ndev, xdp_prog, act);
-+		fallthrough;
-+	case XDP_ABORTED:
-+		/* Program fault or invalid verdict: a genuine RX error. */
-+		trace_xdp_exception(link->ndev, xdp_prog, act);
-+		u64_stats_update_begin(&link->rx_syncp);
-+		u64_stats_inc(&link->rx_errors);
-+		u64_stats_update_end(&link->rx_syncp);
-+		dev_kfree_skb_any(skbn);
-+		return false;
-+	case XDP_DROP:
-+		/* Deliberate policy drop, not an error: counting it in
-+		 * rx_errors makes `ip -s link` show a healthily filtered
-+		 * link as faulty. Use the core rx_dropped counter, which
-+		 * dev_get_stats() merges on top of ndo_get_stats64() —
-+		 * the same thing gro_cells does on its own drop path.
-+		 */
-+		dev_core_stats_rx_dropped_inc(link->ndev);
-+		dev_kfree_skb_any(skbn);
-+		return false;
-+	}
++	return true;
 +}
 +
++/* Serialised by rtnl: ndo_bpf and ndo_uninit are both rtnl-only paths. */
 +static int mhi_mbim_xdp_set(struct net_device *ndev, struct bpf_prog *prog)
 +{
 +	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
 +	struct bpf_prog *old;
 +
-+	old = rcu_replace_pointer(link->xdp_prog, prog,
-+				  lockdep_rtnl_is_held());
++	old = rtnl_dereference(link->xdp_prog);
++	rcu_assign_pointer(link->xdp_prog, prog);
 +	if (old)
 +		bpf_prog_put(old);
 +
@@ -273,30 +189,22 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +{
 +	switch (bpf->command) {
 +	case XDP_SETUP_PROG:
-+		/* A program cannot be run on datagrams that do not fit one
-+		 * page, so refuse to attach at an MTU where that is possible
-+		 * rather than silently skipping the program at runtime.
-+		 */
-+		if (bpf->prog && ndev->mtu > MHI_MBIM_XDP_MAX_MTU) {
-+			NL_SET_ERR_MSG_MOD(bpf->extack,
-+					   "MTU too large for XDP on this device");
-+			return -EOPNOTSUPP;
-+		}
 +		return mhi_mbim_xdp_set(ndev, bpf->prog);
 +	default:
 +		/* -EOPNOTSUPP, not -EINVAL: the request is well formed, this
-+		 * driver simply does not implement it. Userspace distinguishes
-+		 * the two -- e.g. AF_XDP zero-copy setup probes with
-+		 * XDP_SETUP_XSK_POOL.
++		 * driver simply does not implement it.  Userspace
++		 * distinguishes the two -- AF_XDP zero-copy setup probes with
++		 * XDP_SETUP_XSK_POOL and must see "unsupported", not
++		 * "malformed".
 +		 */
 +		return -EOPNOTSUPP;
 +	}
 +}
 +
- /* Cheap per-flow hash, for GRO bucketing only.
-  *
-  * dev_gro_receive() selects its bucket with skb_get_hash_raw(), and
-@@ -391,6 +587,8 @@
+ static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
+ {
+ 	int ndpoffset;
+@@ -391,6 +494,8 @@
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -305,11 +213,17 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -402,13 +600,22 @@
+@@ -402,21 +507,30 @@
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
 -			skbn = netdev_alloc_skb(link->ndev, dgram_len);
++			/* XDP programs are entitled to XDP_PACKET_HEADROOM in front
++			 * of the data for bpf_xdp_adjust_head().  Reserving it here
++			 * keeps netif_skb_check_for_xdp() from having to
++			 * pskb_expand_head() every datagram; when no program is
++			 * attached it costs nothing.
++			 */
 +			xdp_prog = rcu_dereference(link->xdp_prog);
 +			headroom = xdp_prog ? XDP_PACKET_HEADROOM : 0;
 +
@@ -322,110 +236,55 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			skb_put(skbn, dgram_len);
  			skb_copy_bits(skb, dgram_offset, skbn->data, dgram_len);
  
+-			switch (skbn->data[0] & 0xf0) {
+-			case 0x40:
+-				skbn->protocol = htons(ETH_P_IP);
+-				break;
+-			case 0x60:
+-				skbn->protocol = htons(ETH_P_IPV6);
+-				break;
+-			default:
 +			if (xdp_prog &&
-+			    !mhi_mbim_xdp_rx(link, xdp_prog, skbn))
-+				continue; /* consumed: DROP/TX/... */
++			    !mhi_mbim_xdp_rx(link, xdp_prog, &skbn))
++				continue; /* consumed: DROP/TX/REDIRECT */
 +
- 			switch (skbn->data[0] & 0xf0) {
- 			case 0x40:
- 				skbn->protocol = htons(ETH_P_IP);
-@@ -613,6 +820,25 @@
- 		netif_wake_queue(ndev);
- }
- 
-+/* Without this, the ndo_bpf guard is defeated by attaching a program at a
-+ * small MTU and then raising the MTU afterwards.
-+ */
-+static int mhi_mbim_ndo_change_mtu(struct net_device *ndev, int new_mtu)
-+{
-+	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
-+
-+	if (new_mtu > (int)MHI_MBIM_XDP_MAX_MTU &&
-+	    rtnl_dereference(link->xdp_prog)) {
-+		netdev_err(ndev, "MTU %d exceeds the %lu-byte XDP limit while a program is attached\n",
-+			   new_mtu, (unsigned long)MHI_MBIM_XDP_MAX_MTU);
-+		return -EINVAL;
-+	}
-+
-+	/* Pairs with the lockless readers of dev->mtu in the stack. */
-+	WRITE_ONCE(ndev->mtu, new_mtu);
-+	return 0;
-+}
-+
- static int mhi_mbim_ndo_open(struct net_device *ndev)
- {
- 	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
-@@ -648,14 +874,55 @@
- static int mhi_mbim_ndo_init(struct net_device *ndev)
- {
- 	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
-+	int err;
- 
--	return gro_cells_init(&link->gcells, ndev);
-+	err = gro_cells_init(&link->gcells, ndev);
-+	if (err)
-+		return err;
-+
-+	err = xdp_rxq_info_reg(&link->xdp_rxq, ndev, 0, 0);
-+	if (err)
-+		goto err_gcells;
-+
-+	/* WARNING before changing this: our RX buffers are kmalloc'd sk_buff
-+	 * heads, NOT page fragments. Under MEM_TYPE_PAGE_SHARED __xdp_return()
-+	 * frees via page_frag_free(), which resolves to the *slab* page and can
-+	 * hand it back to the buddy allocator while the slab allocator still
-+	 * owns it -- and for sub-page allocations that page is shared with other
-+	 * live objects. That is heap corruption, not a leak.
-+	 *
-+	 * It is inert only because nothing here ever reaches
-+	 * xdp_convert_buff_to_frame(): XDP_REDIRECT is refused, and XDP_TX
-+	 * reflects the skb via dev_queue_xmit() rather than building an
-+	 * xdp_frame. Implementing either without first moving to a page_pool or
-+	 * page-frag backed buffer makes this live. Note there is no "no mem
-+	 * model" option: MEM_TYPE_PAGE_SHARED is 0 and xdp_rxq_info_init()
-+	 * memsets the struct, so skipping this call gives the identical state.
-+	 */
-+	err = xdp_rxq_info_reg_mem_model(&link->xdp_rxq, MEM_TYPE_PAGE_SHARED,
-+					 NULL);
-+	if (err)
-+		goto err_rxq;
-+
-+	return 0;
-+
-+err_rxq:
-+	xdp_rxq_info_unreg(&link->xdp_rxq);
-+err_gcells:
-+	gro_cells_destroy(&link->gcells);
-+	return err;
- }
- 
- static void mhi_mbim_ndo_uninit(struct net_device *ndev)
++			skbn->protocol = mhi_mbim_ip_proto(skbn);
++			if (unlikely(!skbn->protocol)) {
+ 				net_err_ratelimited("%s: unknown protocol\n",
+ 						    link->ndev->name);
+ 				dev_kfree_skb_any(skbn);
+@@ -656,6 +770,12 @@
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  
-+	/* dev_xdp_uninstall() has normally already detached the program via
-+	 * ndo_bpf by the time we get here; this is belt and braces for any
-+	 * path that has not, and is a no-op when the pointer is already NULL.
++	/* dev_xdp_uninstall() has normally already detached the program
++	 * via ndo_bpf by the time we get here; this is belt and braces
++	 * for any path that has not, and is a no-op when the pointer is
++	 * already NULL.
 +	 */
 +	mhi_mbim_xdp_set(ndev, NULL);
-+	xdp_rxq_info_unreg(&link->xdp_rxq);
  	gro_cells_destroy(&link->gcells);
  }
  
-@@ -666,6 +933,8 @@
+@@ -666,6 +786,7 @@
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
-+	.ndo_change_mtu = mhi_mbim_ndo_change_mtu,
 +	.ndo_bpf = mhi_mbim_ndo_bpf,
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -721,6 +990,7 @@
- 	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
- 	ndev->features |= NETIF_F_GRO;
- 	ndev->hw_features |= NETIF_F_GRO;
-+	xdp_set_features_flag(ndev, NETDEV_XDP_ACT_BASIC);
- 	ndev->netdev_ops = &mhi_mbim_ndo;
- 	ndev->mtu = MHI_MBIM_DEFAULT_MTU;
- 	ndev->min_mtu = ETH_MIN_MTU;
+@@ -727,6 +848,13 @@
+ 	ndev->max_mtu = MHI_MAX_BUF_SZ - ndev->needed_headroom;
+ 	ndev->tx_queue_len = 1000;
+ 	ndev->needs_free_netdev = true;
++	/* REDIRECT included: do_xdp_generic() implements it. The flag is
++	 * advisory -- dev_xdp_attach() does not enforce it -- but it is
++	 * what `ip link show` and libxdp report, and what tools use to
++	 * decide whether an AF_XDP socket can be bound here.
++	 */
++	xdp_set_features_flag(ndev, NETDEV_XDP_ACT_BASIC |
++			      NETDEV_XDP_ACT_REDIRECT);
+ }
+ 
+ static const struct wwan_ops mhi_mbim_wwan_ops = {
