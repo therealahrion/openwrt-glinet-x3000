@@ -1,0 +1,68 @@
+#!/bin/sh
+# Bundle the WAN diagnostic logs and serve them once over the router's own web
+# server, so they can be pulled onto a PC with a browser and handed over whole
+# rather than pasted in pieces.
+#
+# Usage:  sh /tmp/collect-logs.sh
+#
+# It prints a URL. Open it, save the file, then delete the copy it left in /www
+# so the logs are not still being served on the LAN:
+#
+#   rm /www/x3000-logs.tar.gz
+#
+# If /www is not being served, scp the three files out of /tmp directly instead.
+
+SRC=${SRC:-/tmp}
+WWW=${WWW:-/www}
+NAME=${NAME:-x3000-logs.tar.gz}
+FILES="dl.csv wan2.csv wan2-stall.log"
+
+have=""
+for f in $FILES; do
+	[ -f "$SRC/$f" ] && have="$have $f"
+done
+if [ -z "$have" ]; then
+	echo "collect-logs: nothing to collect in $SRC - are the recorders running?" >&2
+	exit 1
+fi
+
+if [ ! -d "$WWW" ]; then
+	echo "collect-logs: $WWW does not exist; copy these out of $SRC yourself:$have" >&2
+	exit 1
+fi
+
+# Keep a snapshot of the live counters alongside the logs. The recorders sample
+# these too, but having one unambiguous read of the modem and ring state at
+# collection time makes a capture self-contained.
+SNAP=$SRC/x3000-snapshot.txt
+{
+	echo "=== collected $(date '+%F %T'), uptime $(cut -d. -f1 /proc/uptime)s ==="
+	echo "--- kernel ---"; uname -a
+	echo "--- kptr_restrict (1 = driver ring pointers are readable) ---"
+	sysctl -n kernel.kptr_restrict 2>/dev/null
+	echo "--- mhi channels ---"; cat /sys/kernel/debug/mhi/*/channels 2>/dev/null
+	echo "--- mhi events ---";   cat /sys/kernel/debug/mhi/*/events 2>/dev/null
+	echo "--- mhi states ---";   cat /sys/kernel/debug/mhi/*/states 2>/dev/null
+	echo "--- interrupts ---";   grep -E 'mhi|bhi' /proc/interrupts
+	echo "--- wwan0 ---";        ifstatus wwan 2>/dev/null
+	echo "--- radio ---";        command -v 5g-info >/dev/null 2>&1 && 5g-info 2>/dev/null
+	echo "--- memory ---";       head -4 /proc/meminfo
+	echo "--- dmesg ---";        dmesg 2>/dev/null | tail -60
+} > "$SNAP" 2>&1
+
+tar -czf "$WWW/$NAME" -C "$SRC" $have x3000-snapshot.txt 2>/dev/null ||
+	tar -cf "$WWW/${NAME%.gz}" -C "$SRC" $have x3000-snapshot.txt || {
+		echo "collect-logs: could not write the bundle to $WWW" >&2
+		exit 1
+	}
+
+OUT=$WWW/$NAME
+[ -f "$OUT" ] || OUT=$WWW/${NAME%.gz}
+IP=$(uci -q get network.lan.ipaddr || echo 192.168.1.1)
+
+echo "bundled:$have x3000-snapshot.txt"
+echo "size:   $(wc -c < "$OUT") bytes"
+echo
+echo "  http://$IP/$(basename "$OUT")"
+echo
+echo "save that, then:  rm $OUT"
