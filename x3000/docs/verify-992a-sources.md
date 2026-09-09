@@ -1,22 +1,29 @@
 # BPF sources embedded in `verify-992a.sh`
 
-`verify-992a.sh` carries three pre-compiled eBPF objects as base64 so the
-router needs no compiler. eBPF is architecture-independent bytecode — only
-endianness matters, and these are little-endian (`ELF 64-bit LSB … eBPF`),
-matching the target's `CONFIG_CPU_LITTLE_ENDIAN=y`. The sources are kept here
-so the blobs are auditable and reproducible.
+`verify-992a.sh` uses three pre-compiled eBPF objects so the router needs no
+compiler. They live in `bpf/` next to the script; the script falls back to
+fetching them from the repo over HTTPS if that directory is missing.
+
+eBPF is architecture-independent bytecode — only endianness matters, and these
+are little-endian (`ELF 64-bit LSB … eBPF`), matching the target's
+`CONFIG_CPU_LITTLE_ENDIAN=y`. The sources are kept here so the objects are
+auditable and reproducible.
+
+Two naming details worth knowing:
+
+- The files are `.bpf`, not `.o`, because the repo's `.gitignore` has a blanket
+  `*.o` rule that would swallow them.
+- They are shipped as files rather than base64 inside the script. OpenWrt's
+  busybox is built without the `base64` applet, so an embedded blob cannot be
+  decoded on the router — the script fails with `base64: not found`.
 
 Build command (clang 18, any host):
 
 ```sh
-clang -O2 -g -target bpf -c xdp_pass.c  -o xdp_pass.o
-clang -O2 -g -target bpf -c xdp_drop.c  -o xdp_drop.o
-clang -O2 -g -target bpf -c tc_rawip.c  -o tc_rawip.o
-# then: base64 -w0 <each>.o   and paste into the emit lines at the top of the script
+clang -O2 -g -target bpf -c xdp_pass.c -o bpf/xdp_pass.bpf
+clang -O2 -g -target bpf -c xdp_drop.c -o bpf/xdp_drop.bpf
+clang -O2 -g -target bpf -c tc_rawip.c -o bpf/tc_rawip.bpf
 ```
-
-`.o` files are `.gitignore`d (`*.o`), which is why the objects live inside the
-script rather than beside it.
 
 ---
 
