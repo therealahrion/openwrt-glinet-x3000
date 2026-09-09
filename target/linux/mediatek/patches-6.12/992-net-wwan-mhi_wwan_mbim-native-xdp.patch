@@ -11,6 +11,20 @@ alongside the gro_cells 991 put there, so the core unwinds both on a
 failed register_netdevice() and neither newlink nor dellink needs an
 error ladder of its own.
 
+An XDP frame must fit in one page, so a datagram larger than
+MHI_MBIM_XDP_MAX_MTU cannot be handed to a program at all. ndo_bpf refuses
+to attach above that MTU, and ndo_change_mtu refuses to grow past it while
+a program is attached -- without the second guard the first is trivially
+defeated by attaching at a small MTU and raising it afterwards. Should an
+oversized datagram arrive regardless (dgram_len is a u16 read from the NTB
+and is never validated against the MTU) it is now dropped and counted
+rather than passed to the stack: walking a frame around an attached filter
+is a bypass, not a fast path, and previously it happened silently.
+
+ndo_bpf returns -EOPNOTSUPP rather than -EINVAL for commands this driver
+does not implement -- the request is well formed, the driver simply does
+not support it, and userspace distinguishes the two.
+
 Honest ceiling, by design: MBIM NTB aggregation means datagrams share
 one 32KB DMA buffer, so each is copied out before the program runs —
 this hook buys the earliest possible drop point and driver-context
@@ -56,7 +70,15 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
-@@ -29,8 +29,13 @@
+@@ -22,6 +22,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
++#include <linux/netlink.h>
+ #include <linux/skbuff.h>
+ #include <linux/u64_stats_sync.h>
+ #include <linux/usb.h>
+@@ -29,8 +30,13 @@
  #include <linux/usb/usbnet.h>
  #include <linux/usb/cdc_ncm.h>
  #include <linux/wwan.h>
@@ -70,7 +92,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -53,6 +58,8 @@
+@@ -53,6 +59,8 @@
  	struct net_device *ndev;
  	unsigned int session;
  	struct gro_cells gcells;
@@ -79,7 +101,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -257,6 +264,160 @@
+@@ -257,6 +265,194 @@
  	return ret;
  }
  
@@ -98,6 +120,15 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	}
 +}
 +
++/* An XDP frame must fit in a single page: XDP_PACKET_HEADROOM at the front
++ * for bpf_xdp_adjust_head(), and room at the back for the skb_shared_info
++ * that bpf_xdp_adjust_tail() grows into. A datagram larger than this cannot
++ * be handed to a program at all, so it also bounds the MTU at which XDP can
++ * be used on this device -- enforced in ndo_bpf and ndo_change_mtu below.
++ */
++#define MHI_MBIM_XDP_MAX_MTU	(PAGE_SIZE - XDP_PACKET_HEADROOM - \
++				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++
 +/* Run the attached XDP program on one de-aggregated datagram.
 + * Returns true if the skb should continue to the stack (XDP_PASS),
 + * false if it was consumed (dropped or reflected).
@@ -113,11 +144,22 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	int delta;
 +	u32 act;
 +
-+	/* Oversized frame (jumbo MTU): let it pass unfiltered rather
-+	 * than feed XDP a frame layout it does not expect.
++	/* Cannot happen while a program is attached: ndo_bpf refuses to
++	 * attach above MHI_MBIM_XDP_MAX_MTU and ndo_change_mtu refuses to
++	 * grow past it. A datagram this large therefore violates the MTU the
++	 * attached program was validated against. Drop it: passing it would
++	 * silently walk it around the filter, which for a filtering program
++	 * is a bypass rather than a performance note. Counted and logged so
++	 * the event is diagnosable if it ever does occur.
 +	 */
-+	if (skbn->len > PAGE_SIZE - XDP_PACKET_HEADROOM)
-+		return true;
++	if (unlikely(skbn->len > MHI_MBIM_XDP_MAX_MTU)) {
++		net_warn_ratelimited("%s: %u-byte datagram exceeds the %lu-byte XDP limit, dropping\n",
++				     netdev_name(link->ndev), skbn->len,
++				     (unsigned long)MHI_MBIM_XDP_MAX_MTU);
++		dev_core_stats_rx_dropped_inc(link->ndev);
++		dev_kfree_skb_any(skbn);
++		return false;
++	}
 +
 +	xdp_init_buff(&xdp,
 +		      skb_end_offset(skbn) +
@@ -231,16 +273,30 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +{
 +	switch (bpf->command) {
 +	case XDP_SETUP_PROG:
++		/* A program cannot be run on datagrams that do not fit one
++		 * page, so refuse to attach at an MTU where that is possible
++		 * rather than silently skipping the program at runtime.
++		 */
++		if (bpf->prog && ndev->mtu > MHI_MBIM_XDP_MAX_MTU) {
++			NL_SET_ERR_MSG_MOD(bpf->extack,
++					   "MTU too large for XDP on this device");
++			return -EOPNOTSUPP;
++		}
 +		return mhi_mbim_xdp_set(ndev, bpf->prog);
 +	default:
-+		return -EINVAL;
++		/* -EOPNOTSUPP, not -EINVAL: the request is well formed, this
++		 * driver simply does not implement it. Userspace distinguishes
++		 * the two -- e.g. AF_XDP zero-copy setup probes with
++		 * XDP_SETUP_XSK_POOL.
++		 */
++		return -EOPNOTSUPP;
 +	}
 +}
 +
  /* Cheap per-flow hash, for GRO bucketing only.
   *
   * dev_gro_receive() selects its bucket with skb_get_hash_raw(), and
-@@ -391,6 +552,8 @@
+@@ -391,6 +587,8 @@
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -249,7 +305,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -402,13 +565,22 @@
+@@ -402,13 +600,22 @@
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -273,12 +329,39 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			switch (skbn->data[0] & 0xf0) {
  			case 0x40:
  				skbn->protocol = htons(ETH_P_IP);
-@@ -648,14 +820,40 @@
+@@ -613,6 +820,25 @@
+ 		netif_wake_queue(ndev);
+ }
+ 
++/* Without this, the ndo_bpf guard is defeated by attaching a program at a
++ * small MTU and then raising the MTU afterwards.
++ */
++static int mhi_mbim_ndo_change_mtu(struct net_device *ndev, int new_mtu)
++{
++	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
++
++	if (new_mtu > (int)MHI_MBIM_XDP_MAX_MTU &&
++	    rtnl_dereference(link->xdp_prog)) {
++		netdev_err(ndev, "MTU %d exceeds the %lu-byte XDP limit while a program is attached\n",
++			   new_mtu, (unsigned long)MHI_MBIM_XDP_MAX_MTU);
++		return -EINVAL;
++	}
++
++	/* Pairs with the lockless readers of dev->mtu in the stack. */
++	WRITE_ONCE(ndev->mtu, new_mtu);
++	return 0;
++}
++
+ static int mhi_mbim_ndo_open(struct net_device *ndev)
+ {
+ 	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
+@@ -648,14 +874,55 @@
  static int mhi_mbim_ndo_init(struct net_device *ndev)
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
 +	int err;
-+
+ 
+-	return gro_cells_init(&link->gcells, ndev);
 +	err = gro_cells_init(&link->gcells, ndev);
 +	if (err)
 +		return err;
@@ -287,12 +370,26 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	if (err)
 +		goto err_gcells;
 +
++	/* WARNING before changing this: our RX buffers are kmalloc'd sk_buff
++	 * heads, NOT page fragments. Under MEM_TYPE_PAGE_SHARED __xdp_return()
++	 * frees via page_frag_free(), which resolves to the *slab* page and can
++	 * hand it back to the buddy allocator while the slab allocator still
++	 * owns it -- and for sub-page allocations that page is shared with other
++	 * live objects. That is heap corruption, not a leak.
++	 *
++	 * It is inert only because nothing here ever reaches
++	 * xdp_convert_buff_to_frame(): XDP_REDIRECT is refused, and XDP_TX
++	 * reflects the skb via dev_queue_xmit() rather than building an
++	 * xdp_frame. Implementing either without first moving to a page_pool or
++	 * page-frag backed buffer makes this live. Note there is no "no mem
++	 * model" option: MEM_TYPE_PAGE_SHARED is 0 and xdp_rxq_info_init()
++	 * memsets the struct, so skipping this call gives the identical state.
++	 */
 +	err = xdp_rxq_info_reg_mem_model(&link->xdp_rxq, MEM_TYPE_PAGE_SHARED,
 +					 NULL);
 +	if (err)
 +		goto err_rxq;
- 
--	return gro_cells_init(&link->gcells, ndev);
++
 +	return 0;
 +
 +err_rxq:
@@ -315,15 +412,16 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  }
  
-@@ -666,6 +864,7 @@
+@@ -666,6 +933,8 @@
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
++	.ndo_change_mtu = mhi_mbim_ndo_change_mtu,
 +	.ndo_bpf = mhi_mbim_ndo_bpf,
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -721,6 +920,7 @@
+@@ -721,6 +990,7 @@
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;
  	ndev->features |= NETIF_F_GRO;
  	ndev->hw_features |= NETIF_F_GRO;
