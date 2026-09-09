@@ -120,7 +120,7 @@ And adds:
 | Wi-Fi | MT7976 (2.4 GHz + 5 GHz) |
 | Modem | Quectel RM520N-GL (5G NR Sub-6) over PCIe MHI |
 | Storage | 8 GB eMMC |
-| RAM | 1 GB DDR4 |
+| RAM | 512 MB DDR4 |
 
 ## Prerequisites (build host)
 

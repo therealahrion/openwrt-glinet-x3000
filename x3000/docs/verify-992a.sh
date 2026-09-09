@@ -310,8 +310,23 @@ if command -v xdp-loader >/dev/null 2>&1; then
 else
 	skip "xdp-loader not installed"
 fi
-PST=$(ls -1 /sys/fs/pstore/ 2>/dev/null | wc -l)
-[ "$PST" -eq 0 ] && ok "/sys/fs/pstore/ empty — no crash recorded" || bad "$PST entries in /sys/fs/pstore/ — inspect them"
+PST_CRASH=$(ls -1 /sys/fs/pstore/ 2>/dev/null | grep -c '^dmesg-')
+PST_OTHER=$(ls -1 /sys/fs/pstore/ 2>/dev/null | grep -vc '^dmesg-')
+if [ "${PST_CRASH:-0}" -gt 0 ]; then
+	bad "$PST_CRASH crash record(s) in /sys/fs/pstore/ — read them:"
+	ls -1 /sys/fs/pstore/ | grep '^dmesg-' | sed 's/^/            /'
+else
+	ok "no crash records in /sys/fs/pstore/ (no dmesg-ramoops-*)"
+fi
+if [ "${PST_OTHER:-0}" -gt 0 ]; then
+	info "console/pmsg records present — that is pstore capturing, not a fault:"
+	for f in /sys/fs/pstore/*; do
+		case "${f##*/}" in dmesg-*) continue ;; esac
+		info "  ${f##*/}  ($(wc -c < "$f") bytes)"
+		info "    from boot: $(grep -m1 -o 'Linux version [^ ]* .*#[0-9]* SMP.*' "$f" 2>/dev/null | sed 's/.*SMP //' || echo unknown)"
+	done
+	info "  these survive reboots until deleted; clear with: rm /sys/fs/pstore/*"
+fi
 
 hdr "12. telegraf footprint (task #86)"
 if [ -e /usr/bin/telegraf ]; then
