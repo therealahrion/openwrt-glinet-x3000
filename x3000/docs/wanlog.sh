@@ -77,6 +77,10 @@ RBYTES=${RBYTES:-0x800}
 # one, so a two-minute freeze leaves a readable log instead of 24 dumps.
 DUMP_EVERY=${DUMP_EVERY:-6}
 
+# /tmp is RAM on this box and a lost ping now triggers a dump, so cap how many
+# get written. Roughly 100 lines each; 40 is a few hundred KB worst case.
+MAX_DUMPS=${MAX_DUMPS:-40}
+
 MHI_CHAN=$(ls /sys/kernel/debug/mhi/*/channels 2>/dev/null | head -1)
 MHI_DIR=${MHI_CHAN%/channels}
 
@@ -133,7 +137,15 @@ real() { case "$1" in 0xffff*) return 0;; *) return 1;; esac; }
 # Forward distance from rp to wp: descriptors posted and not yet consumed.
 outstanding() { echo $(( ($2 - $1 + RBYTES) % RBYTES )); }
 
+DUMPS=0
+
 dump() {
+	DUMPS=$((DUMPS + 1))
+	if [ "$DUMPS" -gt "$MAX_DUMPS" ]; then
+		[ "$DUMPS" -eq $((MAX_DUMPS + 1)) ] &&
+			echo "===== further dumps suppressed after $MAX_DUMPS =====" >> "$LOG"
+		return
+	fi
 	{
 		echo "===== $1  $(date '+%F %T')  rx=$RP tx=$TP dl_qd=$DL_QD dl_free=$DL_FREE ====="
 		cat "$MHI_DIR/channels" 2>/dev/null
@@ -146,7 +158,7 @@ dump() {
 		echo "--- radio ---"
 		command -v 5g-info >/dev/null 2>&1 && 5g-info 2>/dev/null
 		echo "--- dmesg tail ---"
-		dmesg 2>/dev/null | tail -30
+		dmesg 2>/dev/null | tail -12
 		echo
 	} >> "$LOG"
 }
@@ -201,10 +213,27 @@ while :; do
 		FIRST=0
 	fi
 
-	# A stall is the downlink standing still while the uplink still moves.
-	# Requiring tx to advance keeps idle periods out of the log - the ping
-	# above guarantees traffic, so tx only stops if the link is truly gone.
+	# Two different faults have been seen, and the first version of this only
+	# caught one of them.
+	#
+	# A hard freeze is the downlink standing still while the uplink still
+	# moves: rx_packets identical across two samples with tx_packets climbing.
+	# Requiring tx to advance keeps idle periods out of the log, since the
+	# ping above guarantees traffic.
+	#
+	# But an event on 2026-09-09 around 17:11 produced no dump at all, because
+	# rx never stopped for a whole five-second sample - it degraded instead,
+	# with round trips running from 34 ms to 422 ms and repeated timeouts while
+	# data still trickled through. A lost ping is the most direct evidence of
+	# that, so treat it as a trigger too rather than waiting for a full stop.
+	STALLED=0
 	if [ "$PREV_RX" -ge 0 ] && [ "$RP" -eq "$PREV_RX" ] && [ "$TP" -gt "$PREV_TX" ]; then
+		STALLED=1
+	elif [ "$P" = TIMEOUT ]; then
+		STALLED=1
+	fi
+
+	if [ "$STALLED" -eq 1 ]; then
 		if [ "$STALL" -eq 0 ]; then
 			dump STALL-BEGIN
 		elif [ $((STALL % DUMP_EVERY)) -eq 0 ]; then
