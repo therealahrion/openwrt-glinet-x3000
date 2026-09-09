@@ -3,40 +3,72 @@
 # starts rather than its aftermath.
 #
 # wanlog.sh samples every five seconds and spends most of that on a ping and a
-# DNS lookup, which is too coarse to see a stall that only appears above
-# roughly 200-300 Mbps. This does no network I/O at all: it reads four files a
-# second and writes one short row, so it can run alongside a speed test.
+# DNS lookup, which is too coarse for a stall that only appears above roughly
+# 200-300 Mbps. This does no network I/O: it reads four files a second and
+# writes one short row, so it can run under a speed test.
 #
-# The columns that matter, and what they would mean:
+# Reading the MHI ring correctly
 #
-#   dl_out    downlink descriptors posted by the host and not yet consumed by
-#             the modem, out of 128. Near zero means the host could not post
-#             buffers fast enough. High and frozen means the modem has
-#             somewhere to write and is not writing.
+# /sys/kernel/debug/mhi/*/channels prints four pointers per channel and they do
+# not mean the same thing:
 #
+#   wp         host's write pointer from the shared channel context. Host
+#              written on every posted buffer, always current.
+#   rp         the modem's read pointer in that same context. The modem
+#              updates it lazily - measured here frozen at index 82 across 88
+#              seconds and 5972 delivered packets - so any occupancy figure
+#              derived from it is meaningless. Recorded as dev_rp for
+#              reference only. Do not compute anything from it.
+#   local rp   the driver's own ring pointers, and the pair
+#   local wp   mhi_get_free_desc_count() actually uses. These are the real
+#              answer to "did the host run out of buffers", but they print
+#              through %pK, which hashes them unless kptr_restrict is 1.
+#   db         value of the last real doorbell register write. Host written,
+#              always current. Both data channels are MHI_DB_BRST_ENABLE, so
+#              the host writes the doorbell only when the modem asks for one
+#              and db normally trails wp by a long way. That is by design.
+#
+# So before running this, unhash the driver pointers:
+#
+#   sysctl -w kernel.kptr_restrict=1
+#
+# With kptr_restrict at 1 a process holding CAP_SYSLOG, reading in process
+# context, gets the real pointer (restricted_pointer() in lib/vsprintf.c); at 0
+# everyone gets a hash. Setting it to 1 restricts unprivileged readers further,
+# not less. Without it dl_qd and dl_free read -1 and the rest still works.
+#
+# Columns and what they would mean:
+#
+#   dl_qd     downlink buffers the host has posted and not yet reaped, out of
+#             127. High is healthy - the host keeps the ring stuffed. Falling
+#             toward 0 means the host could not post fast enough, which would
+#             make the stall ours.
+#   dl_free   127 - dl_qd, i.e. what mhi_get_free_desc_count() returns.
 #   er3_bk    unprocessed entries in the downlink completion ring, out of 1024.
-#             This is the one to watch. mhi_ev_task() drains that ring with no
-#             budget (event_quota is U32_MAX) and calls the MBIM receive path
-#             inline for every entry, so all the de-aggregation, per-datagram
-#             allocation and copying happens inside the drain loop. If the loop
-#             cannot keep up, this backs up. 1 means drained, 1023 means the
-#             ring is full and the modem has nowhere to report completions.
-#
+#             mhi_ev_task() drains that ring with no budget (event_quota is
+#             U32_MAX) and calls the MBIM receive path inline for every entry,
+#             so de-aggregation, per-datagram allocation and copying all happen
+#             inside the drain loop. If the loop cannot keep up this backs up.
+#             1 means drained; 1023 means full and the modem has nowhere left
+#             to report completions.
 #   er2_bk    the same for the uplink ring, as a control.
+#   cpu0/cpu1 percent busy and percent softirq over the last second. All four
+#             MHI vectors are delivered to CPU0 and cannot be moved: the
+#             MediaTek gen3 PCIe MSI chip implements no irq_set_affinity, so
+#             writing /proc/irq/N/smp_affinity returns EPERM. A tasklet runs on
+#             whichever CPU took the interrupt, so if CPU0 saturates in softirq
+#             during a fast transfer, that is the drain loop falling behind.
 #
-#   cpu0/cpu1 percent busy and percent in softirq over the last second. All
-#             four MHI vectors land on CPU0, and a tasklet runs on whichever
-#             CPU took the interrupt, so if CPU0 saturates in softirq during a
-#             fast transfer that is the drain loop falling behind.
-#
-# Usage:  sh /tmp/dlwatch.sh &     then run the speed test
-# Output: /tmp/dl.csv
+# Usage:  sysctl -w kernel.kptr_restrict=1
+#         sh /tmp/dlwatch.sh &      then run the transfer
+# Output: /tmp/dl.csv  (ignore the first row's CPU figures - no delta yet)
 # Stop:   kill $(cat /tmp/dlwatch.pid)
 
 IFACE=${IFACE:-wwan0}
 OUT=${OUT:-/tmp/dl.csv}
 PIDFILE=${PIDFILE:-/tmp/dlwatch.pid}
 RING=${RING:-128}
+RBYTES=${RBYTES:-0x800}
 
 MHI_CHAN=$(ls /sys/kernel/debug/mhi/*/channels 2>/dev/null | head -1)
 MHI_DIR=${MHI_CHAN%/channels}
@@ -44,11 +76,18 @@ S=/sys/class/net/$IFACE/statistics
 
 [ -d "$S" ] || { echo "dlwatch: no $IFACE" >&2; exit 1; }
 [ -n "$MHI_CHAN" ] || { echo "dlwatch: no MHI debugfs" >&2; exit 1; }
+case "$(awk '/IP_HW0_MBIM\(101\)/{print $23}' "$MHI_CHAN")" in
+	0xffff*) ;;
+	*) echo "dlwatch: driver pointers are hashed; run 'sysctl -w kernel.kptr_restrict=1' for dl_qd/dl_free" >&2 ;;
+esac
 
 echo $$ > "$PIDFILE"
-[ -f "$OUT" ] || echo "time,rx,tx,irq90,irq91,dl_rp,dl_wp,dl_db,dl_out,er3_bk,er2_bk,cpu0_busy,cpu0_si,cpu1_busy,cpu1_si" > "$OUT"
+[ -f "$OUT" ] || echo "time,rx,tx,irq90,irq91,dl_qd,dl_free,dl_wp,dl_db,dev_rp,er3_bk,er2_bk,cpu0_busy,cpu0_si,cpu1_busy,cpu1_si" > "$OUT"
 
-idx() { echo $(( ( ($2 & 0xffffffff) - $1 ) / 16 )); }
+# Offset within the ring, taken from the last four hex characters so a 64-bit
+# kernel pointer never overflows shell arithmetic.
+off() { L=${1#0x}; L=${L#${L%????}}; echo $(( 0x$L & (RBYTES - 1) )); }
+real() { case "$1" in 0xffff*) return 0;; *) return 1;; esac; }
 gap() { echo $(( ($1 - $2 + $3) % $3 )); }
 
 PC0T=0; PC0I=0; PC0S=0; PC1T=0; PC1I=0; PC1S=0
@@ -60,20 +99,27 @@ while :; do
 	set -- $(awk '/mhi/ { t=0; for (i=2;i<=NF;i++){ if($i~/^[0-9]+$/) t+=$i; else break }; printf "%s ", t }' /proc/interrupts)
 	I90=${3:--1}; I91=${4:--1}
 
-	set -- $(awk '/IP_HW0_MBIM\(101\)/ { print $14, $18, $20, $28 }' "$MHI_CHAN" 2>/dev/null)
-	if [ $# -eq 4 ]; then
-		DB4=${4#0x0x}; DB4=0x$DB4
-		DRP=$(idx "$1" "$2"); DWP=$(idx "$1" "$3"); DDB=$(idx "$1" "$DB4")
-		DOUT=$(gap "$DWP" "$DRP" "$RING")
+	# $14 base, $18 modem rp, $20 host wp, $23 local rp, $26 local wp, $28 db
+	set -- $(awk '/IP_HW0_MBIM\(101\)/ { print $14, $18, $20, $23, $26, $28 }' "$MHI_CHAN" 2>/dev/null)
+	if [ $# -eq 6 ]; then
+		DWP=$(( ($(off "$3") ) / 16 ))
+		DDB=$(( ($(off "${6#0x0x}") ) / 16 ))
+		DRP=$(( ($(off "$2") ) / 16 ))
+		if real "$4" && real "$5"; then
+			QD=$(( $(gap "$(off "$5")" "$(off "$4")" "$RBYTES") / 16 ))
+			FREE=$(( RING - 1 - QD ))
+		else
+			QD=-1; FREE=-1
+		fi
 	else
-		DRP=-1; DWP=-1; DDB=-1; DOUT=-1
+		DWP=-1; DDB=-1; DRP=-1; QD=-1; FREE=-1
 	fi
 
 	E3=-1; E2=-1
 	set -- $(awk '/^Index: 3 /{ print $9, $11, $13, $15 }' "$MHI_DIR/events" 2>/dev/null)
-	[ $# -eq 4 ] && E3=$(gap "$(idx "$1" "$3")" "$(idx "$1" "$4")" "$(( $2 / 16 ))")
+	[ $# -eq 4 ] && E3=$(gap "$(( ($(off "$3")) ))" "$(( ($(off "$4")) ))" "$2")
 	set -- $(awk '/^Index: 2 /{ print $9, $11, $13, $15 }' "$MHI_DIR/events" 2>/dev/null)
-	[ $# -eq 4 ] && E2=$(gap "$(idx "$1" "$3")" "$(idx "$1" "$4")" "$(( $2 / 16 ))")
+	[ $# -eq 4 ] && E2=$(gap "$(( ($(off "$3")) ))" "$(( ($(off "$4")) ))" "$2")
 
 	set -- $(awk '/^cpu[01] /{ t=0; for(i=2;i<=NF;i++) t+=$i; print t, $5, $8 }' /proc/stat)
 	C0T=$1; C0I=$2; C0S=$3; C1T=$4; C1I=$5; C1S=$6
@@ -86,6 +132,6 @@ while :; do
 	else B1=0; S1=0; fi
 	PC0T=$C0T; PC0I=$C0I; PC0S=$C0S; PC1T=$C1T; PC1I=$C1I; PC1S=$C1S
 
-	echo "$(date +%H:%M:%S),$RX,$TX,$I90,$I91,$DRP,$DWP,$DDB,$DOUT,$E3,$E2,$B0,$S0,$B1,$S1" >> "$OUT"
+	echo "$(date +%H:%M:%S),$RX,$TX,$I90,$I91,$QD,$FREE,$DWP,$DDB,$DRP,$E3,$E2,$B0,$S0,$B1,$S1" >> "$OUT"
 	sleep 1
 done

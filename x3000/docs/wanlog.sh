@@ -71,6 +71,7 @@ PIDFILE=${PIDFILE:-/tmp/wanlog.pid}
 
 # Ring size in descriptors, from MHI_CHANNEL_CONFIG_HW_UL/DL(.., 128, ..).
 RING=${RING:-128}
+RBYTES=${RBYTES:-0x800}
 
 # While a stall persists, re-dump the rings every Nth sample rather than every
 # one, so a two-minute freeze leaves a readable log instead of 24 dumps.
@@ -100,7 +101,7 @@ echo $$ > "$PIDFILE"
 #
 # The debugfs events dump agrees: rings 0 and 1 hold 128 elements, rings 2
 # and 3 hold 1024, matching MHI_EVENT_CONFIG_CTRL/DATA vs HW_DATA.
-[ -f "$CSV" ] || echo "time,rx_pkts,rx_drop,tx_pkts,irq88,irq89,irq90,irq91,dl_rp,dl_wp,dl_db,dl_out,ul_out,m0,m3,pend,ping,dns,up" > "$CSV"
+[ -f "$CSV" ] || echo "time,rx_pkts,rx_drop,tx_pkts,irq88,irq89,irq90,irq91,dl_qd,dl_free,dl_wp,dl_db,dev_rp,ul_qd,m0,m3,pend,ping,dns,up" > "$CSV"
 
 # Sum every CPU column for each MHI interrupt. Reading only CPU0 would show a
 # false freeze if a vector ever migrated to the other core.
@@ -117,29 +118,24 @@ mhi_irqs() {
 # Pull base/rp/wp/db for both data channels in one pass. Field positions are
 # fixed by mhi_debugfs_channels_show(); db prints with a doubled 0x prefix.
 chan_raw() {
-	awk '/IP_HW0_MBIM\(100\)/ { a=$14; b=$18; c=$20; d=$28 }
-	     /IP_HW0_MBIM\(101\)/ { e=$14; f=$18; g=$20; h=$28 }
-	     END { gsub("0x0x","0x",d); gsub("0x0x","0x",h); print a,b,c,d,e,f,g,h }' \
+	awk '/IP_HW0_MBIM\(100\)/ { a=$23; b=$26 }
+	     /IP_HW0_MBIM\(101\)/ { c=$23; d=$26; e=$14; f=$18; g=$20; h=$28 }
+	     END { gsub("0x0x","0x",h); print a,b,c,d,e,f,g,h }' \
 	    "$MHI_CHAN" 2>/dev/null
 }
 
 # Pointer -> descriptor index. The modem writes rp through the PCIe inbound
 # window, so its value carries a high-word offset the host's does not; mask to
 # 32 bits before subtracting the ring base.
-idx() {
-	[ -n "$1" ] && [ -n "$2" ] || { echo -1; return; }
-	echo $(( ( ($2 & 0xffffffff) - $1 ) / 16 ))
-}
+off() { L=${1#0x}; L=${L#${L%????}}; echo $(( 0x$L & (RBYTES - 1) )); }
+real() { case "$1" in 0xffff*) return 0;; *) return 1;; esac; }
 
 # Forward distance from rp to wp: descriptors posted and not yet consumed.
-outstanding() {
-	if [ "$1" -lt 0 ] || [ "$2" -lt 0 ]; then echo -1
-	else echo $(( ($2 - $1 + RING) % RING )); fi
-}
+outstanding() { echo $(( ($2 - $1 + RBYTES) % RBYTES )); }
 
 dump() {
 	{
-		echo "===== $1  $(date '+%F %T')  rx=$RP tx=$TP dl_out=$DL_OUT ====="
+		echo "===== $1  $(date '+%F %T')  rx=$RP tx=$TP dl_qd=$DL_QD dl_free=$DL_FREE ====="
 		cat "$MHI_DIR/channels" 2>/dev/null
 		echo "--- events ---"
 		cat "$MHI_DIR/events" 2>/dev/null
@@ -147,6 +143,8 @@ dump() {
 		cat "$MHI_DIR/states" 2>/dev/null
 		echo "--- interrupts ---"
 		grep mhi /proc/interrupts
+		echo "--- radio ---"
+		command -v 5g-info >/dev/null 2>&1 && 5g-info 2>/dev/null
 		echo "--- dmesg tail ---"
 		dmesg 2>/dev/null | tail -30
 		echo
@@ -166,13 +164,22 @@ while :; do
 
 	set -- $(chan_raw)
 	if [ $# -eq 8 ]; then
-		UL_RP=$(idx "$1" "$2"); UL_WP=$(idx "$1" "$3")
-		DL_RP=$(idx "$5" "$6"); DL_WP=$(idx "$5" "$7"); DL_DB=$(idx "$5" "$8")
+		DL_WP=$(( $(off "$7") / 16 )); DL_DB=$(( $(off "${8#0x0x}") / 16 ))
+		DEV_RP=$(( $(off "$6") / 16 ))
+		if real "$3" && real "$4"; then
+			DL_QD=$(( $(outstanding "$(off "$3")" "$(off "$4")") / 16 ))
+			DL_FREE=$(( RING - 1 - DL_QD ))
+		else
+			DL_QD=-1; DL_FREE=-1
+		fi
+		if real "$1" && real "$2"; then
+			UL_QD=$(( $(outstanding "$(off "$1")" "$(off "$2")") / 16 ))
+		else
+			UL_QD=-1
+		fi
 	else
-		UL_RP=-1; UL_WP=-1; DL_RP=-1; DL_WP=-1; DL_DB=-1
+		DL_WP=-1; DL_DB=-1; DEV_RP=-1; DL_QD=-1; DL_FREE=-1; UL_QD=-1
 	fi
-	DL_OUT=$(outstanding "$DL_RP" "$DL_WP")
-	UL_OUT=$(outstanding "$UL_RP" "$UL_WP")
 
 	PM=$(awk '/^M0:/ { print $2, $6, $NF }' "$MHI_DIR/states" 2>/dev/null)
 	set -- $PM
@@ -186,7 +193,7 @@ while :; do
 	U=$(ifstatus "$UCI_IFACE" 2>/dev/null | grep -o '"up": [a-z]*' | cut -d' ' -f2)
 	[ -z "$U" ] && U=unknown
 
-	echo "$(date +%H:%M:%S),$RP,$RD,$TP,$MI$DL_RP,$DL_WP,$DL_DB,$DL_OUT,$UL_OUT,$M0,$M3,$PEND,$P,$D,$U" >> "$CSV"
+	echo "$(date +%H:%M:%S),$RP,$RD,$TP,$MI$DL_QD,$DL_FREE,$DL_WP,$DL_DB,$DEV_RP,$UL_QD,$M0,$M3,$PEND,$P,$D,$U" >> "$CSV"
 
 	# One healthy dump up front, so a stall can be diffed against it.
 	if [ "$FIRST" -eq 1 ]; then
