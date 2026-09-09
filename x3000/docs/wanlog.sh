@@ -88,6 +88,18 @@ fi
 
 echo $$ > "$PIDFILE"
 
+# Which /proc/interrupts line is which, from the driver rather than by
+# correlation. Each event ring takes MSI vector (ring + 1); vector 0 is the
+# BHI control interrupt and is named "bhi", while rings 0-3 are all named
+# "mhi" and appear in vector order (mhi_init_irq_setup, pci_generic.c):
+#
+#   88  event ring 0  control and the software channels (MBIM, DUN, NMEA)
+#   89  event ring 1  DIAG
+#   90  event ring 2  IP_HW0_MBIM(100), uplink
+#   91  event ring 3  IP_HW0_MBIM(101), downlink
+#
+# The debugfs events dump agrees: rings 0 and 1 hold 128 elements, rings 2
+# and 3 hold 1024, matching MHI_EVENT_CONFIG_CTRL/DATA vs HW_DATA.
 [ -f "$CSV" ] || echo "time,rx_pkts,rx_drop,tx_pkts,irq88,irq89,irq90,irq91,dl_rp,dl_wp,dl_db,dl_out,ul_out,m0,m3,pend,ping,dns,up" > "$CSV"
 
 # Sum every CPU column for each MHI interrupt. Reading only CPU0 would show a
