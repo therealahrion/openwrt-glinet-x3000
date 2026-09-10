@@ -963,44 +963,63 @@ the ethernet NAPI, and would still pay the backlog cost, since `get_rps_cpu()`
 does not compare its result against the current CPU. Predicted neutral to worse,
 and equally unresolvable here.
 
-### 14.5 The wireless path costs about the same, and that was not the prediction
+### 14.5 Wireless costs the same as wired, and cost does not scale with flow count
 
-Measured 2026-09-10 from a 5 GHz client (channel 100, 160 MHz) running
-OpenSpeedTest through the modem - the same routed path to the same destination
-as the wired runs, differing only in the client link. Sampled with
-`IFACE=phy1-ap0 dlwatch`.
+Measured 2026-09-10 from a 5 GHz client (channel 100, 160 MHz) pulling parallel
+downloads through the modem - the same routed path to the same destination as
+the wired runs, differing only in the client link. Sampled with `IFACE=phy1-ap0
+dlwatch` and analysed by endpoint difference over interval count.
 
-Direction matters and is easy to get wrong: on `wwan0` the download is **rx**,
-on an AP interface it is **tx**, because the router is transmitting to the
-client. Comparing download packets to download packets:
+Direction inverts between interfaces and this is easy to get wrong: on `wwan0`
+the download is **rx**; on an AP interface it is **tx**, because the router is
+transmitting to the client.
 
-| | download pkt/s | cpu0_si | cpu1_si | total si | si per 1000 pkt/s |
-|---|---|---|---|---|---|
-| wired, `wwan0` rx | 21,059 | 11.1 | 7.9 | 18.9 | **0.897** |
-| wireless, `phy1-ap0` tx | 19,756 | 10.8 | 6.4 | 17.2 | **0.871** |
+| concurrent flows | download pkt/s | cpu0 busy/si | cpu1 busy/si | si per 1000 pkt |
+|---|---|---|---|---|
+| 1 | 17,718 | 18.3 / 9.7 | 25.3 / 6.2 | **0.896** |
+| 4 | 13,215 | 14.8 / 7.3 | 18.7 / 5.2 | **0.944** |
+| 16 | 14,096 | 16.3 / 8.3 | 22.6 / 4.8 | **0.930** |
+| 64 | 3,505 | 8.2 / 1.8 | 9.2 / 1.1 | **0.837** |
 
-The prediction going in was that wireless would cost two to three times more per
-packet, because of the mac80211 and mt76 processing. **It does not** - the two
-are the same within noise. The most likely explanation is that the dominant cost
-in both cases is identical work: the modem RX path, MHI plus MBIM NTB
-de-aggregation plus gro_cells. The egress difference, ethernet TX versus
-mac80211 and mt76 TX, is a smaller share of the total than assumed.
+Two results.
 
-What did change is where the work lands. `cpu1_busy` went from 10.4 to 23.2
-while `cpu0_busy` fell from 20.2 to 16.0, which fits: packet steering pins
-mt76's threads to CPU1, so wifi work goes to the core that was otherwise idle.
-Total across both cores is about 39 percent wireless against 33 percent wired.
+**Wireless costs the same per packet as wired.** 0.896 against the wired
+baseline's 0.897 at 21,059 pkt/s. The prediction going in was two to three times
+worse, because of mac80211 and mt76 processing. It is not. The likely reason is
+that both paths share the dominant cost - the modem RX side, MHI plus MBIM NTB
+de-aggregation plus gro_cells - and the egress difference is a smaller share
+than assumed. What changes is placement, not total: `cpu1_busy` runs higher on
+the wireless path because packet steering pins mt76's threads to CPU1.
 
-Two caveats. The sample is thin - 22 loaded seconds, since OpenSpeedTest's
-phases are short and the idle gaps are filtered out - so treat it as indicative.
-And it measures **wifi carrying modem-rate traffic, not wifi at wifi rates**: at
-160 MHz the radio can far exceed the modem's roughly 280 Mbps ceiling, and
-whether the path stays cheap at full Wi-Fi 6 rates is unmeasured. Measuring that
-needs a second host on the LAN to iperf against, which was not available.
+**Per-packet cost does not scale with flow count.** Across 1 to 64 concurrent
+flows it stays within about 6 percent of 0.90 with no trend. This was tested
+because the single-client speedtest is the easiest possible load and the
+concern - reasonable - was that many clients would cost more per packet. It does
+not, at least not through 64 flows.
+
+Limits on that. Throughput *fell* as flows rose, from 17.7k to 3.5k pkt/s,
+because 64 TCP flows over a cellular link mostly contend with each other. So
+this tested many-flows-at-low-rate, never many-flows-at-high-rate, and the
+64-flow row sits on low load where baseline noise dominates. And 64 flows from
+one client is not 16 clients: separate stations bring more bridge FDB entries,
+per-STA mac80211 queues, more broadcast and ARP, and airtime contention. Those
+are real, but they are per-station wireless overhead rather than forwarding-path
+packet cost, and are not what an XDP fast path would reduce.
+
+An earlier revision of this section reported a wireless measurement from a run
+whose CSV had been appended to an existing capture of a different interface, and
+analysed with an awk that computed its first delta against the header row. Both
+faults inflated the numbers. The conclusion was right; the data was not. These
+figures replace it.
 
 ---
 
-## 15. Scoping the XDP fast path, and why it is not worth building yet
+## 15. First pass at scoping the XDP fast path (superseded by section 16)
+
+Kept for the driver-requirement inventory in 15.1 and 15.3, which still
+hold. The conclusion in 15.4 does not: it parked #101 and #102 on "no
+bottleneck demonstrated", which is a weaker and less useful reason than the
+one section 16 establishes from driver source. Read 16 for the verdict.
 
 Sections 9.3 and 13 left `ndo_xdp_xmit` on `mhi_wwan_mbim` as the headline
 enhancement: it would make `wwan0` a valid redirect target and open a LAN to
@@ -1086,3 +1105,172 @@ plus a NAT-rewriting BPF program.
 **Recommendation: park #101 and #102 behind a measurement.** They are not
 blocked by anything technical - the analysis is done and the approach is sound -
 but neither should be built on the assumption that this box needs them.
+
+## 16. The pre-skb question, settled at the source
+
+Section 15 parked #101 and #102 because no bottleneck had been demonstrated.
+That was the wrong reason. The size of the prize was never in doubt - the 14.3
+measurement works out to roughly 9 us of softirq per forwarded packet (0.897
+percent of one CPU per 1000 pkt/s), and a working pre-allocation bypass would
+skip most of that, not one percent of it. The only real question was whether
+such a bypass can be reached on this hardware. This section answers that from
+driver source instead of from throughput guesses.
+
+### 16.1 On the wired ports the pre-skb win is real
+
+`mtk_eth_soc` is a genuine page-pool XDP driver. In `mtk_poll_rx()`:
+
+    2105   xdp_init_buff(&xdp, PAGE_SIZE, &ring->xdp_q);
+    2106   xdp_prepare_buff(&xdp, data, MTK_PP_HEADROOM, pktlen, false);
+    2110   ret = mtk_xdp_run(eth, ring, &xdp, netdev);
+    2114   if (ret != XDP_PASS) goto skip_rx;
+    2117   skb = build_skb(data, PAGE_SIZE);
+    ...
+    2189   skb->protocol = eth_type_trans(skb, netdev);
+
+The program runs at 2110 on a buffer that is still nothing but DMA'd page-pool
+memory. `build_skb()` sits at 2117 and is reached only on `XDP_PASS`;
+`eth_type_trans()` is seventy lines further on. Anything the program drops,
+transmits or redirects never gets an `sk_buff` at all. So on `eth0` and `eth1`
+the hook is genuinely ahead of allocation.
+
+Two facts make it cheap to try. `mtk_page_pool_enabled()` is just
+`mtk_is_netsys_v2_or_greater()`, and `mt7981_data.version = 2`, so this SoC
+always takes the page-pool path whether or not a program is attached - attaching
+one adds a `bpf_prog_run_xdp()` call and switches the pool's DMA direction to
+bidirectional (line 1731), nothing structural. It does bounce the link once:
+`mtk_xdp_setup()` calls `mtk_stop()`/`mtk_open()` when the program count crosses
+zero.
+
+### 16.2 But on the wired ports every ifindex-based helper reads a dummy netdev
+
+MT7981 runs two netdevs on one DMA ring and one NAPI, so the driver has no real
+device to register the RX queue against and uses a placeholder:
+
+    1737   err = __xdp_rxq_info_reg(xdp_q, eth->dummy_dev, id,
+                                   eth->rx_napi.napi_id, PAGE_SIZE);
+
+    5129   eth->dummy_dev = alloc_netdev_dummy(0);
+
+`alloc_netdev_dummy()` calls `alloc_netdev()` with `init_dummy_netdev_core`,
+which sets `reg_state = NETREG_DUMMY` and never registers the device. Its
+`ifindex` therefore stays 0 and it appears in no namespace's device list. That
+one line breaks three things at once, because `xdp->rxq->dev` is what the BPF
+side reads:
+
+- `ctx->ingress_ifindex` compiles to `xdp->rxq->dev->ifindex`
+  (`filter.c:10246-10255`), so it reads **0** on both wired ports. A program
+  cannot tell which port a packet arrived on, and has no real ifindex to hand to
+  anything else.
+- `bpf_fib_lookup()` needs that ifindex, so it is unusable for the same reason.
+- `bpf_xdp_flow_lookup()` calls `nf_flowtable_by_dev(xdp->rxq->dev)`
+  (`nf_flow_table_bpf.c`), and `nf_flowtable_by_dev()` keys its hashtable on the
+  `struct net_device *` pointer itself. Only devices named in the nftables
+  flowtable are ever inserted, so the dummy pointer never matches and the lookup
+  returns `-ENOENT` for every packet, permanently.
+
+This is not a configuration problem. Adding `eth1` to the flowtable does not fix
+it, and it is unrelated to whether hardware offload is on or off.
+`bpf_xdp_flow_lookup()` is structurally unusable on the wired ports of this SoC.
+
+What does still work there: `XDP_DROP`, `XDP_TX`, and `bpf_redirect()` /
+`bpf_redirect_map()`. Redirect survives because `mtk_xdp_run()` passes the real
+netdev to `xdp_do_redirect(dev, xdp, prog)` as a separate argument (line 1981);
+only helpers that read `rxq->dev` are affected.
+
+### 16.3 On wwan0 the helpers work and the pre-skb win does not exist
+
+The modem path is the mirror image. 992 runs the program through
+`do_xdp_generic()`, and `bpf_prog_run_generic_xdp()` takes its rxq from
+`netif_get_rxqueue(skb)` (`dev.c:5079-5080`) - the real device. So on `wwan0`,
+`ctx->ingress_ifindex`, `bpf_fib_lookup()` and `bpf_xdp_flow_lookup()` all
+behave correctly, and since section 10.3 put `wwan0` in the flowtable, the
+lookup can actually hit.
+
+The price is exactly the thing the pre-allocation argument is about: 992 reaches
+XDP only after `netdev_alloc_skb()` and `skb_copy_bits()` have already run,
+because MBIM aggregation packs many datagrams into one 32 KB DMA buffer and each
+has to be copied out before it can be inspected. The 992 patch header has always
+said this. There is no pre-allocation saving available on the modem path, and
+creating one would mean rebuilding the MBIM RX path around a page pool, not
+adding a hook.
+
+Also confirmed: `do_xdp_generic()` implements `XDP_REDIRECT` itself via
+`xdp_do_generic_redirect((*pskb)->dev, ...)` and `XDP_TX` via
+`generic_xdp_tx()`, returning `XDP_DROP` to signal the skb was consumed
+(`dev.c:5262`). 992's `if (do_xdp_generic(...) != XDP_PASS) return false;` is
+correct - redirect is fully wired, with the real device.
+
+### 16.4 The two halves sit on opposite ends of the box
+
+|                                    | eth0 / eth1 (native) | wwan0 (992)   | br-lan, AP netdevs |
+|------------------------------------|----------------------|---------------|--------------------|
+| Hook runs before `sk_buff` alloc   | yes                  | no            | no                 |
+| `ctx->ingress_ifindex` usable      | no - dummy dev, 0    | yes           | yes                |
+| `bpf_xdp_flow_lookup()` usable     | no - dummy dev       | yes           | not in flowtable   |
+| `bpf_fib_lookup()` usable          | no                   | yes           | yes                |
+| Valid `bpf_redirect()` target      | yes (`NDO_XMIT`)     | no (#101)     | yes, generic only  |
+| `ndo_bpf` in driver                | yes                  | yes (992)     | no                 |
+
+Neither `mac80211` nor the bridge implements `ndo_bpf` - no `ndo_bpf` and no
+`xdp_set_features_flag` anywhere in `iface.c`, `main.c` or `br_device.c` - so
+`br-lan` and the AP netdevs are generic-XDP-only.
+
+Reading down the columns: the ports where a program runs early cannot look a
+flow up, and the port where it can look a flow up cannot run early. And every
+packet that matters on this box crosses `wwan0`.
+
+### 16.5 What survives, and it is not nothing
+
+**Shape A - wwan0 ingress to eth1 or an AP netdev, using `bpf_xdp_flow_lookup()`.**
+Needs no kernel patch. Every gate is already satisfied:
+`CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y` builds `nf_flow_table_bpf.o`
+(`net/netfilter/Makefile:148`); hardware offload is off, so
+`nf_flow_table_offload_setup()` takes the `nf_flow_offload_xdp_setup()` branch
+(`nf_flow_table_offload.c:1258-1259`) and populates the per-device hashtable;
+and `wwan0` is in the flowtable device list. The program looks the flow up,
+applies the NAT rewrite, and builds an Ethernet header itself from
+`tuple.out.h_source` / `h_dest` (raw-IP source, so there is no L2 to rewrite),
+then redirects.
+
+Skips: the bridge `rx_handler`, `ip_rcv` and routing, the software flowtable's
+own `nf_ingress` hook, and the neighbour lookup. Does not skip: the `sk_buff`
+(already allocated) or the egress qdisc - `xdp_do_generic_redirect()` ends in
+`dev_map_generic_redirect()` and then `dev_queue_xmit()`. This is the download
+direction, which is also the high-PPS direction.
+
+**Shape B - eth1 ingress to wwan0, with a program-owned flow map.**
+Genuinely pre-allocation, but it cannot use the kernel flowtable (16.2), so it
+needs its own map of flows filled from somewhere - a tc-BPF egress program, or
+userspace. And it needs `wwan0` to be a valid redirect target, which is #101.
+That part looks feasible: `mbim_tx_fixup()` needs only
+`sizeof(struct mbim_tx_hdr)` of headroom to push the NTH16/NDP16 header, and an
+`xdp_frame` off `eth1`'s page pool arrives with `MTK_PP_HEADROOM` (256 bytes) in
+front of it, so an `ndo_xdp_xmit` could push the same header, hand the buffer to
+`mhi_queue_buf()` instead of `mhi_queue_skb()`, and release it with
+`xdp_return_frame()` from the UL completion callback. This is the upload
+direction - small in bytes, but during a download it carries the ACK stream,
+which at 250 Mbps is on the order of 10k pkt/s of minimum-size packets, and ACK
+timing feeds straight back into what the sender's congestion control will do.
+
+### 16.6 The measurement that decides it, and it is cheap
+
+Section 15.4 asked for the wrong measurement. RPS answers a question about CPU
+placement; it says nothing about what a pre-allocation bypass is worth. The
+right measurement brackets the prize directly, on this hardware, with no new
+kernel patch and no new driver code:
+
+1. Attach a program to `eth1` whose whole body is `return XDP_PASS`. Re-run the
+   `dlwatch` sweep. The delta in si-per-1000-packets is the cost of the hook
+   itself. It should be near zero; if it is not, nothing built on top of it can
+   pay for itself.
+2. Attach a program that `XDP_DROP`s one specific test flow, then drop that same
+   flow a second way with an `nft` rule in the forward chain. The difference
+   between those two si figures is the full cost of `build_skb()` plus stack
+   entry plus netfilter traversal - measured on this SoC rather than estimated.
+   That is the ceiling on what shape B can save per packet.
+
+Two numbers, and they settle whether A and B are worth building without building
+either one. Note the 16.1 caveat: `eth->prog` is per-`mtk_eth`, not per-netdev,
+so the program covers `eth0` and `eth1` together, and attaching it bounces both
+links once.
