@@ -1,8 +1,20 @@
 # QoS / Latency Lab — research notes
 
-Context: GL.iNet GL-X3000, OpenWrt 25.12, kernel **6.12.103**, QModem vendor
-`pcie_mhi` modem stack, eBPF/XDP lab baked (BTF, kprobes, AF_XDP, host-clang
-BPF toolchain, sqm + qosify + cake + sched kmods). Researched 2026-09.
+Context: GL.iNet GL-X3000, OpenWrt 25.12, kernel **6.12.103**, eBPF/XDP lab
+baked (BTF, kprobes, AF_XDP, host-clang BPF toolchain, sqm + qosify + cake +
+sched kmods). Researched 2026-09.
+
+**Read this first (2026-09-10).** These notes were begun while the box ran the
+QModem vendor `pcie_mhi` stack. It does not any more: the modem is on mainline
+`mhi_pci_generic` + `mhi_wwan_mbim` with ModemManager, and the interface is
+`wwan0`, not `rmnet_mhi0.1`. Anything below that names rmnet, quectel-CM or
+`mhi_netdev_quectel.c` describes a stack this build no longer has - the
+downlink MTU black-hole in field log #1 especially. Those findings have not been
+re-tested on the MBIM path and should not be acted on until they are.
+
+For the offload, XDP and flow-table material, `xdp-methods-tested.md` is the
+newer and more carefully verified document; where the two disagree, that one
+wins.
 
 ## 1. The four layers — where every technique lives
 
@@ -311,8 +323,10 @@ like tc-tiny/tc-bpf). All real conflicts are runtime, per the rules above.
 
 ## Validated support matrix (re-validated 2026-09-04, source-level)
 
-Note: no image containing the eBPF/QoS-lab config has been flashed yet —
-**NEXT-BUILD** = in `config.common` now, present in the next image.
+Note (superseded 2026-09-10): **NEXT-BUILD has shipped.** Everything marked
+that way below is in the running image and has been for several builds. The
+tier names are kept so the evidence column still reads correctly, but read
+NEXT-BUILD as "present on the box" from here on.
 Tiers: **NATIVE** (always on) · **NEXT-BUILD** · **FEEDS** (packaged,
 deliberately not baked yet) · **CONFIG-FLIP** (in 6.12 source, one kernel
 config line) · **BACKPORT✔** (external patch, dry-run-tested clean on
@@ -346,8 +360,9 @@ config line) · **BACKPORT✔** (external patch, dry-run-tested clean on
 | ETF/TSN, NIC hw pacing | N/A-HW | no TSN-capable NIC on MT7981 |
 | MTK hw QoS | N/A (mainline) | vendor-SDK only; the mainline HW path is flow offload → Rule 2 |
 
-Nothing in this matrix has been applied beyond what NEXT-BUILD denotes;
-backports remain documented options only.
+Applied status, 2026-09-10: everything at NEXT-BUILD is on the box. The
+backport rows (BORE, DualPI2, TCP Prague, AccECN) remain documented options
+and none has been applied. FEEDS rows are still on the deliberate hold.
 
 ## Kernel-level optimization audit (2026-09-05, source-verified)
 
@@ -814,8 +829,8 @@ BAKED: QModem UI→next + feature adds, MTU hotplug, IKCONFIG(+PROC),
 PREEMPT_DYNAMIC, WireGuard, ply, zram(dormant), default_qdisc=fq_codel,
 tcp_sack/dsack, qmodem_monitor, BBRv3, full eBPF/XDP/QoS platform.
 HELD (deliberate, need a focused/tested pass): mt76 bump (behavioral),
-MHI-GRO (untested kernel patch — lever-off + bench first), fullcone NAT
-(firewall4 patch port). DEFERRED-marginal: safexcel authenc grouping
+fullcone NAT (firewall4 patch port). MHI-GRO left this list on 2026-09-08 —
+see below. DEFERRED-marginal: safexcel authenc grouping
 (IPsec-only micro-opt on the already-present EIP97 engine). RUNTIME/
 boot-arg, by-design not baked (apply + measure post-baseline): the whole
 cookbook — cake+autorate, cake ack-filter, Wi-Fi AQL, RPS/threaded-NAPI/
@@ -828,9 +843,14 @@ Held for a deliberate/tested pass (NOT in this batch, with reasons):
 * **mt76 bump** — swaps the Wi-Fi driver to a 5-month-newer snapshot;
   behavioral (not dormant), so it deserves its own build to isolate any
   regression. Needs a `PKG_SOURCE_VERSION`/`MIRROR_HASH` change.
-* **MHI-GRO** — an as-yet-unwritten, untested kernel patch on the live
-  WAN datapath; will be written lever-off (ethtool-gated) and
-  build+bench-tested in isolation before baking, not lumped into a batch.
+* **MHI-GRO — DONE, and this entry was stale.** It is patch 991,
+  `991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`: written, built, flashed and
+  running, with 992 (native XDP via `do_xdp_generic`) and 993 (the MHI doorbell
+  fix) stacked on top of it. It did not stay lever-off/ethtool-gated as planned;
+  it is unconditional. Two later findings matter for anyone reading this row:
+  cpumap redirect bypasses gro_cells entirely and so discards what 991 buys,
+  while RPS runs *after* gro_cells and keeps it. Both are written up in
+  `xdp-methods-tested.md` section 14.
 * **fullcone NAT** — requires porting ImmortalWrt's firewall4 patch +
   `fullconenat-nft`; a firewall-behavior change worth doing as a focused
   step. Console/P2P "Open NAT" value.
