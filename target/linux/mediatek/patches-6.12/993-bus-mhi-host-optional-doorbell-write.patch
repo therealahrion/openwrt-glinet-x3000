@@ -1,0 +1,107 @@
+From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
+Subject: bus: mhi: host: optional doorbell write on every queued buffer
+
+Adds force_db_brst_disable, an MHI core module parameter that turns off
+doorbell burst mode for every channel configured to use it, so the host
+writes the channel doorbell register on every queued buffer instead of
+only when the device asks.
+
+Default off. With it off the driver behaves exactly as it does without
+this patch, which is the point: it exists to A/B test a downlink stall on
+one flash rather than two, and to be switched back off in place if it
+turns out not to be the cause.
+
+The reasoning and the measurements behind it are in the comment above the
+parameter, next to the only code that reads it, so they stay with the
+change. Briefly: on this board nothing on the host ever writes the
+downlink data channel's doorbell except an M3-to-M0 power transition,
+because the device only re-arms db_mode when it runs out of descriptors
+and the host is careful never to let that happen. Under sustained traffic
+there are no power transitions, so there are no doorbell writes at all.
+
+The parameter is read while channels are configured, which happens when
+the controller is registered -- not when the value changes. So re-probe
+the modem to apply it:
+
+  echo 1 > /sys/module/mhi/parameters/force_db_brst_disable
+  echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/unbind
+  echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/bind
+
+Confirm it took with
+
+  dmesg | grep 'forcing doorbell writes'
+
+which should name channels 100 and 101. Write 0 and re-probe again to go
+back, so both directions are testable without reflashing.
+
+Note that a reboot does not keep the setting: the module reloads with the
+default. Making it persistent means passing it at module load time, which
+is deliberately left out of this patch -- nothing should be made permanent
+before the test says it helps.
+
+Cost when enabled is one MMIO write per queued buffer.
+
+Out-of-tree patch for the GL-X3000 lean build; independent of 991 and
+992 and can be dropped on its own.
+
+--- a/drivers/bus/mhi/host/init.c
++++ b/drivers/bus/mhi/host/init.c
+@@ -772,6 +772,44 @@
+ 	return -EINVAL;
+ }
+ 
++/* Burst mode (MHI_DB_BRST_ENABLE) lets the device fetch transfer descriptors
++ * without the host writing the doorbell register: mhi_db_brstmode() writes it
++ * only while db_mode is set, and clears db_mode afterwards. The device re-arms
++ * it by sending MHI_EV_CC_DB_MODE when it wants poking again.
++ *
++ * On the GL-X3000's RM520N-GL that re-arm does not arrive on the downlink data
++ * channel. Measured across nine minutes of continuous traffic: the uplink
++ * doorbell tracked its write pointer exactly, while the downlink doorbell did
++ * not move once -- and then began stepping only in lockstep with M3-to-M0
++ * transitions, which re-arm db_mode for an unrelated reason
++ * (mhi_pm_m0_transition() honours doorbell_mode_switch).
++ *
++ * The asymmetry has a cause. The device drains the uplink ring to empty, so it
++ * keeps asking for a doorbell and keeps getting one. The host deliberately
++ * never lets the downlink ring run dry -- mhi_mbim_dl_callback() refills once
++ * free descriptors reach half the queue -- so the device never has to ask, and
++ * never does. The very thing keeping the downlink well fed leaves it with no
++ * way to be woken.
++ *
++ * Under sustained traffic there are no power transitions, so nothing writes the
++ * downlink doorbell at all. If the device stops fetching and waits for one, the
++ * link stalls until traffic drops long enough for a suspend/resume cycle, or
++ * until something forces a wake.
++ *
++ * Setting this forces MHI_DB_BRST_DISABLE on every channel configured for burst
++ * mode, so the doorbell is written on every queued buffer. The cost is one MMIO
++ * write per buffer. Read while channels are configured, so a change takes
++ * effect at the next controller registration -- a modem re-probe or a reboot,
++ * not immediately.
++ *
++ * Default off: with it off the driver behaves exactly as it does without this
++ * patch, which keeps it usable as an A/B test rather than a behaviour change.
++ */
++static bool force_db_brst_disable;
++module_param(force_db_brst_disable, bool, 0644);
++MODULE_PARM_DESC(force_db_brst_disable,
++		 "Write the channel doorbell on every queued buffer rather than only when the device asks for it (default 0)");
++
+ static int parse_ch_cfg(struct mhi_controller *mhi_cntrl,
+ 			const struct mhi_controller_config *config)
+ {
+@@ -871,6 +909,13 @@
+ 			}
+ 		}
+ 
++		if (force_db_brst_disable &&
++		    mhi_chan->db_cfg.brstmode == MHI_DB_BRST_ENABLE) {
++			mhi_chan->db_cfg.brstmode = MHI_DB_BRST_DISABLE;
++			dev_info(dev, "ch%u %s: forcing doorbell writes\n",
++				 mhi_chan->chan, mhi_chan->name);
++		}
++
+ 		if (mhi_chan->db_cfg.brstmode == MHI_DB_BRST_ENABLE)
+ 			mhi_chan->db_cfg.process_db = mhi_db_brstmode;
+ 		else
