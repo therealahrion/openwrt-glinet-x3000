@@ -255,6 +255,10 @@ The corrected program loads and attaches (`id 57 name rawip tag bc4f1df2d30ffdff
 
 ## 5. RX-path order and the offload matrix, re-verified
 
+> Superseded in part by section 9. The line numbers below are from an
+> early 6.12 and the DSA row does not apply to this board. Section 9 has
+> the version re-checked against the pinned 6.12.103.
+
 `__netif_receive_skb_core()` (v6.12, `dev.c:5457`), in order:
 
 | line | hook |
@@ -336,6 +340,7 @@ Caveat: it only helps where XDP runs *natively* — i.e. the wired ports. On
 
 ---
 
+
 ## 7. Recommendation
 
 Switch 992's hook to **Method A**. It is one function replaced (`exp-a` is
@@ -363,3 +368,181 @@ For tc-BPF: use the raw-IP program shape above on `wwan0`, and keep
 - Runtime confirmation that `XDP_SOCKETS`, `DEBUG_INFO_BTF` and `NF_FLOW_TABLE`
   landed in the built image — `zcat /proc/config.gz | grep -E
   'XDP_SOCKETS|DEBUG_INFO_BTF|NF_FLOW_TABLE|BPF_SYSCALL'` on the box settles it.
+
+---
+
+## 9. Re-verified against the pinned kernel, 2026-09-10
+
+Everything in sections 5 and 6 was checked against "v6.12". The tree pins
+**6.12.103** (`target/linux/generic/kernel-6.12`: `LINUX_VERSION-6.12 = .103`), and
+line numbers have moved enough that it was worth redoing. The conclusions hold,
+but three board-specific facts change the matrix and were not previously
+recorded.
+
+### 9.1 This board has no DSA switch
+
+`target/linux/mediatek/filogic/base-files/etc/board.d/02_network` line 163:
+
+    ucidef_set_interfaces_lan_wan eth1 eth0
+
+and the board dtsi declares two direct MACs - `gmac0` (2500base-x to `phy5`) and
+`gmac1` (gmii to the internal GbE PHY). There is no switch node and no DSA user
+ports. So **LAN is `eth1` and WAN is `eth0`, and both are plain `mtk_eth_soc`
+netdevs with full native XDP.** The "DSA user ports" row in the section 5 matrix
+does not apply to this hardware at all.
+
+### 9.2 One XDP program covers both wired ports
+
+`mtk_xdp_setup()` stores the program on the controller, not the netdev:
+
+    mtk_eth_soc.c:3614   old_prog = rcu_replace_pointer(eth->prog, prog, ...)
+    mtk_eth_soc.c:1971   prog = rcu_dereference(eth->prog);
+
+`mtk_xdp_run()` takes `dev` only for statistics and for the redirect/TX calls.
+There is no per-netdev program pointer. **Attaching XDP to `eth0` attaches it to
+`eth1` as well, and detaching from either detaches from both.** A program that
+needs to behave differently on LAN and WAN has to branch on `ctx->ingress_ifindex`
+itself.
+
+Two side effects worth knowing: the first attach and the last detach bounce the
+interface (`mtk_stop`/`mtk_open` when `!!eth->prog != !!prog`), because the page
+pool's DMA direction depends on whether a program is present
+(`mtk_eth_soc.c:1731`). And with a program attached, `mtk_change_mtu()` refuses
+anything above `MTK_PP_MAX_BUF_SIZE` (`PAGE_SIZE` minus headroom and shared-info,
+roughly 3.5 KB) - not a practical limit at 1500.
+
+### 9.3 `wwan0` can be a redirect source but not a redirect target
+
+`kernel/bpf/devmap.c:488`:
+
+    if (!(dev->xdp_features & NETDEV_XDP_ACT_NDO_XMIT))
+            return -EOPNOTSUPP;
+
+992 advertises `NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT`, so a program on
+`wwan0` can redirect *out*, but nothing can redirect *into* `wwan0`. The wired
+ports advertise `NDO_XMIT` and `NDO_XMIT_SG` as well, so `eth1 -> eth0` XDP
+forwarding works today and `eth1 -> wwan0` returns `-EOPNOTSUPP`. Closing that
+would mean adding `ndo_xdp_xmit` to `mhi_wwan_mbim` - see section 13.
+
+### 9.4 The XDP gates on `mtk_eth_soc`, and why none of them bite here
+
+    mtk_page_pool_enabled(eth)  ->  mtk_is_netsys_v2_or_greater(eth)
+
+`mt7981_data.version = 2`, so the page pool and therefore XDP are enabled.
+`mtk_xdp_setup()` also refuses when `eth->hwlro` is set, but
+`eth->hwlro = MTK_HAS_CAPS(caps, MTK_HWLRO)` and `MT7981_CAPS` does not include
+`MTK_HWLRO`, so that gate is permanently false on this SoC.
+
+### 9.5 The corrected matrix for this board
+
+| path | native XDP | generic XDP | tc-BPF | GRO | redirect target |
+|---|---|---|---|---|---|
+| `eth0` (WAN) | yes - `BASIC\|REDIRECT\|NDO_XMIT\|NDO_XMIT_SG` | yes | yes | `napi_gro_receive` (2207) | yes |
+| `eth1` (LAN) | same program as `eth0` | yes | yes | same | yes |
+| `br-lan` | no `ndo_bpf` | yes | yes | inherited | no |
+| wireless (mt76/mac80211) | no `ndo_bpf` in `net/mac80211/iface.c` | yes | yes | `napi_gro_receive` (mt76 `mac80211.c:1550` -> `ieee80211_rx_napi` -> `rx.c:5533`) | no |
+| `wwan0` | 992, `BASIC\|REDIRECT` | yes | yes (raw-IP aware) | 991 gro_cells | **no** |
+
+Hardware BPF offload still does not exist anywhere on this box; that part of
+section 5 is unchanged.
+
+---
+
+## 10. Software vs hardware flow offloading - they are not alternatives
+
+LuCI's *Routing/NAT Offloading* dropdown offers "Software flow offloading" or
+"Hardware flow offloading" and no way to pick both. That is not a limitation -
+picking both is not a thing. The two UCI options behind the dropdown are nested,
+not parallel.
+
+`firewall4` (pinned at `b6e5157527d3`), `fw4.uc`:
+
+    resolve_offload_devices: function() {
+        if (!this.default_option("flow_offloading"))
+            return [];                       // no flowtable at all
+        let devices = this.resolve_hw_offload_devices();
+        if (!devices) { ...software device list... }
+        return devices;
+    }
+
+and `ruleset.uc`:
+
+    flowtable ft {
+        hook ingress priority 0;
+        devices = { ... };
+        counter;
+    {% if (fw4.default_option("flow_offloading_hw")): %}
+        flags offload;
+    {% endif %}
+    }
+
+So `flow_offloading` is the master switch that creates the flowtable, and
+`flow_offloading_hw` only adds `flags offload` to that same flowtable. Hardware
+without software is not expressible. Three states, one dropdown.
+
+It degrades on its own in two places:
+
+- **At ruleset generation.** `resolve_hw_offload_devices()` builds a throwaway
+  flowtable with `nft -c` (`nft_try_hw_offload`) and, if that fails, logs
+  *"Hardware flow offloading unavailable, falling back to software offloading"*,
+  clears the option and returns the software device list.
+- **Per flow, at runtime.** `flow_offload_add()` (`nf_flow_table_core.c:275`)
+  always inserts the flow into the software rhashtable first, and only then, if
+  `nf_flowtable_hw_offload()`, queues an asynchronous hardware attempt. If
+  `flow_offload_work_add()` fails it simply returns without setting
+  `IPS_HW_OFFLOAD_BIT`, and the flow keeps working through the software fast
+  path.
+
+**So "Hardware flow offloading" already means "software, plus hardware for the
+flows the hardware will take."** Choosing it never costs you the software path.
+
+### 10.1 On this box, hardware offload cannot touch the traffic that matters
+
+`mtk_ppe_offload.c:224-231` resolves the egress PSE port only from the ethernet
+controller's own netdevs:
+
+    if (dev == eth->netdev[0])      pse_port = PSE_GDM1_PORT;
+    else if (dev == eth->netdev[1]) pse_port = PSE_GDM2_PORT;
+    else if (dev == eth->netdev[2]) pse_port = PSE_GDM3_PORT;
+    else                            return -EOPNOTSUPP;
+
+`wwan0` is not one of them. With the 5G modem as WAN, **every LAN-to-internet
+flow is software-offloaded and nothing else is possible.** Setting the dropdown
+to Hardware is not harmful - it just has nothing to accelerate until a wired WAN
+or LAN-to-LAN flow appears.
+
+---
+
+## 11. WED is present, wired up, and switched off
+
+`mt7981-wo-firmware` ships in `DEVICE_PACKAGES` and
+`CONFIG_NET_MEDIATEK_SOC_WED=y` is set in the filogic target config. OpenWrt's
+`117-complete-mt7981b-dtsi.patch` adds the full hardware description -
+`wed@15010000` (`mediatek,mt7981-wed`), `wo_ccif0`, `wo_ilm0`, `wo_dlm0`,
+`wo_cpuboot`, the `wo-emi`/`wo-data` reserved regions and `wed_pcie` - and
+`mtk_eth_soc.c:5009` looks up the `mediatek,wed` phandle and calls
+`mtk_wed_add_hw()`.
+
+The wireless half never attaches. In openwrt/mt76 at the pinned commit
+`39c960c3ada5`, `mt7915/mmio.c`:
+
+    static bool wed_enable;
+    module_param(wed_enable, bool, 0644);
+    ...
+    int mt7915_mmio_wed_init(...)
+    {
+            if (!wed_enable)
+                    return 0;
+
+The default is false and **nothing in the tree sets it** - a grep of `package/`,
+`target/` and `x3000/` for `wed_enable` returns nothing. So WED is inert and the
+WO firmware is never requested.
+
+Before turning it on, note what it would buy. `mtk_wed_setup_tc_block()` binds
+only `FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS`, and `mtk_wed_flow_add()` /
+`mtk_wed_flow_remove()` are driven by PPE flow entries - WED accelerates flows
+that PPE has already offloaded. Per section 10.1, PPE cannot carry `wwan0`. So on
+this router WED would only accelerate wireless traffic to and from the wired
+ports, which is not the path anyone here uses. Enabling it is one line -
+`options mt7915e wed_enable=1` in `/etc/modules.conf` - but it should be measured,
+not assumed, and it changes the wireless RX ring setup.
