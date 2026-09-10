@@ -71,7 +71,7 @@ Read that table carefully though: the baseline row was taken on an essentially
 idle link six seconds after the recorder started, not under load. Under load
 the host keeps the ring locally full, so a healthy loaded reading is probably
 also high - meaning 106-versus-0 is not by itself the discriminator it looks
-like. What carries weight is that the count is not zero. `wanlog.sh` now
+like. What carries weight is that the count is not zero. `wanlog` now
 records these columns on every sample, which supplies the missing
 healthy-under-load control.
 
@@ -133,7 +133,7 @@ That makes 991 a live suspect again for *entering* the stall, by slowing the
 drain loop until the modem has nowhere left to report completions. 992 is not:
 with no XDP program attached it costs one `rcu_dereference` per datagram.
 
-`er3_bk` in `dlwatch.sh` measures this directly - unprocessed entries in the
+`er3_bk` in `dlwatch` measures this directly - unprocessed entries in the
 downlink completion ring, out of 1024. If it climbs toward 1023 as throughput
 rises, the drain loop is the bottleneck. If it stays at 1 right up to the
 freeze, the loop is keeping up and the fault is still below the driver.
@@ -172,7 +172,7 @@ matches the driver exactly, which also validates the instrument.
 element essentially always, peaking at five, against a 1024-element ring, while
 both CPUs sit at 0-5 percent. The unbounded drain loop keeps up easily, so 991's
 per-datagram work in that loop is not a factor. (An earlier version of
-`dlwatch.sh` reported a recurring backlog of 14352 here. That was a bug of mine:
+`dlwatch` reported a recurring backlog of 14352 here. That was a bug of mine:
 `off()` masked every pointer to the 0x800 data-ring size, so event offsets
 straddling a 0x800 boundary inverted the subtraction. Fixed; the value is
 reproducible from the bug and was never real.)
@@ -267,7 +267,7 @@ The field data closes it. After a clean flash the `states` dump reads
 **M2: 0** after 80 M0 and 79 M3 transitions. This modem cycles M0 <-> M3 under
 its own endpoint runtime PM and never announces M1, so the M2 machinery that
 sideband_wake governs is never exercised at all. `wake: false` and `device wake:
-0` in the same dump are the no-op handlers showing up directly. `wanlog.sh`
+0` in the same dump are the no-op handlers showing up directly. `wanlog`
 records `m2` and `dwake` on every sample now, so a change in either is visible
 rather than assumed.
 
@@ -445,7 +445,9 @@ file.
 
 ## Instrumentation
 
-`x3000/docs/wanlog.sh` records the ring pointers on every sample. The columns
+`wanlog` (shipped at `/usr/bin/wanlog`, source in
+`x3000/files-common/usr/bin/wanlog`) records the ring pointers on every sample.
+The columns
 to watch are `dl_qd` and `dl_free` - buffers posted, and free descriptors left,
 both taken from the driver's own pointers - together with `dl_db`, the last
 doorbell written. If `dl_wp` keeps advancing through a stall while `dl_db`

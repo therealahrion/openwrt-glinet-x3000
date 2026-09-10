@@ -53,11 +53,12 @@
 # Requires CONFIG_MHI_BUS_DEBUG=y. Without it the ring columns read -1 and the
 # rest of the CSV still works.
 #
-# /tmp does not survive a sysupgrade, so after every flash fetch this again:
+# Installed at /usr/bin/wanlog, so it survives a sysupgrade. Start it with:
 #
-#   curl -sSfL -o /tmp/wanlog.sh \
-#     https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/wanlog.sh
-#   sh /tmp/wanlog.sh &
+#   wanlog &
+#
+# Its output still lives in /tmp and is still lost on reboot - only the script
+# itself is now permanent.
 #
 # Output:
 #   /tmp/wan2.csv         one row per sample

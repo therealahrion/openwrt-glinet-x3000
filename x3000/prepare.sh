@@ -168,11 +168,15 @@ rsync -a --exclude='.gitkeep' "$FILES_VARIANT"/ "$ROOT/files/"
 # procd runs via /etc/rc.d/S* MUST be +x or it silently never executes (the
 # init script ships, `enable` looks fine, and nothing runs at boot).
 # uci-defaults and hotplug.d scripts are sourced, so they do not care.
+# The same applies to anything in usr/bin: the diagnostic tools are meant to
+# be run by name, which needs the bit set.
 # Set the modes here so the image is correct regardless of what the
 # checkout filesystem preserved.
-if [[ -d "$ROOT/files/etc/init.d" ]]; then
-    find "$ROOT/files/etc/init.d" -type f -exec chmod 0755 {} +
-fi
+for d in etc/init.d usr/bin; do
+    if [[ -d "$ROOT/files/$d" ]]; then
+        find "$ROOT/files/$d" -type f -exec chmod 0755 {} +
+    fi
+done
 
 # --- Record the variant ---------------------------------------------------
 

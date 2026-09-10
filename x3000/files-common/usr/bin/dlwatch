@@ -2,7 +2,7 @@
 # 1 Hz downlink watcher for the GL-X3000, for catching the moment a stall
 # starts rather than its aftermath.
 #
-# wanlog.sh samples every five seconds and spends most of that on a ping and a
+# wanlog samples every five seconds and spends most of that on a ping and a
 # DNS lookup, which is too coarse for a stall that only appears above roughly
 # 200-300 Mbps. This does no network I/O: it reads four files a second and
 # writes one short row, so it can run under a speed test.
@@ -63,8 +63,11 @@
 #             whichever CPU took the interrupt, so if CPU0 saturates in softirq
 #             during a fast transfer, that is the drain loop falling behind.
 #
-# Usage:  sysctl -w kernel.kptr_restrict=1
-#         sh /tmp/dlwatch.sh &      then run the transfer
+# Usage:  dlwatch &                 then run the transfer
+#
+#         kernel.kptr_restrict=1 ships in /etc/sysctl.d/40-kptr-restrict.conf.
+#         On an older image set it by hand first, or dl_qd and dl_free read -1
+#         for the whole run:  sysctl -w kernel.kptr_restrict=1
 # Output: /tmp/dl.csv  (ignore the first row's CPU figures - no delta yet)
 # Stop:   kill $(cat /tmp/dlwatch.pid)
 

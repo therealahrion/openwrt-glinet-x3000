@@ -3,7 +3,7 @@
 # server, so they can be pulled onto a PC with a browser and handed over whole
 # rather than pasted in pieces.
 #
-# Usage:  sh /tmp/collect-logs.sh
+# Usage:  collect-logs
 #
 # It prints a URL. Open it, save the file, then delete the copy it left in /www
 # so the logs are not still being served on the LAN:

@@ -790,5 +790,5 @@ IRQ plus GRO on CPU0 from stack processing on CPU1, which is the useful split.
 It costs an IPI per batch, so at low rates it is a small loss. And the captures
 we have showed both CPUs at 0-6 percent during the stall, so **this box has not
 yet been shown to be CPU-bound at all** - which makes RPS a lever to test at
-250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch.sh` with it
+250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch` with it
 off and on before keeping it.

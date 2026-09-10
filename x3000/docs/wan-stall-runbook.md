@@ -63,18 +63,19 @@ Write 0 and re-probe to go back. A reboot does not keep the setting.
 
 ## 5. After a reboot or a flash
 
-`/tmp` does not survive either, so the recorders and their logs are gone, and
-`sysctl -w` does not persist:
+The recorders are part of the image now, at `/usr/bin/wanlog` and
+`/usr/bin/dlwatch`, so there is nothing to fetch. `kernel.kptr_restrict=1` also
+ships, in `/etc/sysctl.d/40-kptr-restrict.conf`. Just start them:
 
-    sysctl -w kernel.kptr_restrict=1
-    curl -sSfL -o /tmp/wanlog.sh  https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/wanlog.sh
-    curl -sSfL -o /tmp/dlwatch.sh https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/dlwatch.sh
-    sh /tmp/wanlog.sh & sh /tmp/dlwatch.sh &
+    wanlog & dlwatch &
+
+Their logs still live in `/tmp` and are still lost on reboot - only the tools
+are permanent.
 
 `kptr_restrict` matters: without it the driver's ring pointers print as hashes
-and `dl_qd`/`dl_free` record -1 for the whole run. Make it stick with
-
-    echo 'kernel.kptr_restrict=1' > /etc/sysctl.d/99-kptr-restrict.conf
+and `dl_qd`/`dl_free` record -1 for the whole run. If you are on an image
+predating the sysctl file, set it by hand first with
+`sysctl -w kernel.kptr_restrict=1`.
 
 Confirm the recorders took, since a failed start is silent in the background:
 
@@ -82,8 +83,7 @@ Confirm the recorders took, since a failed start is silent in the background:
 
 ## 6. Sharing a whole capture
 
-    curl -sSfL -o /tmp/collect-logs.sh https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/collect-logs.sh
-    sh /tmp/collect-logs.sh
+    collect-logs
 
 Bundles the logs plus a snapshot of ring, radio, interrupt and dmesg state, and
 prints a URL to fetch it from. Delete the copy it leaves in /www afterwards.
