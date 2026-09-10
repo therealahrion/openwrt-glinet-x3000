@@ -246,6 +246,56 @@ losing packet service every 30-33 minutes is a different fault: stock firmware
 over QMI, the modem detaches and re-registers, and recovery takes 10-21 s via a
 `CFUN` cycle. Here the interface never changes state and recovers on its own.
 
+## Clean-baseline run, 2026-09-10
+
+The router was reflashed to GL.iNet stock, the modem's band selection reset to
+auto there, then our image flashed back. That removed every inherited setting
+at once - band locks, TTL, MTU override - which no previous capture had.
+
+Seven and a half minutes of heavy traffic followed: 1.75 million packets at
+about 5,100/s. Results:
+
+- **No stalls.** Zero rows where rx stood still while tx kept moving, across
+  455 samples.
+- **Ring healthy throughout.** `dl_qd` sawtoothed with a floor of 64, exactly
+  the refill-at-half-queue point.
+- **Drain loop never near a limit.** Downlink completion-ring backlog peaked at
+  10 of 1024, both CPUs at 0-5 percent.
+- **But `dl_db` never moved.** One value, 66, for the entire run, while `dl_wp`
+  cycled the ring repeatedly. The doorbell exposure is unchanged by the reset:
+  it is structural, not something the old configuration created.
+
+One dump was written and it is a false positive worth knowing about: a
+six-second window where the recorder's ping exceeded its two-second timeout
+while rx was moving at 11,500/s, more than double the run's average. That is
+bufferbloat under load, not a stall. The lost-ping trigger catches degradation,
+which is what it is for, but a dump alone does not mean the link stopped - check
+whether rx was still climbing.
+
+The band-lock reset also did not improve the radio. Free to choose, the modem
+picked a different and wider n41 carrier and came out slightly worse: RSRP -104
+against -101/-103 before, SINR 12 against 15/16. So the marginal signal is the
+location, not a self-inflicted lock. The one real gain was the n25 secondary,
+which began reporting RSRP where it had previously reported nothing at all.
+
+## Related: the PCIe port power-management workaround
+
+`pcie_port_pm=off` in the bootargs is a separate fault from this one, but the
+two are close enough to confuse. See the entry in `x3000/README.md` for the root
+cause - an upstream change backported into the 6.12 stable series at 6.12.43
+that made non-x86 boards eligible for bridge D3 for the first time.
+
+It matters here only as an exclusion: that parameter governs the **root port**.
+The modem's own runtime PM is separate, still active, and is what drives the M3
+cycling that rings the downlink doorbell. Pinning the endpoint at D0 with
+
+    echo on > /sys/bus/pci/devices/0000:01:00.0/power/control
+
+stops those transitions entirely, which should make the doorbell exposure
+permanent rather than intermittent. That is the next test: if stalls get worse
+or become constant, the doorbell mechanism is confirmed and 993 is the fix; if
+they stop, power transitions were causing them and the doorbell is innocent.
+
 ## Instrumentation
 
 `x3000/docs/wanlog.sh` records the ring pointers on every sample. The columns

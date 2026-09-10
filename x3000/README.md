@@ -34,6 +34,32 @@ helpers alongside ModemManager:
    chosen bootargs (`target/linux/mediatek/dts/mt7981a-glinet-gl-x3000-xe3000-common.dtsi`)
    so the kernel never tries to take the link down.
 
+   Why this only started mattering on 25.12. `pci_bridge_d3_possible()`
+   used to refuse D3 on any board whose BIOS predated 2015, and a DT-only
+   ARM router has no DMI at all, so `dmi_get_bios_year()` returns -ENXIO
+   and the answer was always no. Upstream commit "PCI: Allow PCI bridges
+   to go to D3Hot on all non-x86" (mainline v6.15) changed the test to
+
+       if (!IS_ENABLED(CONFIG_X86) || dmi_get_bios_year() >= 2015)
+
+   which makes every non-x86 board eligible. It was backported into the
+   6.12 stable series between 6.12.40 and 6.12.43 -- verified by reading
+   the function at each tag: absent through v6.6.100 and v6.12.40,
+   present from v6.12.43 onward. So 24.10 on 6.6.y was never exposed,
+   25.12 is, and reports from other 25.12 users disagree because it
+   depends which point release they are running.
+
+   The workaround still works because `pci_bridge_d3_disable`, which is
+   what `pcie_port_pm=off` sets, is tested at the top of that function
+   and short-circuits before the new exemption is reached.
+
+   Note this governs the root port only. The modem has its own runtime
+   PM, enabled independently by mhi_pci_generic with a two-second
+   autosuspend, at
+   `/sys/bus/pci/devices/0000:01:00.0/power/control`. The boot parameter
+   does not touch it, and it is what drives the M3 power cycling visible
+   in `/sys/kernel/debug/mhi/*/states`.
+
 3. **ModemManager has no port blacklist without udev.** OpenWrt's
    ModemManager package is built with `-Dudev=false` and gets its
    port discovery via `/etc/hotplug.d/{tty,net,wwan}/25-modemmanager-*`
