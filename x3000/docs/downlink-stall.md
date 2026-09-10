@@ -237,13 +237,71 @@ host write the doorbell on every posted buffer at the cost of one MMIO write
 each. Prediction: the long freezes disappear, while the high round trips and
 timeouts remain, since nothing there touches the radio.
 
+## Ruled out: sideband_wake
+
+`mhi_pci_generic` marks the RM520N `sideband_wake = true`, which replaces the
+controller's `wake_get`/`wake_put`/`wake_toggle` with no-ops. That does leave the
+host with no device-wake mechanism - the driver has no GPIO code at all, at
+6.12.103 or in mainline master, where the only occurrence of "gpio" in the whole
+MHI host driver is the comment on that struct field. But it has nothing to do
+with this stall:
+
+- **Wrong register.** In-band wake writes `mhi_cntrl->wake_db`, channel-doorbell
+  index 127 (`MHI_DEV_WAKE_DB`). The stall was a missing channel 101 doorbell.
+  Wake would never have written it.
+- **Flipping the flag would change nothing.** `modem_quectel_em1xx_config` never
+  sets `m2_no_db`, so `db_access = MHI_PM_M0 | MHI_PM_M2`. `mhi_async_power_up()`
+  then selects `wake_toggle = (db_access & MHI_PM_M2) ? mhi_toggle_dev_wake_nop :
+  mhi_toggle_dev_wake`, so the `wake_toggle` in `mhi_queue()` is a no-op whether
+  the device is sideband or in-band.
+- **Doorbells stay legal in M2 anyway**, so even a modem napping with buffers
+  queued would not block `mhi_ring_chan_db()`.
+- **The device was awake through the freeze.** irq90 +853 and tx +761 across the
+  43 seconds; a modem in M2 is not servicing uplink completions.
+
+The field data closes it. After a clean flash the `states` dump reads
+
+    PM state: M0 Device: Active MHI state: M0 EE: MISSION MODE wake: false
+    M0: 80 M2: 0 M3: 79 device wake: 0 pending packets: 0
+
+**M2: 0** after 80 M0 and 79 M3 transitions. This modem cycles M0 <-> M3 under
+its own endpoint runtime PM and never announces M1, so the M2 machinery that
+sideband_wake governs is never exercised at all. `wake: false` and `device wake:
+0` in the same dump are the no-op handlers showing up directly. `wanlog.sh`
+records `m2` and `dwake` on every sample now, so a change in either is visible
+rather than assumed.
+
+Worth knowing for anyone reading the driver: `mhi_quectel_rm5xx_info` reuses
+`modem_quectel_em1xx_config` - the sdx24 configuration - and inherits
+`sideband_wake = true` from it, while every sdx55/sdx65/sdx6x/sdx72 device in the
+same file uses `false`. It still reads that way in mainline master. It looks
+inherited rather than chosen, but by the second point above it makes no
+difference here.
+
 ## Upstream, and prior reports
 
-Nothing between 6.12 and 6.17 fixes this. `mhi_process_data_event_ring()` did
-gain a ring-desync sanity check ("Event element points to an unexpected TRE"),
-which is detection rather than a fix, but its existence confirms ring desync is
-a real failure mode on MHI. `mhi_prepare_channel()` gained an ENABLED state
-check, and `mhi_wwan_mbim` got a session mux-id fix - neither related.
+No upstream fix exists. Diffing the whole MHI host driver from 6.12.103 to
+mainline master: `init.c` has no change touching `brstmode`, `db_mode`, `db_cfg`
+or the doorbell logic, and the one `mhi_ring_chan_db` change in `main.c` is the
+removal of the unrelated `pre_alloc`/auto-queue path, which never applied here
+(`pre_alloc` comes from `MHI_CH_INBOUND_ALLOC_BUFS`, and IP_HW0_MBIM does not
+set it). `MHI_CHANNEL_CONFIG_HW_UL`/`_DL` in master still use
+`MHI_DB_BRST_ENABLE` with `doorbell_mode_switch = true`, so 993 is not heading
+for a conflict either.
+
+Qualcomm's own downstream device-tree binding is the closest thing to a spec:
+`mhi,db-mode-switch` is documented as "Must switch to doorbell mode whenever MHI
+M0 state transition happens" - an independent statement that M0 transitions are
+the re-arm trigger, which is exactly what the capture above shows. It describes
+no other host-side re-arm, so the device is expected to ask via a DB_MODE event.
+The public kernel MHI documentation does not mention burst mode or DB_MODE at
+all, which is why there is no spec to appeal to.
+
+`mhi_process_data_event_ring()` did gain a ring-desync sanity check ("Event
+element points to an unexpected TRE"), which is detection rather than a fix, but
+its existence confirms ring desync is a real failure mode on MHI.
+`mhi_prepare_channel()` gained an ENABLED state check, and `mhi_wwan_mbim` got a
+session mux-id fix - neither related.
 
 No matching report found elsewhere. The GL.iNet thread about the RM520N-GL
 losing packet service every 30-33 minutes is a different fault: stock firmware
@@ -358,6 +416,12 @@ evidence is strong but one-directional.
 which kmodloader applies when it loads `mhi`, so the fix is live from boot with
 no unbind/bind cycle. That cycle matters: it destroys and recreates `wwan0`, and
 ModemManager reliably fails to find the modem again afterwards.
+
+Confirmed on the 2026-09-10 clean flash: `force_db_brst_disable` reads `Y` and
+both channels log "forcing doorbell writes" at 14 s, with nothing about mhi on
+`/proc/cmdline`. The file's on-disk hash no longer matches ubox's recorded
+conffile checksum, so from here on sysupgrade preserves it and a later image
+will not replace that line without `-n` or an edit on the device.
 
 It cannot go on the kernel command line. `mhi` is a loadable module here
 (`kmod-mhi-bus`), and OpenWrt's kmodloader takes module options from
