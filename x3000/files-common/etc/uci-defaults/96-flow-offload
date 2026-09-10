@@ -1,0 +1,28 @@
+#!/bin/sh
+# Turn software flow offloading on, unless something already has an opinion.
+#
+# This has to be asserted here rather than trusted to survive a flash.
+# /etc/config/firewall is a firewall4 conffile, so sysupgrade only carries it
+# across when the on-disk copy already differs from the packaged one, and any
+# flash that starts from the packaged copy has the option absent entirely.
+# That is how it went missing on the 2026-09-10 flash.
+#
+# Software only, deliberately. flow_offloading_hw stays off:
+# nf_flow_table_offload_setup() registers a device in the XDP lookup map only
+# when the flowtable is NOT hardware-offloaded, so enabling hardware offload
+# permanently disables bpf_xdp_flow_lookup() - and MediaTek's PPE cannot
+# resolve wwan0 as an egress port anyway, so it would buy nothing here. See
+# x3000/docs/xdp-methods-tested.md sections 10.1 and 10.2.
+#
+# Worth knowing: software flow offload does NOT bypass the egress qdisc. Both
+# of its transmit paths end in dev_queue_xmit(), so it composes with a cake
+# shaper. What it skips is conntrack re-lookup and the filter/nat/mangle
+# chains, so any nft rule acting on established traffic stops seeing it.
+#
+# Only acts when the option is unset, so deliberately setting it to 0 sticks.
+uci -q get firewall.@defaults[0] >/dev/null 2>&1 || exit 0
+if [ -z "$(uci -q get firewall.@defaults[0].flow_offloading)" ]; then
+	uci set firewall.@defaults[0].flow_offloading='1'
+	uci commit firewall
+fi
+exit 0
