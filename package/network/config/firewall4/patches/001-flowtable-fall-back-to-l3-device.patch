@@ -1,0 +1,41 @@
+Put L3-only interfaces into the flowtable
+
+fw4 builds the flowtable device list from each zone's related_physdevs,
+which is fed only from a network's physdev, and physdev is set from the
+ubus network.interface field "device" with no fallback:
+
+	device:  ifc.l3_device ?? ifc.device,
+	physdev: ifc.device,
+
+An interface whose protocol never creates an L2 device reports only
+l3_device. ModemManager is the case here: `ubus call network.interface
+dump` shows the wwan interface with "l3_device": "wwan0" and no "device"
+field at all, so physdev is undefined, the guard at the push site skips
+it, and wwan0 silently never enters the flowtable.
+
+The result is a flowtable holding only the LAN side. Flow offload needs
+both directions' devices, so with a 5G modem as WAN the generated
+flowtable is:
+
+	devices = { "br-lan", "eth0" }
+
+and no LAN-to-internet flow can ever be offloaded. Nothing reports this;
+the flowtable exists and looks healthy.
+
+Fall back to l3_device when device is absent. This only ever adds
+devices that previously resolved to nothing - where "device" exists it
+still wins, so PPPoE and VLAN setups keep resolving to their lower
+device exactly as before. physdev is read in only two places, both
+inside the flowtable device resolution, so nothing else changes.
+
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -619,7 +619,7 @@
+ 				let net = {
+ 					up: ifc.up,
+ 					device: ifc.l3_device ?? ifc.device,
+-					physdev: ifc.device,
++					physdev: ifc.device ?? ifc.l3_device,
+ 					zone: ifc.data?.zone
+ 				};
+ 

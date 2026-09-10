@@ -557,6 +557,47 @@ hardware offload does remove XDP's ability to *query* it.
 
 ---
 
+### 10.3 fw4 leaves L3-only interfaces out of the flowtable
+
+Turning software flow offloading on produced this:
+
+    flowtable ft {
+            hook ingress priority filter
+            devices = { "br-lan", "eth0" }
+            counter
+    }
+
+`wwan0` is missing, and flow offload needs **both** directions' devices, so no
+LAN-to-internet flow could be offloaded at all. The flowtable exists and looks
+healthy; nothing reports the omission.
+
+The cause is in `fw4.uc:619-623`. A network record is built as
+
+    device:  ifc.l3_device ?? ifc.device,
+    physdev: ifc.device,
+
+and `resolve_offload_devices()` builds the flowtable from
+`zone.related_physdevs`, which is fed only from `physdev` - `ifc.device` alone,
+never `l3_device`. A `proto modemmanager` interface has no L2 device: `ubus
+call network.interface dump` shows the `wwan` interface with `"l3_device":
+"wwan0"` and **no `"device"` field at all**, so `physdev` is undefined, the
+guard at `fw4.uc:2071` skips it, and the device never enters the list. Setting
+`option device` on the zone does not help either - `fw4.uc:2078` pushes that
+into `match_devices`, which the flowtable never reads.
+
+`package/network/config/firewall4/patches/001-flowtable-fall-back-to-l3-device.patch`
+changes `physdev` to `ifc.device ?? ifc.l3_device`. It only ever adds devices
+that previously resolved to nothing: where `device` exists it still wins, so
+PPPoE and VLAN setups keep resolving to their lower device unchanged. `physdev`
+is read in exactly two places, both inside flowtable resolution, so nothing
+else in fw4 is affected.
+
+This also means the section 10.1 claim about PPE has still never been tested in
+either direction. Even with `flow_offloading_hw=1`, PPE was never offered a
+modem flow, because the flowtable did not contain `wwan0`.
+
+---
+
 ## 11. WED is present, wired up, and switched off
 
 `mt7981-wo-firmware` ships in `DEVICE_PACKAGES` and
