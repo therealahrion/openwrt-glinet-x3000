@@ -11,7 +11,7 @@ ModemManager owning the data plane.
 The GL.iNet stock firmware ships an old OpenWrt 21.02 + kernel 5.4
 + a vendor-patched `pcie_mhi` driver that's never been upstreamed.
 Vanilla OpenWrt 25.12 (kernel 6.12) supports the rest of the device
-out of the box but needs four small fixes before the modem actually
+out of the box but needs five small fixes before the modem actually
 comes up, stays up under load, and lets us keep using our own AT
 helpers alongside ModemManager:
 
@@ -83,6 +83,32 @@ helpers alongside ModemManager:
    `x3000/patches/0002-curl-disable-brotli-autodetect.patch` to pass
    `--without-brotli` explicitly.
 
+5. **MHI stops ringing the downlink doorbell under sustained
+   load.** The modem's data channels are set up for
+   `MHI_DB_BRST_ENABLE` ("burst mode"), where the host writes the
+   channel doorbell only while the device has explicitly asked it to.
+   If the modem stops asking, the host goes on refilling RX
+   descriptors the modem never learns about and the downlink simply
+   stops. Caught in the act at roughly 300 Mbps: all 127 RX
+   descriptors queued, `rx` frozen for 43 seconds straight, `tx`
+   still flowing, the downlink event ring's interrupt count not
+   moving at all, no power transitions, and the radio healthy
+   throughout (RSRP -100, SINR 17).
+
+   `target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch`
+   adds an `mhi` module parameter, `force_db_brst_disable`, which
+   downgrades those channels to `MHI_DB_BRST_DISABLE` at probe time
+   so the doorbell is written on every queued buffer. It defaults to
+   off; `x3000/files-common/etc/modules.conf` turns it on for this
+   board.
+
+   It has to be enabled there rather than on the kernel command line.
+   `mhi` is a loadable module in this build (`kmod-mhi-bus`) and
+   OpenWrt's kmodloader takes module options from `/etc/modules.conf`
+   and `/etc/modules.d/` only -- it never reads `/proc/cmdline` -- so
+   an `mhi.force_db_brst_disable=1` bootarg would be silently ignored.
+   Full capture and analysis in `x3000/docs/downlink-stall.md`.
+
 ## What's different from a stock OpenWrt 25.12 build
 
 Commits on top of upstream `openwrt-25.12`:
@@ -93,6 +119,7 @@ Commits on top of upstream `openwrt-25.12`:
     + variant split under `x3000/`)
   * `swap modem stack from umbim+watchdog to ModemManager`
   * `patch curl to disable brotli autodetect`
+  * `mhi: optional doorbell writes, enabled via /etc/modules.conf`
 
 Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
@@ -352,7 +379,9 @@ x3000/
 ├── config.private.local *(optional, gitignored)* extra CONFIG_PACKAGE_…
                         lines for your private build. Appended to .config
                         after config.private.
-├── files-common/       Rootfs overlay shipped in every variant.
+├── files-common/       Rootfs overlay shipped in every variant. Holds
+                        etc/modules.conf, which enables the MHI
+                        doorbell workaround for this board.
 ├── files-private/      Rootfs overlay only in private. Per-builder slot:
                         only .gitkeep is tracked, all contents are
                         gitignored, so each builder keeps their internal
@@ -371,6 +400,10 @@ target/linux/generic/pending-6.12/
 target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
+target/linux/mediatek/patches-6.12/
+└── 993-bus-mhi-host-optional-doorbell-write.patch
+                        Adds the mhi force_db_brst_disable parameter
+                        (commit aaec43cb0d).
 ```
 
 `prepare.sh` writes its composed outputs to `/.config` and `/files/`

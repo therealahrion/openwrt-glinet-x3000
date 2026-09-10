@@ -1,7 +1,11 @@
 # The wwan0 downlink stall
 
-Status: the stall is below the MHI bus, and it is not caused by anything in
-this repo. Two candidates remain, both in the modem or the MHI host driver.
+Status: root-caused and fixed. The modem's MHI data channels run in burst-mode
+doorbell, and under sustained load nothing on this hardware ever rings the bell,
+so the downlink deadlocks holding a full ring of buffers the modem was never
+told about. Patch 993 forces unconditional doorbell writes; it is enabled on
+this board through `/etc/modules.conf` and has held through sustained 250+ Mbps
+runs that used to stall.
 
 ## Symptom
 
@@ -296,10 +300,94 @@ permanent rather than intermittent. That is the next test: if stalls get worse
 or become constant, the doorbell mechanism is confirmed and 993 is the fix; if
 they stop, power transitions were causing them and the doorbell is innocent.
 
+## Confirmed: the deadlock, and then the fix
+
+### The capture that settles it
+
+2026-09-10 09:26, on an image carrying 993 with the parameter off.
+
+    09:26:29  rx=2005672  tx=694409  irq91=68126  dl_qd=127  dl_free=0
+    09:27:12  rx=2005672  tx=695170  irq91=68126  dl_qd=127  dl_free=0
+
+Forty-three seconds with `rx` frozen to the exact packet, `tx` still climbing
+by 761, uplink vector 90 up 853, and downlink vector 91 not firing once. The
+ring was **completely full** - 127 posted, zero free. That kills host-side
+buffer starvation outright: the host had done everything it could and the modem
+had consumed nothing.
+
+Everything else was healthy at the same instant. Downlink completion-ring
+backlog 1 of 1024 with both CPUs at 0-6 percent, which exonerates 991 and 992
+for *entering* the stall as well as during it - the open question left by the
+correction above. `m0`/`m3` frozen at 1503/1502, so no power transitions were
+happening. Radio fine: RSRP -100, SINR 17, bearer up 37,128 s.
+
+And the doorbell state, read from debugfs during the freeze:
+
+| local rp | local wp | ctxt wp | db | modem rp |
+|---|---|---|---|---|
+| 66 | 65 | 65 | 66 | 46 |
+
+The host had gone a full lap of the ring posting 127 buffers and rung the bell
+zero times. `db` still points where it was one lap earlier.
+
+### The fix, measured
+
+With `force_db_brst_disable=1` the driver says so at probe:
+
+    mhi-pci-generic 0000:01:00.0: ch100 IP_HW0_MBIM: forcing doorbell writes
+    mhi-pci-generic 0000:01:00.0: ch101 IP_HW0_MBIM: forcing doorbell writes
+
+and `dl_db` then equals `dl_wp` on every sample and moves every second, against
+one frozen value across 455 samples with it off. Sustained 250+ Mbps with no
+stalls, in the same 200-300 Mbps band where they used to appear.
+
+### Still open
+
+The controlled reverse test - turn 993 back off, reproduce at the same
+throughput, confirm the deadlock returns - has not been completed. The first
+attempt did not take: the parameter was written but the rebind read it too
+early, so 993 was still active for that probe. Until that run exists the
+evidence is strong but one-directional.
+
+### How it is enabled
+
+`x3000/files-common/etc/modules.conf` carries
+
+    options mhi force_db_brst_disable=1
+
+which kmodloader applies when it loads `mhi`, so the fix is live from boot with
+no unbind/bind cycle. That cycle matters: it destroys and recreates `wwan0`, and
+ModemManager reliably fails to find the modem again afterwards.
+
+It cannot go on the kernel command line. `mhi` is a loadable module here
+(`kmod-mhi-bus`), and OpenWrt's kmodloader takes module options from
+`/etc/modules.conf` and from inline options in `/etc/modules.d/` files - it
+contains no `/proc/cmdline` parsing at all. The kernel accepts an
+`mhi.force_db_brst_disable=1` bootarg silently as an unused module parameter and
+it then never reaches the module. Of the two files, `/etc/modules.conf` is the
+right one because kmodloader applies it in `scan_module_folders()` on every
+invocation, including a manual `modprobe` after an `rmmod`, whereas
+`/etc/modules.d/` options are only read on the boot-loader path.
+
+To A/B test at runtime:
+
+    echo 0 > /sys/module/mhi/parameters/force_db_brst_disable
+    echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/unbind
+    echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/bind
+
+The parameter is read at probe, so the value in place at bind time is the one
+that counts. Confirm with the dmesg lines above rather than with the parameter
+file.
+
 ## Instrumentation
 
 `x3000/docs/wanlog.sh` records the ring pointers on every sample. The columns
-to watch are `dl_out` (buffers posted and unconsumed) and `dl_db` (last
-doorbell). If `dl_wp` keeps advancing through a stall while `dl_db` stands
-still, the host is posting buffers the modem is never told about. If `dl_db`
-tracks `dl_wp`, the modem has been told and is ignoring it.
+to watch are `dl_qd` and `dl_free` - buffers posted, and free descriptors left,
+both taken from the driver's own pointers - together with `dl_db`, the last
+doorbell written. If `dl_wp` keeps advancing through a stall while `dl_db`
+stands still, the host is posting buffers the modem is never told about. If
+`dl_db` tracks `dl_wp`, the modem has been told and is ignoring it. `dl_qd=127`
+with `dl_free=0` is the deadlock signature.
+
+Reading those pointer columns needs `sysctl -w kernel.kptr_restrict=1` first;
+without it the driver's own `rp`/`wp` print as hashed values.
