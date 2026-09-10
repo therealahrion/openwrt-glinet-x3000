@@ -904,12 +904,8 @@ would not saturate until something like 80 kpps, near 1 Gbps. Even the 41,194
 pkt/s peak from the stall captures would leave CPU0 around half idle. **This
 router is not CPU-bound and will not be on this WAN.**
 
-Scope that claim carefully: **every measurement in this document is wired LAN to
-modem.** No test in this session has put traffic across the wireless path, which
-adds mac80211 and mt76 processing that is materially heavier per packet than the
-ethernet path. "Not CPU-bound" is established for the wired path only. A box
-serving wireless clients at these rates has never been characterised here, and
-nothing above should be read as covering it.
+The wireless path was measured separately - see 14.5. It costs about the same
+per packet, so this conclusion holds for both, at modem rates.
 
 An earlier revision of this section said to keep the default steering on "for
 CPU0 headroom against jitter". That was an unmeasured claim and it is withdrawn
@@ -919,6 +915,7 @@ This is the measurement section 15 asked for, and it answers it in the
 negative: **#101 and #102 stay parked.** They reduce per-packet CPU cost on a
 machine with three quarters of CPU0 idle at full modem rate. There is no
 bottleneck there to attack, and no amount of driver work creates one.
+
 
 
 ### 14.4 The latency question is not resolvable on this hardware
@@ -965,6 +962,41 @@ half the flows would be steered onto the core already taking every MHI vector an
 the ethernet NAPI, and would still pay the backlog cost, since `get_rps_cpu()`
 does not compare its result against the current CPU. Predicted neutral to worse,
 and equally unresolvable here.
+
+### 14.5 The wireless path costs about the same, and that was not the prediction
+
+Measured 2026-09-10 from a 5 GHz client (channel 100, 160 MHz) running
+OpenSpeedTest through the modem - the same routed path to the same destination
+as the wired runs, differing only in the client link. Sampled with
+`IFACE=phy1-ap0 dlwatch`.
+
+Direction matters and is easy to get wrong: on `wwan0` the download is **rx**,
+on an AP interface it is **tx**, because the router is transmitting to the
+client. Comparing download packets to download packets:
+
+| | download pkt/s | cpu0_si | cpu1_si | total si | si per 1000 pkt/s |
+|---|---|---|---|---|---|
+| wired, `wwan0` rx | 21,059 | 11.1 | 7.9 | 18.9 | **0.897** |
+| wireless, `phy1-ap0` tx | 19,756 | 10.8 | 6.4 | 17.2 | **0.871** |
+
+The prediction going in was that wireless would cost two to three times more per
+packet, because of the mac80211 and mt76 processing. **It does not** - the two
+are the same within noise. The most likely explanation is that the dominant cost
+in both cases is identical work: the modem RX path, MHI plus MBIM NTB
+de-aggregation plus gro_cells. The egress difference, ethernet TX versus
+mac80211 and mt76 TX, is a smaller share of the total than assumed.
+
+What did change is where the work lands. `cpu1_busy` went from 10.4 to 23.2
+while `cpu0_busy` fell from 20.2 to 16.0, which fits: packet steering pins
+mt76's threads to CPU1, so wifi work goes to the core that was otherwise idle.
+Total across both cores is about 39 percent wireless against 33 percent wired.
+
+Two caveats. The sample is thin - 22 loaded seconds, since OpenSpeedTest's
+phases are short and the idle gaps are filtered out - so treat it as indicative.
+And it measures **wifi carrying modem-rate traffic, not wifi at wifi rates**: at
+160 MHz the radio can far exceed the modem's roughly 280 Mbps ceiling, and
+whether the path stays cheap at full Wi-Fi 6 rates is unmeasured. Measuring that
+needs a second host on the LAN to iperf against, which was not available.
 
 ---
 
