@@ -507,9 +507,53 @@ controller's own netdevs:
     else                            return -EOPNOTSUPP;
 
 `wwan0` is not one of them. With the 5G modem as WAN, **every LAN-to-internet
-flow is software-offloaded and nothing else is possible.** Setting the dropdown
-to Hardware is not harmful - it just has nothing to accelerate until a wired WAN
-or LAN-to-LAN flow appears.
+flow is software-offloaded and nothing else is possible.** Hardware offload has
+nothing to accelerate until a wired WAN or a LAN-to-LAN flow appears - and, per
+10.2, asking for it costs something real.
+
+### 10.2 Hardware offload and the XDP flowtable kfunc are mutually exclusive
+
+This is the part that makes the dropdown a real decision rather than a free
+upgrade. `nf_flow_table_offload.c:1250`:
+
+    int nf_flow_table_offload_setup(struct nf_flowtable *flowtable,
+                                    struct net_device *dev,
+                                    enum flow_block_command cmd)
+    {
+            ...
+            if (!nf_flowtable_hw_offload(flowtable))
+                    return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+
+            /* hardware path only, from here down */
+
+`nf_flow_offload_xdp_setup()` on `FLOW_BLOCK_BIND` calls
+`nf_flowtable_by_dev_insert()`, and that is the **only** caller - it is the sole
+way a device gets into `nf_xdp_hashtable`. That hashtable is what
+`nf_flowtable_by_dev()` reads, which is what `bpf_xdp_flow_tuple_lookup()` calls,
+which is what the `bpf_xdp_flow_lookup()` kfunc from section 6 is built on:
+
+    nf_flow_table_bpf.c:43   nf_flow_table = nf_flowtable_by_dev(dev);
+    nf_flow_table_bpf.c:44   if (!nf_flow_table)
+    nf_flow_table_bpf.c:45           return ERR_PTR(-ENOENT);
+
+`nf_flowtable_hw_offload()` is just `flowtable->flags & NF_FLOWTABLE_HW_OFFLOAD`,
+which is exactly the `flags offload` that `flow_offloading_hw` emits.
+
+**So switching the LuCI dropdown to "Hardware flow offloading" silently makes
+`bpf_xdp_flow_lookup()` return `-ENOENT` forever.** The device is never inserted
+into the XDP map. There is no partial mode and no fallback - the check is at the
+top of the setup function and it returns.
+
+On this board that trade is strictly bad: hardware offload cannot carry
+LAN-to-`wwan0` at all (10.1), so you would be giving up the only kernel hook that
+lets an XDP program consult the flowtable in exchange for nothing. **Leave the
+dropdown on Software flow offloading.**
+
+That also corrects the ordering intuition. The flowtable's own hook runs at
+`nf_ingress` (`dev.c:5664`), after generic XDP (`dev.c:5616`) and tc ingress
+(`dev.c:5656`) - re-verified at 6.12.103; section 5's line numbers were from an
+earlier point release. The flowtable never hides traffic from XDP. But choosing
+hardware offload does remove XDP's ability to *query* it.
 
 ---
 
@@ -546,3 +590,49 @@ this router WED would only accelerate wireless traffic to and from the wired
 ports, which is not the path anyone here uses. Enabling it is one line -
 `options mt7915e wed_enable=1` in `/etc/modules.conf` - but it should be measured,
 not assumed, and it changes the wireless RX ring setup.
+
+---
+
+## 12. Odds and ends, re-verified at 6.12.103
+
+Small claims that were resting on inference, now checked directly.
+
+- **RX hook order.** `__netif_receive_skb_core()`: generic XDP `dev.c:5616`, tc
+  ingress `dev.c:5656`, netfilter ingress `dev.c:5664`, bridge `rx_handler`
+  `dev.c:5690`. Same order as section 5, different line numbers.
+- **The kfunc really is built.** `net/netfilter/Makefile` at 6.12.103:
+  `nf_flow_table_xdp.o` is unconditional in `nf_flow_table-objs` (line 145), and
+  `nf_flow_table_bpf.o` is added by `CONFIG_DEBUG_INFO_BTF_MODULES` (148) or
+  `CONFIG_DEBUG_INFO_BTF` (150). `kmod-nf-flow` builds `nf_flow_table.ko` as a
+  module, so `_BTF_MODULES` is the gate that applies, and config.common sets it.
+- **`kmod-nft-offload` composition.** It selects `NF_FLOW_TABLE_INET` and
+  `NFT_FLOW_OFFLOAD` and ships `nf_flow_table_inet.ko` + `nft_flow_offload.ko`,
+  depending on `kmod-nf-flow` for `nf_flow_table.ko` - which is where the XDP
+  hook and the kfunc live. `kmod-nf-flow` also lists `CONFIG_NF_FLOW_TABLE_HW`
+  and autoloads `nf_flow_table_hw`; neither exists in 6.12 (the Kconfig has only
+  `NF_FLOW_TABLE`, `_INET` and `_PROCFS`). Harmless - kmodloader skips a module
+  it cannot find - but the `/etc/modules.d/` entry names a phantom.
+- **LAN/WAN assignment.** `ucidef_set_interfaces_lan_wan()` in
+  `package/base-files/files/lib/functions/uci-defaults.sh:89` takes `$1` as LAN
+  and `$2` as WAN, so `eth1 eth0` really is LAN `eth1`, WAN `eth0`.
+- **Wired GRO is the main path.** `napi_gro_receive` at `mtk_eth_soc.c:2207` sits
+  in the `mtk_poll_rx()` per-descriptor loop straight after `eth_type_trans()`
+  and the PPE check. There is no other delivery call in the driver.
+- **BBRv3 is the boot default.** `kmod-tcp-bbr` installs
+  `package/kernel/linux/files/sysctl-tcp-bbr.conf` as `/etc/sysctl.d/12-tcp-bbr.conf`,
+  containing `net.ipv4.tcp_congestion_control=bbr`, and 990 makes the module
+  registered under that name BBRv3 (`#define BBR_VERSION 3`,
+  `MODULE_VERSION(__stringify(BBR_VERSION))`, 1719 added lines in `tcp_bbr.c`).
+- **The SoC wifi is an mt7915e device.** `mt798x_wmac_of_match` in mt76's
+  `mt7915/soc.c` matches `mediatek,mt7981-wmac`, so the built-in radio binds the
+  same module that carries the `wed_enable` parameter. `options mt7915e
+  wed_enable=1` is the right spelling.
+- **The mt76 package carries no patches.** `package/kernel/mt76/` contains only a
+  Makefile - no `patches/`, no `files/`, and no occurrence of `wed` anywhere. The
+  "nothing enables WED" finding in section 11 survives that stronger check.
+- **WED has no PPE-independent accelerator here.** `mtk_wed_start_hw_rro()`
+  returns early unless `dev->wlan.hw_rro` is set, and mt7915 never sets it.
+  `mt76_wed_offload_enable()` only moves the TX token boundary. So the documented
+  ways WED helps are all PPE-gated, and PPE cannot carry `wwan0`.
+- **No hardware BPF offload.** No `NETDEV_XDP_ACT_HW_OFFLOAD` in `mtk_eth_soc.c`,
+  `net/mac80211/iface.c`, `net/dsa/user.c` or `net/bridge/br_device.c`.
