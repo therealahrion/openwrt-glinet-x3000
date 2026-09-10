@@ -582,14 +582,23 @@ The default is false and **nothing in the tree sets it** - a grep of `package/`,
 `target/` and `x3000/` for `wed_enable` returns nothing. So WED is inert and the
 WO firmware is never requested.
 
-Before turning it on, note what it would buy. `mtk_wed_setup_tc_block()` binds
-only `FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS`, and `mtk_wed_flow_add()` /
-`mtk_wed_flow_remove()` are driven by PPE flow entries - WED accelerates flows
-that PPE has already offloaded. Per section 10.1, PPE cannot carry `wwan0`. So on
-this router WED would only accelerate wireless traffic to and from the wired
-ports, which is not the path anyone here uses. Enabling it is one line -
-`options mt7915e wed_enable=1` in `/etc/modules.conf` - but it should be measured,
-not assumed, and it changes the wireless RX ring setup.
+Before turning it on, note what it would buy. Its *forwarding* acceleration is
+PPE-driven: `mtk_wed_setup_tc_block()` binds only
+`FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS`, and `mtk_wed_flow_add()` /
+`mtk_wed_flow_remove()` are called from PPE flow entries. Per section 10.1 PPE
+cannot carry `wwan0`, so that half would only ever accelerate wireless traffic to
+and from the wired ports.
+
+It is not only a forwarding engine, though. `mtk_wed_get_rx_capa()` returns true
+on this SoC (see section 12), so WED v2 also runs its own RX datapath with the WO
+MCU - which is exactly what `mt7981-wo-firmware` is for. Whether that alone saves
+CPU with no PPE flows bound cannot be settled from the source; it has to be
+measured. `mtk_wed_debugfs.o` is already built (section 13.3), so measuring it is
+cheap once it is on.
+
+Enabling it is one line - `options mt7915e wed_enable=1` in `/etc/modules.conf` -
+and it changes the wireless RX ring setup, so it is a change to make deliberately
+and measure, not a free switch.
 
 ---
 
@@ -630,9 +639,145 @@ Small claims that were resting on inference, now checked directly.
 - **The mt76 package carries no patches.** `package/kernel/mt76/` contains only a
   Makefile - no `patches/`, no `files/`, and no occurrence of `wed` anywhere. The
   "nothing enables WED" finding in section 11 survives that stronger check.
-- **WED has no PPE-independent accelerator here.** `mtk_wed_start_hw_rro()`
-  returns early unless `dev->wlan.hw_rro` is set, and mt7915 never sets it.
-  `mt76_wed_offload_enable()` only moves the TX token boundary. So the documented
-  ways WED helps are all PPE-gated, and PPE cannot carry `wwan0`.
+- **Correction: WED v2 does have an RX datapath.** An earlier revision of this
+  document claimed WED had no PPE-independent accelerator on this SoC. That was
+  wrong, and it came from checking only hardware RRO. `mtk_wed_get_rx_capa()`
+  (`include/linux/soc/mediatek/mtk_wed.h:251`) is
+
+      if (dev->version == 3)
+              return dev->wlan.hw_rro;
+      return dev->version != 1;
+
+  and `hw->version = eth->soc->version`, which is 2 for MT7981 - so it returns
+  **true**. It gates RX ring setup and teardown, RX buffer allocation, the ext
+  interrupt masks, and `mtk_wed_wo_reset()`/`mtk_wed_wo_deinit()`. WED v2 runs a
+  real RX path driven by the WO MCU, which is what `mt7981-wo-firmware` feeds.
+  What is genuinely off is hardware RRO specifically: `mtk_wed_hwrro_init()` and
+  `mtk_wed_start_hw_rro()` both need `dev->wlan.hw_rro`, which is v3-only and
+  which mt7915 never sets. Whether the v2 RX path saves CPU with no PPE flows
+  bound is not answerable from source - it needs measurement.
 - **No hardware BPF offload.** No `NETDEV_XDP_ACT_HW_OFFLOAD` in `mtk_eth_soc.c`,
   `net/mac80211/iface.c`, `net/dsa/user.c` or `net/bridge/br_device.c`.
+
+---
+
+## 13. WED and PPE: what is actually there to hook into
+
+### 13.1 PPE has a debugfs surface nobody is using
+
+`drivers/net/ethernet/mediatek/Makefile` puts `mtk_ppe_debugfs.o` in `mtk_eth-y`
+unconditionally, and `CONFIG_DEBUG_FS=y` in the generic config. So every build
+already exposes, per PPE unit:
+
+    /sys/kernel/debug/ppe0/entries    all FOE table entries
+    /sys/kernel/debug/ppe0/bind       only the bound (offloaded) ones
+    /sys/kernel/debug/ppe1/...        same, second unit
+
+`mt7981_data.has_accounting = true`, so each line carries live per-flow counters:
+
+    eth=<src>-><dst> etype=0800 vlan=0,0 ib1=... ib2=... packets=N bytes=N
+
+**This is the falsification test for section 10.1.** The claim that PPE cannot
+carry LAN-to-`wwan0` was derived from reading `mtk_ppe_offload.c`. Run a
+speedtest through the modem and read `/sys/kernel/debug/ppe*/bind`: if the claim
+holds, no entry appears for that traffic. If entries do appear, the source
+reading is wrong and this document needs correcting. That is worth doing before
+anyone acts on section 10.2's recommendation.
+
+Both units are in use, so check both. `mtk_eth_soc.c:3466-3475` assigns
+`ppe_idx` per MAC, and `mt7981_data.ppe_num = 2`, so gmac0 uses ppe0 and gmac1
+uses ppe1.
+
+### 13.2 The PPE binding policy is hardcoded
+
+`mtk_ppe_init()` writes fixed constants that upstream exposes no way to change:
+
+    mtk_ppe.c:1077   val = FIELD_PREP(MTK_PPE_BIND_RATE_BIND, 30) |
+    mtk_ppe.c:1078         FIELD_PREP(MTK_PPE_BIND_RATE_PREBIND, 1);
+    mtk_ppe.c:1058   val = FIELD_PREP(MTK_PPE_UNBIND_AGE_MIN_PACKETS, 1000) |
+    mtk_ppe.c:1059         FIELD_PREP(MTK_PPE_UNBIND_AGE_DELTA, 3);
+
+`BIND_RATE_BIND = 30` is the packets-per-tick a flow must sustain before the
+hardware will bind it, and `UNBIND_AGE_MIN_PACKETS`/`DELTA` govern when a bound
+flow is aged out. Short-lived flows never reach the bind threshold and are
+handled entirely in software.
+
+If PPE offload ever matters on this box - a wired WAN, or heavy LAN-to-LAN -
+these are the two registers worth turning into module parameters or DT
+properties, in the same shape as 993: default to the current values, patch only
+`mtk_ppe_init()`, and leave behaviour unchanged unless the parameter is set.
+That is a small, self-contained patch. It is not worth writing while the 5G
+modem is the only WAN, because nothing binds.
+
+### 13.3 WED has debugfs too, but only when it runs
+
+`mtk_wed_debugfs.o` is gated on `CONFIG_NET_MEDIATEK_SOC_WED` **and**
+`CONFIG_DEBUG_FS`, both of which are set. So if `wed_enable=1` were ever set, the
+WED counters would appear without any further work - which makes measuring the
+question in section 11 cheap rather than speculative.
+
+---
+
+## 14. Getting work off CPU0
+
+All four MHI MSI vectors land on CPU0 (`mhi_init_irq_setup` assigns event ring
+`n` to vector `n+1`), and the affinity write is refused - the MediaTek MSI domain
+sets `MSI_FLAG_NO_AFFINITY`, so `/proc/irq/*/smp_affinity` returns `-EPERM`. The
+interrupt cannot be moved. The processing after it can.
+
+### 14.1 cpumap works, but it costs GRO
+
+Verified end to end at 6.12.103:
+
+- `do_xdp_generic()` (`dev.c:5262`) dispatches `XDP_REDIRECT` to
+  `xdp_do_generic_redirect()`.
+- `xdp_do_generic_redirect_map()` (`filter.c:4570`) handles
+  `BPF_MAP_TYPE_CPUMAP` via `cpu_map_generic_redirect()`.
+- `cpumap.o` is built by `CONFIG_BPF_SYSCALL`, always on here.
+- 992 routes through `do_xdp_generic()` and advertises
+  `NETDEV_XDP_ACT_REDIRECT`.
+
+So an XDP program on `wwan0` can redirect into a CPUMAP pinned to CPU1 today,
+with the image as built. The catch is the delivery on the far side:
+`cpumap.c:364` is `netif_receive_skb_list(&list)` - **no GRO**. Redirecting to a
+cpumap therefore bypasses 991's `gro_cells` entirely and hands the stack
+un-aggregated packets on the other core. That is a trade, not a win, and 991
+exists because the aggregation was worth having.
+
+The native wired path has the same capability (`__xdp_do_redirect_frame` ->
+`cpu_map_enqueue`) with the same caveat.
+
+### 14.2 RPS does the same job and keeps GRO
+
+`CONFIG_RPS=y`, `CONFIG_RFS_ACCEL=y` and `CONFIG_XPS=y` are all set in
+`target/linux/mediatek/filogic/config-6.12`. The modem receive path is:
+
+    MHI IRQ (CPU0) -> mhi_ev_task -> mhi_mbim_rx
+      -> 992's do_xdp_generic hook, if a program is attached
+      -> 991's gro_cells_receive, which queues on this_cpu (gro_cells.c:28)
+      -> gro_cell_poll -> napi_gro_receive
+      -> gro_normal_one -> netif_receive_skb_list_internal()
+      -> __netif_receive_skb_core
+
+and `netif_receive_skb_list_internal()` (`dev.c:6000`) applies RPS to that
+post-GRO list:
+
+    dev.c:6016   if (static_branch_unlikely(&rps_needed)) {
+    dev.c:6019           int cpu = get_rps_cpu(skb->dev, skb, &rflow);
+    dev.c:6021           if (cpu >= 0) {
+    dev.c:6024                   enqueue_to_backlog(skb, cpu, &rflow->last_qtail);
+
+So RPS runs **after** GRO has already aggregated, and moves the aggregated
+super-packets to another core. That is strictly the better shape than cpumap
+here: it keeps 991, needs no BPF program, and is a single sysfs write.
+
+    echo 2 > /sys/class/net/wwan0/queues/rx-0/rps_cpus   # 0x2 = CPU1
+
+Caveats worth stating plainly. RPS hashes per flow, so one big TCP stream moves
+to one other core rather than spreading; on a dual-core A53 that still splits
+IRQ plus GRO on CPU0 from stack processing on CPU1, which is the useful split.
+It costs an IPI per batch, so at low rates it is a small loss. And the captures
+we have showed both CPUs at 0-6 percent during the stall, so **this box has not
+yet been shown to be CPU-bound at all** - which makes RPS a lever to test at
+250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch.sh` with it
+off and on before keeping it.
