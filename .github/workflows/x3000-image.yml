@@ -104,6 +104,14 @@ jobs:
           # first boot. If that uci-default ever goes missing, zram would come
           # up live on a 512 MB box -- so gate on it.
           test -f x3000/files-common/etc/uci-defaults/99-zram-disabled
+          # The diagnostic tools are run by name, so they have to ship +x. A
+          # Windows checkout runs git with core.filemode=false and loses the
+          # bit; prepare.sh restores it when composing files/. Gate on the
+          # result rather than the source, because an unrunnable script on the
+          # box fails in a way that looks exactly like success.
+          for t in wanlog dlwatch collect-logs; do
+            test -x "files/usr/bin/$t" || { echo "not executable: files/usr/bin/$t" >&2; exit 1; }
+          done
           echo "config OK"
 
       - name: Download sources
@@ -117,7 +125,11 @@ jobs:
       - name: Collect artifacts
         run: |
           set -e
-          TDIR=bin-x3000-public/targets/mediatek/filogic
+          # BIN_DIR is the *leaf* output directory in OpenWrt: rules.mk sets it
+          # to $(OUTPUT_DIR)/targets/$(BOARD)/$(SUBTARGET), so overriding it in
+          # the build step puts the images flat here, not under a targets/
+          # subtree. Getting this wrong fails the job after the whole build.
+          TDIR=bin-x3000-public
           mkdir -p out
           cp "$TDIR"/openwrt-mediatek-filogic-glinet_gl-x3000-squashfs-sysupgrade.bin out/
           cp "$TDIR"/openwrt-mediatek-filogic-glinet_gl-x3000.manifest out/ || true
@@ -125,6 +137,32 @@ jobs:
           cp "$TDIR"/version.buildinfo out/ || true
           (cd out && sha256sum -- * > sha256sums)
           ls -la out/
+
+      # Catch silent image growth, and a truncated or stub image, before the
+      # artifact is published. The private variant measured 92,559,637 bytes
+      # (88.3 MiB) on 2026-09-10 with telegraf-full baked in; the public
+      # variant carries neither telegraf nor the private overlay, so it should
+      # sit well below that. The ceiling starts deliberately loose - tighten it
+      # once a public build has printed its real size in this log. The floor is
+      # there because a stub image is a worse failure than a fat one and would
+      # otherwise upload cleanly.
+      - name: Check image size
+        env:
+          MAX_IMAGE_BYTES: "100663296"
+          MIN_IMAGE_BYTES: "8388608"
+        run: |
+          set -e
+          IMG=out/openwrt-mediatek-filogic-glinet_gl-x3000-squashfs-sysupgrade.bin
+          BYTES=$(stat -c %s "$IMG")
+          echo "sysupgrade image: $BYTES bytes ($((BYTES / 1048576)) MiB)"
+          if [ "$BYTES" -gt "$MAX_IMAGE_BYTES" ]; then
+            echo "image is larger than MAX_IMAGE_BYTES=$MAX_IMAGE_BYTES" >&2
+            exit 1
+          fi
+          if [ "$BYTES" -lt "$MIN_IMAGE_BYTES" ]; then
+            echo "image is smaller than MIN_IMAGE_BYTES=$MIN_IMAGE_BYTES -- truncated?" >&2
+            exit 1
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
