@@ -311,9 +311,24 @@ no scheduler replacement required.
 1. **One master per interface.** One root qdisc per netdev (cake vs HTB vs
    PIE vs fq: a per-interface choice, not a conflict). One *manager* per
    interface: sqm-scripts XOR qosify. One DSCP marker at a time.
-2. **Fast paths bypass queues.** HW/SW flow offload and XDP_REDIRECT
-   forwarding skip the qdisc layer — mutually exclusive with shaping the
-   same path. XDP filtering/observation coexists fine.
+2. **Fast paths and queues — corrected 2026-09-10.** This rule used to say
+   HW *and* SW flow offload both skip the qdisc layer. Only half of that is
+   true, checked against 6.12.103.
+   *Hardware* offload (PPE) and XDP_REDIRECT forwarding do skip it and are
+   mutually exclusive with shaping the same path — PPE-bound packets never
+   reach the CPU at all.
+   *Software* flow offload does **not**. Both of its transmit paths end in
+   `dev_queue_xmit()`, which is where the root qdisc runs:
+   `FLOW_OFFLOAD_XMIT_NEIGH` goes `neigh_xmit()` -> `neigh->output()` ->
+   `dev_queue_xmit()` (`neighbour.c:1570`, `1599`, `1610`), and
+   `FLOW_OFFLOAD_XMIT_DIRECT` goes through `nf_flow_queue_xmit()`
+   (`nf_flow_table_ip.c:345`). So cake on egress and software flow offload
+   compose fine.
+   What software offload actually skips is conntrack re-lookup, the
+   filter/nat/mangle chains and the routing lookup — everything after
+   `nf_ingress` (`dev.c:5664`). Generic XDP (`dev.c:5616`) and tc ingress
+   (`dev.c:5656`) both run earlier and are unaffected. XDP
+   filtering/observation coexists fine.
 3. **Layers compose; semantics can clash.** Endpoint pacing/CC never
    conflicts with middlebox shaping. The one semantic caveat: RFC 3168
    CE-marking (cake) vs L4S ECT(1) flows when cake is the bottleneck.
