@@ -834,3 +834,92 @@ we have showed both CPUs at 0-6 percent during the stall, so **this box has not
 yet been shown to be CPU-bound at all** - which makes RPS a lever to test at
 250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch` with it
 off and on before keeping it.
+
+---
+
+## 15. Scoping the XDP fast path, and why it is not worth building yet
+
+Sections 9.3 and 13 left `ndo_xdp_xmit` on `mhi_wwan_mbim` as the headline
+enhancement: it would make `wwan0` a valid redirect target and open a LAN to
+modem XDP path. Scoping it against the driver turned up enough to argue for
+deferring it.
+
+### 15.1 What the driver would need
+
+`mhi_mbim_ndo_xmit()` is skb-shaped throughout. `mbim_tx_fixup()` does
+`skb_cow_head()` then `skb_push()` to prepend `struct mbim_tx_hdr` - NTH16 plus
+NDP16 plus two DPE16, 28 bytes packed - and hands the result to
+`mhi_queue_skb()`. Three problems follow from that.
+
+**Framing.** An `xdp_frame` has no `skb_push()`. The header would be written by
+adjusting `frame->data` and `frame->len` by hand, after checking
+`frame->headroom` is actually 28 bytes or more rather than assuming the usual
+`XDP_PACKET_HEADROOM`. Not hard, but it is open-coded pointer work in a path
+where getting it wrong corrupts the NTB the modem parses. `mhi_queue_buf()`
+exists and is the right queue call.
+
+**Locking.** `mhi_mbim_ndo_xmit()` already takes `spin_lock_irqsave(&mbim->tx_lock)`,
+commented "Serialize MHI channel queuing and MBIM seq", because several links
+share one MHI channel and the NTB carries a sequence number. `ndo_start_xmit` is
+serialized per queue by the netdev layer on top of that; **`ndo_xdp_xmit` is
+not**, and can run concurrently on every CPU that has a redirecting NAPI. It
+would have to take the same lock - so every redirected frame contends a spinlock
+with normal TX, on a dual-core A53. That erodes a good part of what XDP is for.
+
+**Completion.** `mhi_mbim_ul_callback()` opens with
+
+    struct sk_buff *skb = mhi_res->buf_addr;
+    struct net_device *ndev = skb->dev;
+
+It hard-assumes the buffer is an skb and dereferences `skb->dev` for stats.
+`mhi_result` carries no type tag, so mixing `xdp_frame`s into the same channel
+means inventing one: a side table, a tagged wrapper (which reintroduces the
+per-frame allocation XDP exists to avoid), or pointer-bit games. All of it lands
+in a hot completion path.
+
+Declining `NETDEV_XDP_ACT_NDO_XMIT_SG` avoids multi-buffer frames entirely -
+`devmap.c:491` refuses fragmented frames when SG is not advertised - so at least
+that part can be sidestepped.
+
+### 15.2 The part that makes it a project rather than a patch
+
+`ndo_xdp_xmit` on its own buys nothing usable, and not for a subtle reason.
+
+Generic XDP runs at `dev.c:5616`, tc ingress at `5656`, netfilter ingress at
+`5664`. An `XDP_REDIRECT` from `eth1` to `wwan0` hands the frame to the modem's
+transmit path directly - **the packet never enters netfilter at all**, so
+masquerading never happens. A LAN packet would leave the modem still carrying a
+private source address and be dropped upstream.
+
+Making it work means doing the NAT in BPF: look the flow up with
+`bpf_xdp_flow_lookup()` (which is what section 6 is about - the returned
+`flow_offload_tuple_rhash` gives access to `tuplehash[!dir].tuple`, carrying the
+translated addresses and ports), rewrite the headers, fix the checksums, then
+redirect. That is the actual shape of the work, and #101 is only its first
+third.
+
+### 15.3 Two cheaper paths already exist
+
+- **tc-BPF `bpf_redirect()`** from `eth1` to `wwan0` works today with no driver
+  change at all. It is skb-based, so slower than native XDP, but it is a real
+  fast path available now.
+- **The software flowtable now covers `wwan0`** (section 10.3). It skips
+  conntrack re-lookup and the filter/nat/mangle chains at `nf_ingress`, and -
+  unlike an XDP redirect - it does the NAT for you, because it *is* netfilter.
+
+### 15.4 The measurement that is missing
+
+Everything above is optimising a bottleneck nobody has demonstrated. Every
+capture we have shows both CPUs at 0-6 percent, including during the 43-second
+deadlock at full downlink rate. The box has never been shown to be CPU-bound.
+
+So the order is: measure first. #98 (RPS) is a one-line sysfs write that shows
+whether moving work off CPU0 changes anything at all. If it does not, the whole
+XDP fast-path line of work is solving a problem this hardware does not have, and
+#101 and #102 should stay parked. If it does, that same measurement tells us how
+much headroom is actually on the table and whether it justifies a driver patch
+plus a NAT-rewriting BPF program.
+
+**Recommendation: park #101 and #102 behind a measurement.** They are not
+blocked by anything technical - the analysis is done and the approach is sound -
+but neither should be built on the assumption that this box needs them.
