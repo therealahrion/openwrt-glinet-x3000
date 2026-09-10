@@ -904,6 +904,13 @@ would not saturate until something like 80 kpps, near 1 Gbps. Even the 41,194
 pkt/s peak from the stall captures would leave CPU0 around half idle. **This
 router is not CPU-bound and will not be on this WAN.**
 
+Scope that claim carefully: **every measurement in this document is wired LAN to
+modem.** No test in this session has put traffic across the wireless path, which
+adds mac80211 and mt76 processing that is materially heavier per packet than the
+ethernet path. "Not CPU-bound" is established for the wired path only. A box
+serving wireless clients at these rates has never been characterised here, and
+nothing above should be read as covering it.
+
 An earlier revision of this section said to keep the default steering on "for
 CPU0 headroom against jitter". That was an unmeasured claim and it is withdrawn
 - see 14.4.
