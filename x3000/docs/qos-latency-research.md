@@ -855,9 +855,41 @@ device; PREEMPT_DYNAMIC by contrast has a runtime debugfs toggle).
 
 Held for a deliberate/tested pass (NOT in this batch, with reasons):
 
-* **mt76 bump** — swaps the Wi-Fi driver to a 5-month-newer snapshot;
-  behavioral (not dormant), so it deserves its own build to isolate any
-  regression. Needs a `PKG_SOURCE_VERSION`/`MIRROR_HASH` change.
+* **mt76 bump** — swaps the Wi-Fi driver to a newer snapshot; behavioral
+  (not dormant), so it deserves its own build to isolate any regression.
+  Needs a `PKG_SOURCE_VERSION`/`MIRROR_HASH` change.
+
+  Assessed 2026-09-10 against the pin (`39c960c3ada5`, 2026-03-19). Diffing
+  the eleven files that matter for this board - `mt7915/{soc,mmio,mac,init,main}.c`,
+  `mac80211.c`, `dma.c`, `wed.c`, `tx.c`, `agg-rx.c`, `mt76.h` - gives about
+  400 changed lines, and the content is mostly **fixes**, which raises the
+  value of the bump:
+
+  - `wed.c`: WED v2 uses `MT_RXQ_MAIN` for every band on the pin; upstream now
+    selects `MT_RXQ_BAND1` when `wed->version == 2 && dev->phy.band_idx`.
+    MT7981 is WED v2 **and** DBDC, so enabling WED on the current pin would
+    misconfigure band 1. This gates #99: bump before testing WED, or the test
+    measures a known-buggy configuration.
+  - `dma.c`: clamps an out-of-range DMA index, because "a hung bus (e.g. after
+    a PCIe AER error) reads 0xffffffff from every register" and would otherwise
+    corrupt `q->head`/`q->tail`. The Wi-Fi is SoC-internal here rather than
+    PCIe, so this specific trigger does not apply, but it is real hardening.
+  - `mt7915/mac.c`: RSSI chain 3 read `GENMASK(31, 14)` where it should be
+    `GENMASK(31, 24)`; `tx_retries = count - 1` underflowed to 0xFFFFFFFF when
+    count was zero; new PLE hardware-hang detection
+    (`MT_SWDEF_PLE1_MDP_RIOC_HANG_ERR`); reset path now uses
+    `test_and_clear_bit` and wakes queues.
+  - `mac80211.c`: `ieee80211_is_first_frag()` was passed `hdr->frame_control`
+    where `hdr->seq_ctrl` was intended; wcid publish is now guarded against a
+    double-publish with `WARN_ON_ONCE`.
+  - Behaviour change to isolate: `MT_DRV_HW_PS_BUFFERING` plus new power-save
+    buffering in `tx.c` and a UAPSD EOSP fix - this alters handling for
+    power-saving clients.
+
+  Caveats on that assessment: it covers eleven files, not the whole tree, and
+  it was taken against `master`, which moves. An actual bump means choosing a
+  specific commit, and some of these changes are recent enough not to be
+  battle-tested.
 * **MHI-GRO — DONE, and this entry was stale.** It is patch 991,
   `991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`: written, built, flashed and
   running, with 992 (native XDP via `do_xdp_generic`) and 993 (the MHI doorbell
