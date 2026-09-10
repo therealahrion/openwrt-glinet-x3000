@@ -860,6 +860,62 @@ yet been shown to be CPU-bound at all** - which makes RPS a lever to test at
 250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch` with it
 off and on before keeping it.
 
+
+### 14.3 Measured, 2026-09-10: this box is not CPU-bound
+
+Four alternating 60-second legs through the modem under OpenSpeedTest
+(multi-connection, so flows hash across CPUs - the favourable case for RPS),
+sampled by `dlwatch`:
+
+| leg | rps_cpus | pkt/s | cpu0_busy | cpu0_si | cpu1_busy | cpu1_si |
+|---|---|---|---|---|---|---|
+| 1 | 0 | 15927 | 20.3 | 12.1 | 3.4 | 1.0 |
+| 2 | 2 | 23168 | 22.9 | 12.1 | 11.6 | 8.3 |
+| 3 | 0 | 20829 | 25.8 | 15.4 | 4.7 | 1.5 |
+| 4 | 2 | 18949 | 20.2 | 10.0 | 10.4 | 7.4 |
+
+Read the labels carefully: `rps_cpus=2` is not an experimental setting, it is
+**this box's default**. `network.globals.packet_steering='1'`, and
+`packet-steering.uc` assigns `wwan0`'s rx queue to CPU1 - it deliberately biases
+away from the CPU running ethernet NAPI. So the legs are OpenWrt's default
+steering on versus disabled, not off versus on.
+
+Throughput varied 45 percent across legs, so the CPU figures only mean anything
+normalised by packet rate (softirq percent per 1000 pkt/s):
+
+| | cpu0_si per kpps | total_si per kpps |
+|---|---|---|
+| disabled (legs 1, 3) | **0.750** | 0.817 |
+| default (legs 2, 4) | **0.525** | 0.899 |
+
+**RPS works.** `cpu1_si` moves from about 1 to about 8; the work really is
+relocating. It takes roughly 30 percent of CPU0's per-packet softirq off that
+core, and costs about 10 percent more softirq overall - the IPI, the queueing
+and the cache misses. That is the textbook signature: relocation, not
+elimination.
+
+**It does not change throughput.** The fastest leg was steering-on and the
+second fastest was steering-off; the effect does not track the treatment. That
+spread is the cellular link, which is why the legs alternate.
+
+**And the conclusion that matters.** `cpu0_busy` peaked at 25.8 percent and
+`cpu1_busy` at 11.6 percent, at roughly 250 Mbps. Extrapolating linearly, CPU0
+would not saturate until something like 80 kpps, near 1 Gbps. Even the 41,194
+pkt/s peak from the stall captures would leave CPU0 around half idle. **This
+router is not CPU-bound and will not be on this WAN.**
+
+Keep the default steering on, but for the right reason: not throughput, but CPU0
+headroom. All four MHI vectors land on CPU0 and cannot be moved
+(`MSI_FLAG_NO_AFFINITY`), so shifting a third of the per-packet softirq off it is
+cheap insurance against jitter under burst. `steering_flows` stays unset - RFS
+steers toward the CPU running the application, which is meaningless on a box
+that forwards rather than terminates.
+
+This is the measurement section 15 asked for, and it answers it in the
+negative: **#101 and #102 stay parked.** They reduce per-packet CPU cost on a
+machine with three quarters of CPU0 idle at full modem rate. There is no
+bottleneck there to attack, and no amount of driver work creates one.
+
 ---
 
 ## 15. Scoping the XDP fast path, and why it is not worth building yet
