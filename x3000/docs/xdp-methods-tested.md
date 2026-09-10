@@ -658,6 +658,17 @@ Small claims that were resting on inference, now checked directly.
   bound is not answerable from source - it needs measurement.
 - **No hardware BPF offload.** No `NETDEV_XDP_ACT_HW_OFFLOAD` in `mtk_eth_soc.c`,
   `net/mac80211/iface.c`, `net/dsa/user.c` or `net/bridge/br_device.c`.
+- **AF_XDP works, but only in copy mode.** `CONFIG_KERNEL_XDP_SOCKETS=y` is set, so
+  AF_XDP sockets bind fine - but `mtk_eth_soc.c` has zero occurrences of
+  `ndo_xsk_wakeup` and zero of `NETDEV_XDP_ACT_XSK_ZEROCOPY`, so there is no
+  zero-copy path on the wired ports. Worth stating because the config symbol
+  invites the opposite assumption.
+- **No XDP RX metadata.** `mtk_eth_soc.c` implements no `xdp_metadata_ops`, so
+  none of `xmo_rx_hash`, `xmo_rx_timestamp` or the VLAN accessor exist. A BPF
+  program on `eth0`/`eth1` cannot read the hardware RX hash through the
+  `bpf_xdp_metadata_*` kfuncs, even though the driver computes a hash for the PPE
+  path. Implementing `xdp_metadata_ops` would be a small, self-contained driver
+  patch and is the cheapest of the driver-side enhancement candidates.
 
 ---
 
