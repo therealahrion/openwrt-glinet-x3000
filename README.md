@@ -20,7 +20,7 @@ from the [Build X3000 image workflow](../../actions/workflows/x3000-image.yml)
 
 **vjt's pre-built images** are on his
 [**releases page**](https://github.com/vjt/openwrt-glinet-x3000/releases)
-— the `jeeves-rN` builds are his stock tree without this overlay; flash the and flash the
+— the `jeeves-rN` builds are his stock tree without this overlay. Flash
 `...-squashfs-sysupgrade.bin` (factory image is rejected by stock
 GL.iNet U-Boot; sysupgrade is the only path in).
 

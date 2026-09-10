@@ -39,8 +39,16 @@
 # never told about (a burst-mode doorbell that stopped being rung). If dl_db
 # tracks dl_wp, the modem has been told and is ignoring it.
 #
-# m0/m3 count power-state transitions and pend is uplink packets in flight, so
-# a stall that lines up with a suspend/resume cycle is visible too.
+# m0/m2/m3 count power-state transitions and pend is uplink packets in flight,
+# so a stall that lines up with a suspend/resume cycle is visible too. m2 is
+# what tells a real deadlock apart from the modem simply napping: if it climbs
+# during a freeze the device went to sleep with buffers queued, if it stands
+# still the device was awake and just stopped consuming.
+#
+# dwake is the MHI core's device-wake refcount. On this modem it is pinned at
+# 0 by design: mhi_pci_generic marks the RM520N sideband_wake, which replaces
+# wake_get/wake_put with no-ops because the driver has no GPIO to drive. Any
+# value other than 0 would mean that assumption changed.
 #
 # Requires CONFIG_MHI_BUS_DEBUG=y. Without it the ring columns read -1 and the
 # rest of the CSV still works.
@@ -105,7 +113,7 @@ echo $$ > "$PIDFILE"
 #
 # The debugfs events dump agrees: rings 0 and 1 hold 128 elements, rings 2
 # and 3 hold 1024, matching MHI_EVENT_CONFIG_CTRL/DATA vs HW_DATA.
-[ -f "$CSV" ] || echo "time,rx_pkts,rx_drop,tx_pkts,irq88,irq89,irq90,irq91,dl_qd,dl_free,dl_wp,dl_db,dev_rp,ul_qd,m0,m3,pend,ping,dns,up" > "$CSV"
+[ -f "$CSV" ] || echo "time,rx_pkts,rx_drop,tx_pkts,irq88,irq89,irq90,irq91,dl_qd,dl_free,dl_wp,dl_db,dev_rp,ul_qd,m0,m2,m3,dwake,pend,ping,dns,up" > "$CSV"
 
 # Sum every CPU column for each MHI interrupt. Reading only CPU0 would show a
 # false freeze if a vector ever migrated to the other core.
@@ -193,9 +201,10 @@ while :; do
 		DL_WP=-1; DL_DB=-1; DEV_RP=-1; DL_QD=-1; DL_FREE=-1; UL_QD=-1
 	fi
 
-	PM=$(awk '/^M0:/ { print $2, $6, $NF }' "$MHI_DIR/states" 2>/dev/null)
+	# states prints: M0: n M2: n M3: n device wake: n pending packets: n
+	PM=$(awk '/^M0:/ { print $2, $4, $6, $9, $NF }' "$MHI_DIR/states" 2>/dev/null)
 	set -- $PM
-	M0=${1:--1}; M3=${2:--1}; PEND=${3:--1}
+	M0=${1:--1}; M2=${2:--1}; M3=${3:--1}; DWAKE=${4:--1}; PEND=${5:--1}
 
 	P=$(ping -c1 -W2 "$PING_TARGET" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
 	[ -z "$P" ] && P=TIMEOUT
@@ -205,7 +214,7 @@ while :; do
 	U=$(ifstatus "$UCI_IFACE" 2>/dev/null | grep -o '"up": [a-z]*' | cut -d' ' -f2)
 	[ -z "$U" ] && U=unknown
 
-	echo "$(date +%H:%M:%S),$RP,$RD,$TP,$MI$DL_QD,$DL_FREE,$DL_WP,$DL_DB,$DEV_RP,$UL_QD,$M0,$M3,$PEND,$P,$D,$U" >> "$CSV"
+	echo "$(date +%H:%M:%S),$RP,$RD,$TP,$MI$DL_QD,$DL_FREE,$DL_WP,$DL_DB,$DEV_RP,$UL_QD,$M0,$M2,$M3,$DWAKE,$PEND,$P,$D,$U" >> "$CSV"
 
 	# One healthy dump up front, so a stall can be diffed against it.
 	if [ "$FIRST" -eq 1 ]; then
