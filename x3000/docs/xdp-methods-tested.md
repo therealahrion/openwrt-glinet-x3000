@@ -511,6 +511,31 @@ flow is software-offloaded and nothing else is possible.** Hardware offload has
 nothing to accelerate until a wired WAN or a LAN-to-LAN flow appears - and, per
 10.2, asking for it costs something real.
 
+That egress gate was the original reason given here, and it is the weaker one.
+Checked again on 2026-09-10, a `wwan0` flow never reaches MediaTek code at all:
+
+- `mhi_wwan_mbim`'s `net_device_ops` has exactly four entries - `ndo_open`,
+  `ndo_stop`, `ndo_start_xmit`, `ndo_get_stats64` - plus `ndo_bpf` from 992.
+  **No `ndo_setup_tc`.** So `nf_flow_table_offload_setup()` takes its `else`
+  branch into `nf_flow_table_indr_offload_cmd()`, which calls
+  `flow_indr_dev_setup_offload(dev, NULL, TC_SETUP_FT, ...)`.
+- **MediaTek registers no indirect flow block.** `flow_indr_dev_register` does
+  not appear in any file under `drivers/net/ethernet/mediatek/` -
+  `mtk_eth_soc.c`, `mtk_ppe_offload.c`, `mtk_wed.c`, `mtk_ppe.c` and
+  `mtk_eth_path.c` all checked. So the indirect dispatch has no MediaTek
+  callback to reach.
+
+`mtk_eth_setup_tc_block()` is therefore reachable only through
+`ndo_setup_tc` on an mtk netdev, which is what `eth0` and `eth1` have and
+`wwan0` does not. Reaching it another way would not even be safe:
+`mtk_eth_setup_tc_block_cb()` treats `netdev_priv(dev)` as a `struct mtk_mac *`.
+
+So there are three independent barriers, and the dispatch one is decisive: the
+code path does not exist. An empty `/sys/kernel/debug/ppe*/bind` during modem
+traffic is the predicted result, not evidence - which is why the test drafted
+for this could never have discriminated. Running it remains a cheap
+confirmation, but nothing rests on it.
+
 ### 10.2 Hardware offload and the XDP flowtable kfunc are mutually exclusive
 
 This is the part that makes the dropdown a real decision rather than a free
