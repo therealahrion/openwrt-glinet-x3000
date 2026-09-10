@@ -1,0 +1,30 @@
+# Ring the MHI channel doorbell on every queued buffer instead of only when
+# the modem asks for it.
+#
+# Without this the downlink deadlocks under sustained load, in practice
+# somewhere past 200 Mbps: the host fills all 127 RX descriptors, the modem
+# never re-arms the burst-mode doorbell, and rx stops dead for tens of seconds
+# while tx keeps flowing. Captured and analysed in x3000/docs/downlink-stall.md.
+#
+# The parameter comes from
+# target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch
+# and defaults to off, so this line is what enables it on this board.
+#
+# Why here and not /etc/modules.conf, which also works: that file is a ubox
+# conffile, so once a modified copy is on the router sysupgrade preserves it
+# and a later image can no longer change the value. Nothing owns or preserves
+# a file we invent under /etc/modules.d/, so the image always wins and editing
+# this line actually takes effect on the next flash.
+#
+# Why not the kernel command line: mhi is a loadable module here
+# (kmod-mhi-bus) and kmodloader never reads /proc/cmdline, so an
+# "mhi.force_db_brst_disable=1" bootarg is silently ignored.
+#
+# One limitation worth knowing: kmodloader applies /etc/modules.d/ options on
+# the boot path only. A manual "modprobe mhi" after an "rmmod mhi" would not
+# pick this up - pass the option by hand in that case. The usual A/B test does
+# not reload the module, so it is unaffected:
+#   echo 0 > /sys/module/mhi/parameters/force_db_brst_disable
+#   echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/unbind
+#   echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/bind
+mhi force_db_brst_disable=1

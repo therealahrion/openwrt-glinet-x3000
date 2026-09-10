@@ -637,7 +637,8 @@ CPU with no PPE flows bound cannot be settled from the source; it has to be
 measured. `mtk_wed_debugfs.o` is already built (section 13.3), so measuring it is
 cheap once it is on.
 
-Enabling it is one line - `options mt7915e wed_enable=1` in `/etc/modules.conf` -
+Enabling it is one line - `mt7915e wed_enable=1` in a file under
+`/etc/modules.d/` -
 and it changes the wireless RX ring setup, so it is a change to make deliberately
 and measure, not a free switch.
 

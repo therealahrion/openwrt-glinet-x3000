@@ -99,15 +99,18 @@ helpers alongside ModemManager:
    adds an `mhi` module parameter, `force_db_brst_disable`, which
    downgrades those channels to `MHI_DB_BRST_DISABLE` at probe time
    so the doorbell is written on every queued buffer. It defaults to
-   off; `x3000/files-common/etc/modules.conf` turns it on for this
-   board.
+   off; `x3000/files-common/etc/modules.d/mhi-doorbell` turns it on for
+   this board.
 
    It has to be enabled there rather than on the kernel command line.
    `mhi` is a loadable module in this build (`kmod-mhi-bus`) and
    OpenWrt's kmodloader takes module options from `/etc/modules.conf`
    and `/etc/modules.d/` only -- it never reads `/proc/cmdline` -- so
    an `mhi.force_db_brst_disable=1` bootarg would be silently ignored.
-   Full capture and analysis in `x3000/docs/downlink-stall.md`.
+   `/etc/modules.d/` is the one to use: `/etc/modules.conf` is a ubox
+   conffile, so once modified it is preserved across flashes and a later
+   image can no longer change the value. Full capture and analysis in
+   `x3000/docs/downlink-stall.md`.
 
 ## What's different from a stock OpenWrt 25.12 build
 
@@ -119,7 +122,7 @@ Commits on top of upstream `openwrt-25.12`:
     + variant split under `x3000/`)
   * `swap modem stack from umbim+watchdog to ModemManager`
   * `patch curl to disable brotli autodetect`
-  * `mhi: optional doorbell writes, enabled via /etc/modules.conf`
+  * `mhi: optional doorbell writes, enabled via /etc/modules.d/`
 
 Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
@@ -380,8 +383,9 @@ x3000/
                         lines for your private build. Appended to .config
                         after config.private.
 ├── files-common/       Rootfs overlay shipped in every variant. Holds
-                        etc/modules.conf, which enables the MHI
-                        doorbell workaround for this board.
+                        etc/modules.d/mhi-doorbell, which enables the MHI
+                        doorbell workaround, the diagnostic tools under
+                        usr/bin/, and the sysctl and uci-defaults drop-ins.
 ├── files-private/      Rootfs overlay only in private. Per-builder slot:
                         only .gitkeep is tracked, all contents are
                         gitignored, so each builder keeps their internal

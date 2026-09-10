@@ -4,7 +4,8 @@ Status: root-caused and fixed. The modem's MHI data channels run in burst-mode
 doorbell, and under sustained load nothing on this hardware ever rings the bell,
 so the downlink deadlocks holding a full ring of buffers the modem was never
 told about. Patch 993 forces unconditional doorbell writes; it is enabled on
-this board through `/etc/modules.conf` and has held through sustained 250+ Mbps
+this board through `/etc/modules.d/mhi-doorbell` and has held through sustained
+250+ Mbps
 runs that used to stall.
 
 ## Symptom
@@ -409,9 +410,9 @@ evidence is strong but one-directional.
 
 ### How it is enabled
 
-`x3000/files-common/etc/modules.conf` carries
+`x3000/files-common/etc/modules.d/mhi-doorbell` carries
 
-    options mhi force_db_brst_disable=1
+    mhi force_db_brst_disable=1
 
 which kmodloader applies when it loads `mhi`, so the fix is live from boot with
 no unbind/bind cycle. That cycle matters: it destroys and recreates `wwan0`, and
@@ -419,19 +420,29 @@ ModemManager reliably fails to find the modem again afterwards.
 
 Confirmed on the 2026-09-10 clean flash: `force_db_brst_disable` reads `Y` and
 both channels log "forcing doorbell writes" at 14 s, with nothing about mhi on
-`/proc/cmdline`. The file's on-disk hash no longer matches ubox's recorded
-conffile checksum, so from here on sysupgrade preserves it and a later image
-will not replace that line without `-n` or an edit on the device.
+`/proc/cmdline`.
 
 It cannot go on the kernel command line. `mhi` is a loadable module here
 (`kmod-mhi-bus`), and OpenWrt's kmodloader takes module options from
 `/etc/modules.conf` and from inline options in `/etc/modules.d/` files - it
 contains no `/proc/cmdline` parsing at all. The kernel accepts an
 `mhi.force_db_brst_disable=1` bootarg silently as an unused module parameter and
-it then never reaches the module. Of the two files, `/etc/modules.conf` is the
-right one because kmodloader applies it in `scan_module_folders()` on every
-invocation, including a manual `modprobe` after an `rmmod`, whereas
-`/etc/modules.d/` options are only read on the boot-loader path.
+it then never reaches the module.
+
+Of the two files this originally used `/etc/modules.conf`, because kmodloader
+applies that one in `scan_module_folders()` on every invocation, including a
+manual `modprobe` after an `rmmod`, whereas `/etc/modules.d/` options are read
+only on the boot-loader path. It moved on 2026-09-10 for a reason that matters
+more in practice: `/etc/modules.conf` is a ubox conffile, and once a modified
+copy is on the router sysupgrade preserves it, so a later image can no longer
+change the value without `-n` or an edit on the device. That was confirmed on
+the clean flash - the on-disk hash stopped matching ubox's recorded checksum.
+Nothing owns or preserves a file invented under `/etc/modules.d/`: it is a
+conffile of no package, and `keep.d/base-files-essential` lists only
+`/etc/hosts`, `/etc/passwd`, `/etc/sysctl.conf` and similar. So the image always
+wins there and editing the value actually takes effect on the next flash. The
+cost is the `modprobe`-after-`rmmod` case, which the usual A/B procedure does
+not hit because it rebinds the PCI driver rather than reloading the module.
 
 To A/B test at runtime:
 
