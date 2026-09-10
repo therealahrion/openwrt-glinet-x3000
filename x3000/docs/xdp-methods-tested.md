@@ -1234,10 +1234,10 @@ applies the NAT rewrite, and builds an Ethernet header itself from
 then redirects.
 
 Skips: the bridge `rx_handler`, `ip_rcv` and routing, the software flowtable's
-own `nf_ingress` hook, and the neighbour lookup. Does not skip: the `sk_buff`
-(already allocated) or the egress qdisc - `xdp_do_generic_redirect()` ends in
-`dev_map_generic_redirect()` and then `dev_queue_xmit()`. This is the download
-direction, which is also the high-PPS direction.
+own `nf_ingress` hook, and the neighbour lookup. Does not skip the `sk_buff` -
+it is already allocated by then. It *does* skip the egress qdisc, which is not
+a bonus; see section 17.2. This is the download direction, which is also the
+high-PPS direction.
 
 **Shape B - eth1 ingress to wwan0, with a program-owned flow map.**
 Genuinely pre-allocation, but it cannot use the kernel flowtable (16.2), so it
@@ -1274,3 +1274,159 @@ Two numbers, and they settle whether A and B are worth building without building
 either one. Note the 16.1 caveat: `eth->prog` is per-`mtk_eth`, not per-netdev,
 so the program covers `eth0` and `eth1` together, and attaching it bounces both
 links once.
+
+## 17. The same question for the modem and for wireless LAN
+
+Section 16 answered it for the wired ports. The other two attach points are
+worse, each for a different reason, and one of the reasons applies to the wired
+ports too and is the most important finding in this file.
+
+### 17.1 Wireless LAN has no native XDP at all, and attaching generic XDP costs GRO
+
+`mt76` uses a page pool for RX buffers, which makes it look like an XDP driver
+from a distance. It is not one. There is no `xdp_rxq_info`, no `xdp_buff`, no
+`bpf_prog_run_xdp` and no `ndo_bpf` anywhere in `mt76_dma.c` or `mt76.h` -
+`grep -c xdp` returns 0 for both. Neither `mac80211` nor `br_device.c`
+implements `ndo_bpf` either, so `br-lan` and every AP netdev are
+generic-XDP-only.
+
+Where the skb actually gets built on the wireless path:
+
+    mt76_dma.c:1045       skb = napi_build_skb(data, q->buf_size);
+      -> ieee80211_rx_napi()                        mac80211 rx.c:5510
+        -> ieee80211_rx_list()   decrypt, defrag, A-MSDU split, 802.11->802.3
+          -> ieee80211_deliver_skb()                mac80211 rx.c:2662
+            -> napi_gro_receive()                   mac80211 rx.c:5533
+              -> __netif_receive_skb_core()  <- generic XDP hook is here
+
+The allocation happens in the driver's NAPI poll, before mac80211 has even
+looked at the frame. A generic XDP program on an AP netdev sits at the very end
+of that chain - later than the equivalent point on `wwan0`, and about as far
+from "before allocation" as it is possible to get.
+
+And it is not free to attach. `generic_xdp_install()` does
+`rcu_assign_pointer(dev->xdp_prog, new)` and `dev_disable_lro(dev)`
+(`dev.c:5944-5960`), and `netif_elide_gro()` is:
+
+    netdevice.h:2423   if (!(dev->features & NETIF_F_GRO) || dev->xdp_prog)
+                               return true;
+
+which `dev_gro_receive()` tests on every packet (`gro.c:488`, `goto normal`).
+So attaching any generic XDP program to `phy0-ap0` or `phy1-ap0` **turns GRO off
+for that interface**. This is the same trap 992 was written to avoid on the
+modem - it is exactly why 992 keeps the program on `link->xdp_prog` instead of
+`dev->xdp_prog` - and on a wifi netdev there is no equivalent dodge available,
+because there is no driver hook to own the pointer.
+
+Net: on wireless you pay a certain, measurable loss (GRO and LRO) to buy a hook
+that runs after every expensive thing has already happened. There is no version
+of this that pays.
+
+### 17.2 Every generic-XDP redirect bypasses the qdisc, and tc ingress
+
+This is the finding that matters most, and it applies to `wwan0` and to the
+wired ports equally.
+
+Both redirect paths converge:
+
+    filter.c:4655            generic_xdp_tx(skb, xdp_prog);   /* bpf_redirect() */
+    devmap.c                 generic_xdp_tx(skb, xdp_prog);   /* bpf_redirect_map() */
+
+and `generic_xdp_tx()` is (`dev.c:5237-5257`):
+
+    txq = netdev_core_pick_tx(dev, skb, NULL);
+    HARD_TX_LOCK(dev, txq, cpu);
+    rc = netdev_start_xmit(skb, dev, txq, 0);
+
+`netdev_start_xmit()` directly, under the hard TX lock. No `dev_queue_xmit()`,
+no qdisc. The kernel says so itself, at `dev.c:5231`:
+
+    /* When doing generic XDP we have to bypass the qdisc layer and the
+     * network taps in order to match in-driver-XDP behavior. This also means
+     * that XDP packets are able to starve other packets going through a
+     * qdisc, and DDOS attacks will be more effective. ...
+
+There is no devmap escape hatch - `dev_map_generic_redirect()` ends in the same
+call.
+
+The ingress side is the same story. In `__netif_receive_skb_core()` the generic
+XDP hook is at `dev.c:5612`, and `sch_handle_ingress()` - which is where an SQM
+ingress redirect to an IFB lives - is at `dev.c:5655`, **43 lines later**. A
+redirect from XDP never reaches it. For 992 the gap is bigger still, since that
+hook is inside `mhi_mbim_rx()` and runs before the packet is handed to the stack
+at all.
+
+So on this box the fast path and the AQM are mutually exclusive, on exactly the
+link that needs the AQM. Any flow taking an XDP redirect on `wwan0` leaves both
+the ingress shaper and the egress qdisc behind. For a build that carries
+`qos-latency-research.md` as half its reason to exist, that is not a footnote -
+it means shape A cannot be "always on". At best it is a per-flow decision: a
+program that fastpaths only traffic that is explicitly exempt from shaping, and
+returns `XDP_PASS` for everything else so it goes the normal way.
+
+One exception worth recording: a *wireless* egress target is unaffected, because
+mac80211's AQM is not a qdisc. `fq_codel` and AQL live inside
+`ieee80211_subif_start_xmit()`, below `netdev_start_xmit()`, so they still apply
+to a packet delivered via `generic_xdp_tx()`. OpenWrt leaves AP netdevs on
+`noqueue` for the same reason. Only wired egress loses its queue discipline.
+
+### 17.3 WED is the real wireless lever, and half of it is unreachable here
+
+WED is not XDP and does not compete with it - it is a separate hardware block,
+and it is the only thing on this SoC that removes wireless work from the CPU in
+bulk. What it offers splits cleanly in two:
+
+**The half that works regardless of anything else.** `mt76_wed_dma_setup()`
+hands the WLAN TX ring, the TXFREE ring and the RX ring to WED hardware
+(`MT76_WED_Q_TX`, `MT76_WED_Q_TXFREE`, `MT76_WED_Q_RX`). Token accounting and
+completion recycling move off the CPU. `mtk_wed_get_rx_capa()` is
+`dev->version != 1` for anything below v3, and MT7981 is v2, so the RX half is
+available. None of this depends on PPE, so it applies to modem-to-wifi traffic
+like anything else.
+
+**The half that is unreachable.** The headline WED win is WDMA forwarding: PPE
+binds a flow whose egress resolves to a WDMA PSE port and the packet goes
+ETH -> PPE -> WDMA -> WED -> WLAN without the CPU touching it.
+`mtk_flow_set_output_device()` shows a wifi netdev does resolve that way
+(`mtk_ppe_offload.c:198-218`, `PSE_WDMA0/1/2_PORT`), so wireless is a legal PPE
+*egress*. But a PPE entry needs both ends, and section 10.1 established that
+`wwan0` can never be a PPE ingress - no `ndo_setup_tc`, no
+`flow_indr_dev_register` on the MediaTek side, and `-EOPNOTSUPP` from the egress
+port resolver. Every internet flow on this box crosses `wwan0`. So WDMA
+forwarding can never fire for real traffic here; it would only ever cover
+wired-WAN-to-wifi, on a port this box does not use as its WAN.
+
+Enabling it is cheap - `wed_enable` is a module parameter on `mt7915e`
+(`mt7915_mmio.c:16-18`, mode 0644, gate at line 640), so it goes in
+`/etc/modules.d/` the same way 993's doorbell parameter does, and the AXI/SoC
+branch of `mt7915_mmio_wed_init()` is fully populated for the built-in WMAC.
+
+But not on the pinned mt76, and this is why #111 blocks #99. The pin has:
+
+    wed.c:36   struct mt76_queue *q = &dev->q_rx[MT_RXQ_MAIN];
+
+hardcoded, while the newer mt76 has:
+
+    wed.c:41   if (wed->version == 2 && dev->phy.band_idx)
+                       q = &dev->q_rx[MT_RXQ_BAND1];
+               else
+                       q = &dev->q_rx[MT_RXQ_MAIN];
+
+MT7981 is WED v2 *and* DBDC, so on the pinned tree `mt76_wed_init_rx_buf()`
+would build the WED RX buffer ring against band 0's queue while serving band 1 -
+the 5 GHz band, which is the one actually in use here. That is a correctness
+bug, not a tuning difference. `mt7915_mmio_wed_init()` itself is identical
+between the two trees; the fix is entirely in `wed.c`.
+
+### 17.4 Summary across all four attach points
+
+| Attach point | Native XDP | Runs pre-skb | Flow lookup | Cost to attach | Verdict |
+|---|---|---|---|---|---|
+| `eth0`/`eth1` | yes | yes | no - dummy dev | link bounce, both ports | measure first (#114) |
+| `wwan0` | yes (992) | no - MBIM copy | yes | none | shape A, but see 17.2 |
+| AP netdevs | no | no | n/a | **GRO and LRO off** | not worth it |
+| `br-lan` | no | no | n/a | GRO and LRO off | not worth it |
+
+For wireless the answer is WED, not XDP - and WED needs #111 first, and even
+then delivers only its DMA and token half, because its forwarding half cannot
+reach a flow that crosses the modem.
