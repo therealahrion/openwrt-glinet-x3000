@@ -904,17 +904,60 @@ would not saturate until something like 80 kpps, near 1 Gbps. Even the 41,194
 pkt/s peak from the stall captures would leave CPU0 around half idle. **This
 router is not CPU-bound and will not be on this WAN.**
 
-Keep the default steering on, but for the right reason: not throughput, but CPU0
-headroom. All four MHI vectors land on CPU0 and cannot be moved
-(`MSI_FLAG_NO_AFFINITY`), so shifting a third of the per-packet softirq off it is
-cheap insurance against jitter under burst. `steering_flows` stays unset - RFS
-steers toward the CPU running the application, which is meaningless on a box
-that forwards rather than terminates.
+An earlier revision of this section said to keep the default steering on "for
+CPU0 headroom against jitter". That was an unmeasured claim and it is withdrawn
+- see 14.4.
 
 This is the measurement section 15 asked for, and it answers it in the
 negative: **#101 and #102 stay parked.** They reduce per-packet CPU cost on a
 machine with three quarters of CPU0 idle at full modem rate. There is no
 bottleneck there to attack, and no amount of driver work creates one.
+
+
+### 14.4 The latency question is not resolvable on this hardware
+
+Throughput could not distinguish the steering settings, because the box is not
+CPU-bound. The obvious follow-up was latency under load, comparing
+`packet_steering` 0, 1 and 2 with `fping` during a sustained transfer. That test
+was run on 2026-09-10 and produced nothing usable, for two separate reasons
+worth recording so nobody repeats it.
+
+**The probe target was wrong.** `fping -c 285 -p 200` is five echoes a second,
+and six legs is about 1,700 ICMP packets to 1.1.1.1 in six minutes. Cloudflare
+rate-limits ICMP hard. Loss went 17, 82, 72, 83, 84, 98 percent across the legs -
+and legs 1 and 4 were the *same* setting, `packet_steering=0`, at 17 and 83
+percent. The variable was elapsed time, not the treatment. The reported
+`min/avg/max` are then statistics over whichever packets survived a throttle,
+which is not a latency distribution.
+
+The link itself was fine throughout: `dlwatch` recorded a mean of 23,097 pkt/s
+across all 350 samples of the run, higher than any leg of the 14.3 test. Nothing
+was lost on the WAN.
+
+**And the effect is below the noise floor anyway.** At 25 percent CPU
+utilisation, the queueing delay attributable to CPU scheduling is on the order of
+microseconds. Cellular round trips run 25 to 200 ms with tens of milliseconds of
+variance. The signal is three to four orders of magnitude smaller than the
+measurement path's noise. No ping-based test through this modem can resolve it,
+whatever the target or interval - so a better-designed version of this test would
+not have helped either.
+
+**Conclusion.** Packet steering makes no difference this hardware can
+demonstrate, in throughput or in latency. Leave it at OpenWrt's default because
+that is the default and costs nothing observable, not because a benefit has been
+shown.
+
+That also disposes of the two settings not tested. `steering_flows` (RFS) is
+provably not in this path: `get_rps_cpu()` consults
+`net_hotdata.rps_sock_flow_table`, which `rps_record_sock_flow()` fills from
+socket receive paths only. Forwarded traffic has no local socket, so the identity
+check at `dev.c:4771` fails and it falls through to plain RPS. RFS can only
+affect flows terminating on the router itself. `packet_steering=2` differs from 1
+only in CPU distribution - on two cores it puts CPU0 back in the mask, so roughly
+half the flows would be steered onto the core already taking every MHI vector and
+the ethernet NAPI, and would still pay the backlog cost, since `get_rps_cpu()`
+does not compare its result against the current CPU. Predicted neutral to worse,
+and equally unresolvable here.
 
 ---
 
