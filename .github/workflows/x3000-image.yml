@@ -128,11 +128,6 @@ jobs:
           # Guard against the old dormant-zram script coming back: it and
           # 92-zram-swap would fight, and disable would win by running later.
           test ! -e x3000/files-common/etc/uci-defaults/99-zram-disabled
-          # /etc/config/x3000 holds the applied-once markers and belongs to no
-          # package, so sysupgrade only carries it if it is listed. Without
-          # that, 93 and 95 re-apply over settings changed in LuCI.
-          grep -qx '/etc/config/x3000' x3000/files-common/etc/sysupgrade.conf
-          grep -qx '/etc/config/wireless' x3000/files-common/etc/sysupgrade.conf
           # The composed overlay has to actually carry the new trees --
           # prepare.sh rebuilds files/ from scratch on every run.
           test -f files/lib/x3000/defaults.sh
