@@ -44,10 +44,17 @@ uci set network.wwan.init_apn='fast.t-mobile.com'
 uci set network.wwan.init_iptype='ipv4v6'
 
 # Fill device in now if the modem happens to already be enumerated.
+#
+# The `-d` test alone is not enough of a check: if the sysfs layout ever
+# differs, ../../.. can walk up to /sys or /sys/devices, which are directories
+# and would be written as a bogus device path that fails silently at ifup.
+# Require something at least two levels under /sys/devices/.
 for c in /sys/class/wwan/*mbim*; do
 	[ -e "$c" ] || continue
 	d="$(readlink -f "$c/device/../../.." 2>/dev/null)"
-	[ -n "$d" ] && [ -d "$d" ] && uci set network.wwan.device="$d"
+	case "$d" in
+		/sys/devices/?*/?*) [ -d "$d" ] && uci set network.wwan.device="$d" ;;
+	esac
 	break
 done
 

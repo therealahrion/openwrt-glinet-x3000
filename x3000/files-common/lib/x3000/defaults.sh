@@ -2,22 +2,27 @@
 #
 # uci-defaults scripts are deleted by /etc/init.d/boot once they run
 # (`rm -f $applied` at the end of uci_apply_defaults), so a normal reboot does
-# not run them again. Whether they run again after a sysupgrade depends on how
-# much of the overlay that particular upgrade carried across, which is not
-# worth relying on either way. Every script here is therefore written so that
-# running twice is harmless and never overwrites a choice made in LuCI.
+# not run them again. A sysupgrade does: SAVE_OVERLAY defaults to 0 in
+# /sbin/sysupgrade (-c and -o are opt-in), so the rootfs is replaced and these
+# scripts come back from the new squashfs and run a second time against a
+# restored /etc/config. Every script here is therefore written so that running
+# twice is harmless and never overwrites a choice made in LuCI.
 #
 # For a setting whose packaged state is "absent", `uci -q get` coming back
-# empty is guard enough - that is how 94-packet-steering and 96-flow-offload
-# work. For a setting whose packaged state is a real value there is no way to
-# tell "package default" from "user picked this", so those record a flag here
-# instead and apply exactly once per factory state. Two cases need it:
-# irqbalance ships enabled='0', and the wireless sections ship with a real
-# SSID and channel already filled in.
+# empty is guard enough - that is how 90, 91, 94 and 96-flow-offload work. For
+# a setting whose packaged state is a real value there is no way to tell
+# "package default" from "user picked this", so those record a flag here and
+# apply exactly once per factory state. Two cases need it: irqbalance ships
+# enabled='0', and the wireless sections ship with a real SSID, channel and
+# htmode already filled in.
 #
-# /etc/config/x3000 belongs to no package, so it is not a conffile and would
-# not be backed up on its own; x3000/files-common/etc/sysupgrade.conf lists it
-# for that reason.
+# On /etc/config/x3000 surviving a sysupgrade: base-files declares /etc/config/
+# as a conffile, and include/package-pack.mk writes any declared conffile that
+# is not shipped as a real file into /lib/upgrade/keep.d/<pkg>. sysupgrade's
+# list_static_conffiles() then finds every file under it, so the whole of
+# /etc/config is preserved and this file rides along with it. Nothing extra is
+# needed in /etc/sysupgrade.conf. Confirm on the box with:
+#     cat /lib/upgrade/keep.d/base-files
 
 x3000_defaults_init() {
 	[ -f /etc/config/x3000 ] || : > /etc/config/x3000

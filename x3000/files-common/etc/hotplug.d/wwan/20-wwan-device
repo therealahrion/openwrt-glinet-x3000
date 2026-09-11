@@ -22,7 +22,13 @@ esac
 # Same expression that works by hand, just anchored on the device this event
 # is about: /sys$DEVPATH is the resolved form of /sys/class/wwan/<name>.
 newdev="$(readlink -f "/sys$DEVPATH/device/../../.." 2>/dev/null)"
-[ -n "$newdev" ] && [ -d "$newdev" ] || return 0
+# A `-d` test alone would accept /sys or /sys/devices if the sysfs layout ever
+# differs, and that bogus path would be written and then fail silently at
+# ifup. Require something at least two levels under /sys/devices/.
+case "$newdev" in
+	/sys/devices/?*/?*) [ -d "$newdev" ] || return 0 ;;
+	*) logger -t x3000-wwan "refusing implausible device path '$newdev'"; return 0 ;;
+esac
 
 # Only act on an interface that is actually configured for modemmanager.
 [ "$(uci -q get network.wwan.proto)" = "modemmanager" ] || return 0
