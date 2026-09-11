@@ -1,0 +1,65 @@
+#!/bin/sh
+# Create the `wwan` interface for the RM520N modem, once, on first boot.
+#
+# Everything the proto needs is static except one value. `device` is the
+# modem's sysfs path, and /lib/netifd/proto/modemmanager.sh refuses to bring
+# the interface up without it:
+#
+#     # validate sysfs path given in config
+#     [ -n "${device}" ] || {
+#             echo "No device specified"
+#             proto_notify_error "${interface}" NO_DEVICE
+#
+# but this script runs from /etc/init.d/boot (START=10) immediately after
+# kmodloader, and the modem needs several more seconds of MHI bring-up before
+# /sys/class/wwan/wwan0mbim0 exists. So the path is filled in by
+# /etc/hotplug.d/wwan/20-wwan-device when the device actually shows up. The
+# attempt below covers the case where it is already there, which happens on a
+# warm reboot with the modem still powered.
+#
+# On "Authentication Type: none": there is no `auth` option. LuCI's field is
+# `allowedauth`, a list whose None entry writes an empty value, and the proto
+# derives its auth argument from that list. Leaving it unset IS none, so it is
+# deliberately absent here rather than set to a string the proto would not
+# recognise. Same for init_allowedauth.
+#
+# Heads up if you ever add a username: the proto reads `init_user` into a shell
+# variable but then uses `${init_username:+...}` when building the connect
+# arguments, so the Initial EPS Bearer username is broken upstream. Irrelevant
+# with auth none.
+#
+# Leaves an existing wwan section completely alone.
+[ -n "$(uci -q get network.wwan)" ] && exit 0
+
+uci set network.wwan=interface
+uci set network.wwan.proto='modemmanager'
+uci set network.wwan.apn='fast.t-mobile.com'
+uci set network.wwan.iptype='ipv4v6'
+uci set network.wwan.metric='40'
+
+# Initial EPS bearer, "custom" so the init_* values below are used rather than
+# the connect-time ones.
+uci set network.wwan.init_epsbearer='custom'
+uci set network.wwan.init_apn='fast.t-mobile.com'
+uci set network.wwan.init_iptype='ipv4v6'
+
+# Fill device in now if the modem happens to already be enumerated.
+for c in /sys/class/wwan/*mbim*; do
+	[ -e "$c" ] || continue
+	d="$(readlink -f "$c/device/../../.." 2>/dev/null)"
+	[ -n "$d" ] && [ -d "$d" ] && uci set network.wwan.device="$d"
+	break
+done
+
+uci commit network
+
+# Put wwan in the wan firewall zone. Found by name rather than by index,
+# because @zone[N] ordering is not guaranteed.
+zone="$(uci -q show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p" | head -n1)"
+if [ -n "$zone" ]; then
+	case " $(uci -q get "firewall.$zone.network") " in
+		*" wwan "*) ;;
+		*) uci add_list "firewall.$zone.network"='wwan'; uci commit firewall ;;
+	esac
+fi
+exit 0

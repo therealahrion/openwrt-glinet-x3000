@@ -1,0 +1,36 @@
+# Fill in network.wwan.device once the modem's MBIM control port appears.
+#
+# The modemmanager proto needs the modem's sysfs path and refuses the
+# interface without it, but that path does not exist until MHI finishes
+# bringing the modem up - well after uci-defaults have run. procd dispatches
+# any subsystem that has a matching directory here (hotplug.json: `isdir
+# /etc/hotplug.d/%SUBSYSTEM%` then `exec /sbin/hotplug-call %SUBSYSTEM%`), so
+# the wwan class lands in this script.
+#
+# Sourced by /sbin/hotplug-call, so no exec bit and no shebang needed.
+#
+# Only writes when the resolved path differs from what is already stored, so
+# the usual boot costs one readlink and nothing else - no flash write, no
+# spurious ifup.
+
+[ "$ACTION" = "add" ] || return 0
+case "$DEVPATH" in
+	*mbim*) ;;
+	*) return 0 ;;
+esac
+
+# Same expression that works by hand, just anchored on the device this event
+# is about: /sys$DEVPATH is the resolved form of /sys/class/wwan/<name>.
+newdev="$(readlink -f "/sys$DEVPATH/device/../../.." 2>/dev/null)"
+[ -n "$newdev" ] && [ -d "$newdev" ] || return 0
+
+# Only act on an interface that is actually configured for modemmanager.
+[ "$(uci -q get network.wwan.proto)" = "modemmanager" ] || return 0
+
+olddev="$(uci -q get network.wwan.device)"
+[ "$olddev" = "$newdev" ] && return 0
+
+logger -t x3000-wwan "setting network.wwan.device=$newdev (was '${olddev:-unset}')"
+uci set network.wwan.device="$newdev"
+uci commit network
+ifup wwan

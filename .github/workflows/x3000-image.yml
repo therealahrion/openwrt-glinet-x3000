@@ -84,15 +84,17 @@ jobs:
 
       # Fail fast (before ~4h of compiling) if the composition is wrong:
       # vjt's stock modem stack must be in, the lean overlay must be in,
-      # and the excluded stacks (QModem, qosify/sqm, tc-tiny) out. zram is
-      # shipped but dormant, so it is asserted PRESENT and asserted disabled.
+      # and the excluded stacks (QModem, qosify/sqm, tc-tiny) out. Anything
+      # that needs both a package and a first-boot default to do its job gets
+      # both halves gated, because a missing overlay file fails silently.
       - name: Sanity-check composed .config
         run: |
           set -e
           for s in modemmanager kmod-mhi-pci-generic luci-proto-modemmanager quectel-5g-tools \
                    kmod-tcp-bbr kmod-sched-cake kmod-sched-bpf kmod-ifb tc-bpf libbpf \
                    bpftool-full xdp-loader xdpdump fping kmod-wireguard luci-proto-wireguard \
-                   kmod-zram zram-swap; do
+                   kmod-zram zram-swap irqbalance luci-app-irqbalance \
+                   fantastic-keyring fantastic-packages-feeds; do
             grep -q "^CONFIG_PACKAGE_$s=y" .config || { echo "missing: $s" >&2; exit 1; }
           done
           for s in qmodem kmod-pcie_mhi qosify sqm-scripts luci-app-sqm tc-tiny ply; do
@@ -100,10 +102,41 @@ jobs:
           done
           grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-x3000=y' .config
-          # zram ships dormant: the package is in, the service is disabled on
-          # first boot. If that uci-default ever goes missing, zram would come
-          # up live on a 512 MB box -- so gate on it.
-          test -f x3000/files-common/etc/uci-defaults/99-zram-disabled
+          # zram: the CONFIG_KERNEL_ZRAM_BACKEND_* symbols are the real lever.
+          # They are what pull kmod-lib-lzo/lz4/zstd in AND what lets zram use
+          # them; selecting the kmod-lib-* packages alone would build modules
+          # zram cannot reach. LZO needs stating explicitly because enabling
+          # LZ4 or ZSTD cancels kmod-zram's FORCE_LZO auto-select.
+          for k in ZRAM_BACKEND_LZO ZRAM_BACKEND_LZ4 ZRAM_BACKEND_ZSTD \
+                   ZRAM_DEF_COMP_LZORLE; do
+            grep -q "^CONFIG_KERNEL_$k=y" .config \
+              || { echo "missing kernel symbol: $k" >&2; exit 1; }
+          done
+          # Every one of these is inert without its first-boot default: the
+          # wwan interface does not exist, zram needs enabling, irqbalance
+          # ships enabled='0', packet steering has no value on a fresh flash,
+          # and the wireless sections ship with OpenWrt's own SSID.
+          for u in 90-wwan-interface 91-gateway-metrics 92-zram-swap \
+                   93-irqbalance 94-packet-steering 95-wireless; do
+            test -f "x3000/files-common/etc/uci-defaults/$u" \
+              || { echo "missing uci-default: $u" >&2; exit 1; }
+          done
+          # The marker helper that 92/93/95 source, and the hotplug script
+          # that fills in network.wwan.device once the modem enumerates.
+          test -f x3000/files-common/lib/x3000/defaults.sh
+          test -f x3000/files-common/etc/hotplug.d/wwan/20-wwan-device
+          # Guard against the old dormant-zram script coming back: it and
+          # 92-zram-swap would fight, and disable would win by running later.
+          test ! -e x3000/files-common/etc/uci-defaults/99-zram-disabled
+          # /etc/config/x3000 holds the applied-once markers and belongs to no
+          # package, so sysupgrade only carries it if it is listed. Without
+          # that, 93 and 95 re-apply over settings changed in LuCI.
+          grep -qx '/etc/config/x3000' x3000/files-common/etc/sysupgrade.conf
+          grep -qx '/etc/config/wireless' x3000/files-common/etc/sysupgrade.conf
+          # The composed overlay has to actually carry the new trees --
+          # prepare.sh rebuilds files/ from scratch on every run.
+          test -f files/lib/x3000/defaults.sh
+          test -f files/etc/hotplug.d/wwan/20-wwan-device
           # The diagnostic tools are run by name, so they have to ship +x. A
           # Windows checkout runs git with core.filemode=false and loses the
           # bit; prepare.sh restores it when composing files/. Gate on the

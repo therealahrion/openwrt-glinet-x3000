@@ -1,0 +1,19 @@
+#!/bin/sh
+# Route priority between the wired WAN and the modem. Lower metric wins, so
+# wired WAN (10) is preferred and the modem (40) is the fallback.
+#
+# wwan's own metric is set by 90-wwan-interface when it creates the section;
+# this script only covers it for an install where wwan already existed.
+#
+# Each one is set only when that interface has no metric yet, so a value
+# changed in LuCI > Interfaces > Advanced Settings survives. Interfaces that
+# do not exist on this board are skipped rather than created.
+for pair in "wan 10" "wan6 10" "wwan 40"; do
+	set -- $pair
+	iface="$1"; metric="$2"
+	[ -n "$(uci -q get "network.$iface")" ] || continue
+	[ -z "$(uci -q get "network.$iface.metric")" ] || continue
+	uci set "network.$iface.metric=$metric"
+done
+uci commit network
+exit 0

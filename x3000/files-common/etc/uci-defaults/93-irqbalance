@@ -6,19 +6,19 @@
 # installing irqbalance on its own does nothing whatsoever. This is the line
 # that actually makes it run.
 #
-# /etc/config/irqbalance is a package conffile, so a flash that starts from
-# the packaged copy is back to enabled=0 - the same trap that lost
-# flow_offloading on the 2026-09-10 flash.
+# Marker-guarded rather than "only if unset", because the packaged value is a
+# real 0: there is no way to tell "package default" from "user turned it off",
+# and a plain set would re-enable it every time these defaults run. Applying
+# once per factory state is the behaviour we want. See /lib/x3000/defaults.sh.
 #
-# Unlike 94-packet-steering this re-asserts on every flash rather than only
-# when unset, because the packaged value is a real 0 and not an absent
-# option: there is no way to tell "user chose off" from "package default".
-# If you want it off for good, remove CONFIG_PACKAGE_irqbalance from
+# To have it off permanently, drop CONFIG_PACKAGE_irqbalance from
 # x3000/config.common rather than fighting this script.
-[ -f /etc/config/irqbalance ] || exit 0
+. /lib/x3000/defaults.sh
 
-if [ "$(uci -q get irqbalance.irqbalance.enabled)" != "1" ]; then
-	uci set irqbalance.irqbalance.enabled='1'
-	uci commit irqbalance
-fi
+[ -f /etc/config/irqbalance ] || exit 0
+x3000_applied irqbalance && exit 0
+
+uci set irqbalance.irqbalance.enabled='1'
+uci commit irqbalance
+x3000_mark irqbalance
 exit 0

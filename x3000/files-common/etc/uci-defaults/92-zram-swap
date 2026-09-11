@@ -2,12 +2,12 @@
 # Turn zram swap on. Replaces the earlier 99-zram-disabled, which shipped the
 # package present but dormant.
 #
-# Asserted here rather than left to the package's install state. The build
-# does create /etc/rc.d/S15zram on its own - default_postinst runs
-# `rc.common <init> enable` whenever IPKG_INSTROOT is set, which is the case
-# for anything baked into an image - but a sysupgrade carrying an overlay
-# where the service was previously disabled would keep it off. One explicit
-# enable makes both paths end up the same.
+# The build already creates /etc/rc.d/S15zram on its own - default_postinst
+# runs `rc.common <init> enable` whenever IPKG_INSTROOT is set, which is the
+# case for anything baked into an image - so this enable is belt and braces
+# for an install whose overlay carried a previous `disable`. It is marker-
+# guarded so that a deliberate `/etc/init.d/zram disable` is not undone the
+# next time these defaults run. See /lib/x3000/defaults.sh.
 #
 # uci-defaults run from /etc/init.d/boot (START=10) -> uci_apply_defaults,
 # ahead of S15zram, so the service comes up normally later in this same boot.
@@ -24,14 +24,18 @@
 # Size is deliberately left alone. With system.@system[0].zram_size_mb unset
 # the init uses MemTotal/2048, about 235 MiB on this 512 MB board. zram
 # allocates physical pages lazily, so that is a ceiling, not a reservation.
+. /lib/x3000/defaults.sh
+
 [ -x /etc/init.d/zram ] || exit 0
 
-if uci -q get system.@system[0] >/dev/null 2>&1; then
-	if [ -z "$(uci -q get system.@system[0].zram_comp_algo)" ]; then
-		uci set system.@system[0].zram_comp_algo='lzo-rle'
-		uci commit system
-	fi
+if [ -n "$(uci -q get system.@system[0])" ] && \
+   [ -z "$(uci -q get system.@system[0].zram_comp_algo)" ]; then
+	uci set system.@system[0].zram_comp_algo='lzo-rle'
+	uci commit system
 fi
 
-/etc/init.d/zram enable
+if ! x3000_applied zram_enable; then
+	/etc/init.d/zram enable
+	x3000_mark zram_enable
+fi
 exit 0

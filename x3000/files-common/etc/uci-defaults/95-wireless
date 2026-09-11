@@ -1,0 +1,96 @@
+#!/bin/sh
+# Wireless defaults for both radios, applied once.
+#
+# Timing. /etc/init.d/boot calls `/sbin/wifi config` before kmodloader, so on
+# a build where mt76 is a module the phys are not visible yet and no radio
+# sections get created at that point; kmodloader then loads mt76 and the
+# ieee80211 hotplug creates them a moment later, asynchronously. uci-defaults
+# run immediately after kmodloader, which can be ahead of that hotplug, so
+# this waits for the sections rather than assuming they are there. It
+# deliberately does NOT call `wifi config` itself - that would race the
+# hotplug's own call and can duplicate sections.
+#
+# If the radios never turn up, the script exits non-zero. /etc/init.d/boot
+# only deletes uci-defaults that succeeded, so it simply retries on the next
+# boot instead of marking itself done and silently never applying.
+#
+# Radios are matched on their `band` value, not on radio0/radio1 or phy index.
+# Same result on this board (phy0 is 2.4 GHz, phy1 is 5 GHz) but it cannot
+# silently do the wrong thing if that ever swaps.
+#
+# Marker-guarded rather than "only if unset": these options ship with real
+# values from the generator (SSID "OpenWrt", a channel, a computed htmode), so
+# an unset test would never fire and a plain set would stomp LuCI edits every
+# time these defaults run. See /lib/x3000/defaults.sh.
+#
+# Two things deliberately left alone: `encryption` and `key`. Rewriting those
+# from a defaults script is how you lock yourself out of your own wifi.
+#
+# About the values. HE is what LuCI calls "Mode: AX". HE160 needs DFS channels
+# in the US, so with channel=auto the driver may settle on 80 MHz depending on
+# radar state and what mt76 allows - check `iw phy1 info` rather than assuming
+# you got 160. txpower is a ceiling, not a request: the driver still clamps to
+# whatever the US regulatory domain permits on the chosen channel.
+. /lib/x3000/defaults.sh
+
+x3000_applied wireless && exit 0
+
+radio_for_band() {
+	local s
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		if [ "$(uci -q get "wireless.$s.band")" = "$1" ]; then echo "$s"; return 0; fi
+	done
+	return 1
+}
+
+iface_for_radio() {
+	local s
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		if [ "$(uci -q get "wireless.$s.device")" = "$1" ]; then echo "$s"; return 0; fi
+	done
+	return 1
+}
+
+# Wait for the ieee80211 hotplug to register both radios.
+i=0
+while [ "$i" -lt 20 ]; do
+	radio_for_band 2g >/dev/null 2>&1 && radio_for_band 5g >/dev/null 2>&1 && break
+	sleep 1
+	i=$((i + 1))
+done
+
+if ! radio_for_band 2g >/dev/null 2>&1 || ! radio_for_band 5g >/dev/null 2>&1; then
+	logger -t x3000-wireless "radios not registered after ${i}s, will retry next boot"
+	exit 1
+fi
+
+# band  htmode  txpower(dBm)  ssid
+setup_band() {
+	local band="$1" htmode="$2" txpower="$3" ssid="$4"
+	local radio iface
+
+	radio="$(radio_for_band "$band")" || return 1
+
+	uci set "wireless.$radio.channel=auto"
+	uci set "wireless.$radio.htmode=$htmode"
+	uci set "wireless.$radio.country=US"
+	uci set "wireless.$radio.txpower=$txpower"
+	uci -q delete "wireless.$radio.disabled"
+
+	iface="$(iface_for_radio "$radio")" || {
+		logger -t x3000-wireless "no wifi-iface on $radio, left SSID alone"
+		return 0
+	}
+
+	uci set "wireless.$iface.mode=ap"
+	uci set "wireless.$iface.ssid=$ssid"
+	uci set "wireless.$iface.network=lan"
+	uci set "wireless.$iface.disabled=0"
+}
+
+setup_band 2g HE40  27 'GL-X3000-42b-2.4G'
+setup_band 5g HE160 24 'GL-X3000-42b-5G'
+
+uci commit wireless
+x3000_mark wireless
+exit 0
