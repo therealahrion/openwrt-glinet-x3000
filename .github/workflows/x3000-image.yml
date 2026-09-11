@@ -120,8 +120,9 @@ jobs:
           # the inverse - it ships ENABLED with a catch-all rule pointing at a
           # policy that has no member on this board's uplink, so losing
           # 89-mwan3-inert would black-hole new IPv4 connections on a flash.
-          for u in 89-mwan3-inert 90-wwan-interface 91-gateway-metrics \
-                   92-zram-swap 93-irqbalance 94-packet-steering 95-wireless; do
+          for u in 87-timezone 88-ttyd 89-mwan3-inert 90-wwan-interface \
+                   91-gateway-metrics 92-zram-swap 93-irqbalance \
+                   94-packet-steering 95-wireless; do
             test -f "x3000/files-common/etc/uci-defaults/$u" \
               || { echo "missing uci-default: $u" >&2; exit 1; }
           done
