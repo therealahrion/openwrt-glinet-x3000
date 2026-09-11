@@ -1,0 +1,30 @@
+#!/bin/sh
+# ttyd defaults: log straight in as root, and listen on IPv6 as well.
+#
+# Both live in the anonymous `config ttyd` section, so they are addressed as
+# @ttyd[0]. /etc/config/ttyd is a package conffile and ships
+# `option command '/bin/login'` with no ipv6 line at all.
+#
+# `command` is appended unquoted by the init script
+# (procd_append_param command $command), so `/bin/login -f root` splits into
+# separate arguments the way it needs to. -f skips authentication, which is
+# the point: ttyd is bound to @lan only, so anyone who can reach it is already
+# on the trusted side of the firewall and the extra login prompt just gets in
+# the way of pasting diagnostics.
+#
+# ipv6 is read as 'ipv6:bool' and turns into ttyd's -6 flag.
+#
+# Marker-guarded rather than "only if unset", because `command` ships with a
+# real value and there is no way to tell the packaged default from a
+# deliberate choice. Applied once per factory state. See
+# /lib/x3000/defaults.sh.
+. /lib/x3000/defaults.sh
+
+[ -f /etc/config/ttyd ] || exit 0
+x3000_applied ttyd && exit 0
+
+uci set ttyd.@ttyd[0].command='/bin/login -f root'
+uci set ttyd.@ttyd[0].ipv6='1'
+uci commit ttyd
+x3000_mark ttyd
+exit 0

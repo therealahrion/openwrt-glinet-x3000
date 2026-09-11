@@ -13,25 +13,32 @@
 # ahead of S15zram, so the service comes up normally later in this same boot.
 # Nothing needs starting by hand.
 #
-# Compressor: lzo-rle. /etc/init.d/zram falls back to plain "lzo" when
-# system.@system[0].zram_comp_algo is unset, and lzo-rle is the strictly
-# better variant of the same codec - same speed, much better on the
-# zero-filled pages a router swaps out. The lz4 and zstd backends are built
-# in too (see x3000/config.common), so either is one uci set plus a reboot
-# away. zstd roughly doubles the compression ratio at a real CPU and swap-in
-# latency cost on a 1.3 GHz A53.
+# Compressor: lz4. It is faster than zstd at both ends, compresses better
+# than plain lzo, and - unlike lzo-rle - it is one of the three values LuCI's
+# System > System > ZRam Settings dropdown actually offers (lzo, lz4, zstd),
+# so the field reads correctly there instead of looking unset. All four
+# backends are compiled into zram.ko (see x3000/config.common), so switching
+# is a uci set plus a zram restart, not a rebuild.
 #
-# Size is deliberately left alone. With system.@system[0].zram_size_mb unset
-# the init uses MemTotal/2048, about 235 MiB on this 512 MB board. zram
-# allocates physical pages lazily, so that is a ceiling, not a reservation.
+# Size: 256 MiB, half the board's 512 MB. Left unset the init would compute
+# MemTotal/2048, which lands near 239 MiB because MemTotal excludes the
+# kernel's reserved regions. zram allocates physical pages lazily, so this is
+# a ceiling on the compressed store, not a reservation.
+#
+# Both are marker-guarded rather than "only if unset", so changing either in
+# LuCI sticks, and so a later change to these defaults still applies to an
+# install that already ran an earlier version of this script. Note the running
+# zram device keeps its old settings until the next boot or an explicit
+# `/etc/init.d/zram restart`, because the init only reads them at start.
 . /lib/x3000/defaults.sh
 
 [ -x /etc/init.d/zram ] || exit 0
 
-if [ -n "$(uci -q get system.@system[0])" ] && \
-   [ -z "$(uci -q get system.@system[0].zram_comp_algo)" ]; then
-	uci set system.@system[0].zram_comp_algo='lzo-rle'
+if ! x3000_applied zram_tuning && [ -n "$(uci -q get system.@system[0])" ]; then
+	uci set system.@system[0].zram_comp_algo='lz4'
+	uci set system.@system[0].zram_size_mb='256'
 	uci commit system
+	x3000_mark zram_tuning
 fi
 
 if ! x3000_applied zram_enable; then

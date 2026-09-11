@@ -48,10 +48,30 @@
 . /lib/x3000/defaults.sh
 
 [ -x /etc/init.d/mwan3 ] || exit 0
-x3000_applied mwan3_disable && exit 0
 
-# No stop() needed: uci-defaults run from /etc/init.d/boot (START=10), ahead
-# of mwan3's START=19, so it has never started at this point.
-/etc/init.d/mwan3 disable
-x3000_mark mwan3_disable
+# Two separately keyed blocks, so adding the second one later still applies on
+# an install that already ran the first.
+if ! x3000_applied mwan3_disable; then
+	# No stop() needed: uci-defaults run from /etc/init.d/boot (START=10),
+	# ahead of mwan3's START=19, so it has never started at this point.
+	/etc/init.d/mwan3 disable
+	x3000_mark mwan3_disable
+fi
+
+# Belt and braces on top of the disabled service: turn off the one interface
+# the package ships enabled, so the LuCI page reads as inert too.
+#
+# Be clear about what this does and does not buy. It does NOT make enabling
+# the service safe on its own - mwan3_set_user_rules() applies every `config
+# rule` stanza without looking at interface state, so default_rule_v4 would
+# still send 0.0.0.0/0 to policy `balanced`, whose chain is seeded with the
+# `unreachable` last_resort mark. The fix for that is `option last_resort
+# 'default'` on the policies, which falls through to the main routing table
+# instead of black-holing. Left alone here because fail-open vs fail-closed
+# is a real design choice, not a default to impose.
+if ! x3000_applied mwan3_wan_off && [ -f /etc/config/mwan3 ]; then
+	uci set mwan3.wan.enabled='0'
+	uci commit mwan3
+	x3000_mark mwan3_wan_off
+fi
 exit 0
