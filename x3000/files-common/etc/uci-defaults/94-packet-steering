@@ -1,0 +1,40 @@
+#!/bin/sh
+# Packet steering across both CPUs, with RPS flow tracking at 128.
+#
+# These are the two options behind LuCI > Network > Interfaces > Global
+# network options. Values taken straight from luci-mod-network's
+# interfaces.js, not guessed:
+#     packet_steering   0 = Disabled
+#                       1 = Enabled
+#                       2 = Enabled (all CPUs)      <- what we want
+#     steering_flows   '' = Standard: none
+#                     128 = Suggested: 128          <- what we want
+#                     256 = 256
+#
+# How they are consumed: /etc/init.d/packet_steering (START=25) reads
+# network.@globals[0] and runs /usr/libexec/network/packet-steering.uc.
+# There, '2' sets all_cpus, which makes rps_cpus the full CPU mask instead of
+# one chosen core, and steering_flows is passed as `-l N` and written to
+# every rx queue's rps_flow_cnt. mediatek ships no
+# /usr/libexec/platform/packet-steering.sh, so the generic script runs here
+# and the -l flag is honoured. steering_flows only has any effect while
+# packet_steering is 1 or 2.
+#
+# Evidence note, so nobody reads this as a proven win: the 2026-09-10 sweep
+# could not measure an RPS benefit on this box (see
+# x3000/docs/xdp-methods-tested.md 14.3 and 14.4). Softirq never came close
+# to saturating CPU0, and scheduling-level effects are microseconds against
+# tens of milliseconds of cellular variance. This is set because it was
+# asked for, and because it is cheap and reversible from that same dropdown.
+#
+# Only acts when packet_steering has no value yet, so a deliberate choice in
+# LuCI survives - /etc/config/network is carried across a sysupgrade, unlike
+# the conffile-managed files the other scripts here have to re-assert.
+uci -q get network.globals >/dev/null 2>&1 || uci set network.globals=globals
+
+if [ -z "$(uci -q get network.globals.packet_steering)" ]; then
+	uci set network.globals.packet_steering='2'
+	uci set network.globals.steering_flows='128'
+	uci commit network
+fi
+exit 0

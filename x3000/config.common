@@ -180,8 +180,8 @@ CONFIG_FEED_custom=m
 # Scope, and nothing else: kernel/CPU/threading, pacing, eBPF/XDP/BTF
 # platform, qdisc + TCP baseline, WireGuard. The modem stack above
 # (ModemManager + mainline MHI/MBIM, quectel-5g-tools with its
-# 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm. zram is
-# kmod-only (module baked, no zram-swap auto-enable — added 2026-09-07).
+# 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm. zram
+# swap is active as of 2026-09-11 (was kmod-only before that).
 # Companion pieces: target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch
 # (BBRv3), 3 lines appended to target/linux/mediatek/filogic/config-6.12
 # (IKCONFIG, IKCONFIG_PROC, PREEMPT_DYNAMIC — not menu-exposed, so they
@@ -280,17 +280,78 @@ CONFIG_PACKAGE_kmod-wireguard=y
 CONFIG_PACKAGE_wireguard-tools=y
 CONFIG_PACKAGE_luci-proto-wireguard=y
 
-# --- zram compressed-RAM swap (present but DORMANT) -----------------------
-# kmod-zram creates the /dev/zram device + compression kmods (vermagic-
-# locked, must be baked in). zram-swap is the userspace init that WOULD run
-# mkswap + swapon on a zram block device at boot (START=15). Added 2026-09-08
-# per request but shipped DORMANT to keep this image's "capability baked,
-# lever off" posture: files-common/etc/uci-defaults/99-zram-disabled runs
-# `/etc/init.d/zram disable` on first boot, so swap is AVAILABLE but not
-# active. Turn it on later with:
-#     /etc/init.d/zram enable && /etc/init.d/zram start
+# --- zram compressed-RAM swap (ACTIVE) ------------------------------------
+# kmod-zram creates /dev/zram0; zram-swap is the init script (START=15) that
+# runs mkswap + swapon on it. Added dormant 2026-09-08, switched ON
+# 2026-09-11 per request. files-common/etc/uci-defaults/92-zram-swap enables
+# the service and pins the compressor; it replaced 99-zram-disabled.
+#
+# Backends, and why the three symbols below are the real lever. Kernel 6.12
+# dropped zram's use of the crypto API in favour of CONFIG_ZRAM_BACKEND_*,
+# and kmod-zram pulls the matching library module through a conditional dep:
+#     +(KERNEL_ZRAM_BACKEND_LZO||...):kmod-lib-lzo
+#     +(KERNEL_ZRAM_BACKEND_LZ4||...):kmod-lib-lz4
+#     +(KERNEL_ZRAM_BACKEND_ZSTD||...):kmod-lib-zstd
+# So setting these installs kmod-lib-lzo, kmod-lib-lz4 and kmod-lib-zstd
+# along with their own deps (kmod-crypto-acompress, kmod-lib-lz4-decompress,
+# kmod-lib-xxhash). Do NOT hand-set the kmod-lib-* package symbols instead:
+# that builds the modules but leaves CONFIG_ZRAM_BACKEND_* off, so zram
+# cannot actually use them.
+#
+# One trap worth knowing: kmod-zram's KERNEL_ZRAM_BACKEND_FORCE_LZO only
+# auto-selects LZO while LZ4, LZ4HC and ZSTD are all off. Enabling LZ4 or
+# ZSTD drops that auto-select, so LZO has to be stated explicitly here.
+#
+# Default compressor is lzo-rle: the kernel's own default, cheapest on a
+# 1.3 GHz A53, and good on the zero-filled pages a router swaps out. zstd
+# roughly doubles the ratio for real CPU and swap-in latency cost. To switch:
+#     uci set system.@system[0].zram_comp_algo=zstd && uci commit && reboot
 CONFIG_PACKAGE_kmod-zram=y
 CONFIG_PACKAGE_zram-swap=y
+CONFIG_KERNEL_ZRAM_BACKEND_LZO=y
+CONFIG_KERNEL_ZRAM_BACKEND_LZ4=y
+CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y
+CONFIG_KERNEL_ZRAM_DEF_COMP_LZORLE=y
+
+# --- irqbalance ------------------------------------------------------------
+# Spreads hardware IRQ affinity across the two cores. Deps are trivial
+# (iconv/gettext stubs; glib2 is already here for ModemManager and is picked
+# up automatically from the linked libraries), and there are no kernel
+# symbols to add - it only writes /proc/irq/*/smp_affinity.
+#
+# The package alone does nothing: /etc/config/irqbalance ships
+# `option enabled '0'` and the init script returns early unless that is
+# above zero. files-common/etc/uci-defaults/93-irqbalance flips it.
+#
+# Scope note: irqbalance moves hardware IRQ affinity, while packet steering
+# moves NAPI threads (taskset) and rps_cpus. Different knobs on the same two
+# cores, so they can pull against each other. On a dual-core box the blast
+# radius is small, but if steering measurements come out noisy, turn this
+# off first.
+CONFIG_PACKAGE_irqbalance=y
+CONFIG_PACKAGE_luci-app-irqbalance=y
+
+# --- Fantastic Packages runtime feed ---------------------------------------
+# These two exist to make the upstream BINARY repo installable on the box
+# after flashing. Nothing from that catalogue is built into the image.
+#   fantastic-keyring        -> the developer pubkey into /etc/apk/keys/
+#   fantastic-packages-feeds -> appends three repo lines to
+#                               /etc/apk/repositories.d/customfeeds.list
+# Its postinst runs at image build time with IPKG_INSTROOT set, so the
+# flashed image already has the feed configured, and it selects the 25.12
+# branch from the running release itself.
+#
+# "Allow untrusted" is NOT needed and should not be set: the keyring package
+# installs the signing key, so apk verifies signatures normally. Note 25.12
+# is apk, so this is /etc/apk/repositories.d/customfeeds.list, not opkg's
+# /etc/opkg/customfeeds.conf.
+#
+# To BUILD one of their packages into the image rather than install it at
+# runtime, add that package's own upstream repo to x3000/custom-feeds.txt -
+# the fantastic-packages superproject is all git submodules and will not
+# work as a feed here (see the note in that file).
+CONFIG_PACKAGE_fantastic-keyring=y
+CONFIG_PACKAGE_fantastic-packages-feeds=y
 
 # --- Explicitly OUT of the lean image (guards; last line wins) ------------
 # CONFIG_PACKAGE_qosify is not set

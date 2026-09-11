@@ -1,0 +1,24 @@
+#!/bin/sh
+# Turn irqbalance on.
+#
+# The package ships /etc/config/irqbalance with `option enabled '0'`, and its
+# init script returns early unless that value is greater than zero, so
+# installing irqbalance on its own does nothing whatsoever. This is the line
+# that actually makes it run.
+#
+# /etc/config/irqbalance is a package conffile, so a flash that starts from
+# the packaged copy is back to enabled=0 - the same trap that lost
+# flow_offloading on the 2026-09-10 flash.
+#
+# Unlike 94-packet-steering this re-asserts on every flash rather than only
+# when unset, because the packaged value is a real 0 and not an absent
+# option: there is no way to tell "user chose off" from "package default".
+# If you want it off for good, remove CONFIG_PACKAGE_irqbalance from
+# x3000/config.common rather than fighting this script.
+[ -f /etc/config/irqbalance ] || exit 0
+
+if [ "$(uci -q get irqbalance.irqbalance.enabled)" != "1" ]; then
+	uci set irqbalance.irqbalance.enabled='1'
+	uci commit irqbalance
+fi
+exit 0

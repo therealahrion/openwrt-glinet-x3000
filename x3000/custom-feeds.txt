@@ -32,3 +32,17 @@ quectel-5g-tools        https://github.com/vjt/quectel-5g-tools.git             
 
 # Prometheus collector for Wi-Fi dethrash detection across the fleet.
 wifi-dethrash-collector https://github.com/vjt/openwrt-dethrash.git                master  openwrt/wifi-dethrash-collector
+
+# Fantastic Packages: the two base packages that wire their binary repo into
+# apk on the router - the developer keyring, and the installer that appends
+# the repo lines to /etc/apk/repositories.d/customfeeds.list. Both live at
+# the root of their own repo, hence subdir ".".
+#
+# The fantastic-packages/packages superproject is deliberately NOT used here.
+# Every package in it is a git submodule (its .gitmodules lists ~40), and
+# prepare.sh clones without --recurse-submodules, so that tree would come
+# through as empty directories. Pulling 40 extra repos on every prepare run
+# would also not buy anything: the whole catalogue is installable from the
+# binary repo once these two are in the image.
+fantastic-keyring        https://github.com/fantastic-packages/fantastic-keyring.git         master  .
+fantastic-packages-feeds https://github.com/fantastic-packages/fantastic-packages-feeds.git  master  .
