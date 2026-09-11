@@ -94,7 +94,8 @@ jobs:
                    kmod-tcp-bbr kmod-sched-cake kmod-sched-bpf kmod-ifb tc-bpf libbpf \
                    bpftool-full xdp-loader xdpdump fping kmod-wireguard luci-proto-wireguard \
                    kmod-zram zram-swap irqbalance luci-app-irqbalance \
-                   fantastic-keyring fantastic-packages-feeds; do
+                   fantastic-keyring fantastic-packages-feeds \
+                   mwan3 luci-app-mwan3; do
             grep -q "^CONFIG_PACKAGE_$s=y" .config || { echo "missing: $s" >&2; exit 1; }
           done
           for s in qmodem kmod-pcie_mhi qosify sqm-scripts luci-app-sqm tc-tiny ply; do
@@ -112,12 +113,15 @@ jobs:
             grep -q "^CONFIG_KERNEL_$k=y" .config \
               || { echo "missing kernel symbol: $k" >&2; exit 1; }
           done
-          # Every one of these is inert without its first-boot default: the
-          # wwan interface does not exist, zram needs enabling, irqbalance
+          # Every one of these needs its first-boot default to be correct:
+          # the wwan interface does not exist, zram needs enabling, irqbalance
           # ships enabled='0', packet steering has no value on a fresh flash,
-          # and the wireless sections ship with OpenWrt's own SSID.
-          for u in 90-wwan-interface 91-gateway-metrics 92-zram-swap \
-                   93-irqbalance 94-packet-steering 95-wireless; do
+          # and the wireless sections ship with OpenWrt's own SSID. mwan3 is
+          # the inverse - it ships ENABLED with a catch-all rule pointing at a
+          # policy that has no member on this board's uplink, so losing
+          # 89-mwan3-inert would black-hole new IPv4 connections on a flash.
+          for u in 89-mwan3-inert 90-wwan-interface 91-gateway-metrics \
+                   92-zram-swap 93-irqbalance 94-packet-steering 95-wireless; do
             test -f "x3000/files-common/etc/uci-defaults/$u" \
               || { echo "missing uci-default: $u" >&2; exit 1; }
           done

@@ -353,6 +353,41 @@ CONFIG_PACKAGE_luci-app-irqbalance=y
 CONFIG_PACKAGE_fantastic-keyring=y
 CONFIG_PACKAGE_fantastic-packages-feeds=y
 
+# --- mwan3 multi-WAN (present but NOT running) -----------------------------
+# Added 2026-09-11 on request. Shipped with its service disabled by
+# files-common/etc/uci-defaults/89-mwan3-inert - read that file before
+# enabling it, the stock config is a trap on this board.
+#
+# Cost, measured against the Makefiles rather than guessed: mwan3 2.12.0 still
+# depends on iptables and ipset (its DEPENDS block is byte-identical on the
+# packages master branch, so the nftables port has not happened even in
+# development). That drags in the whole iptables-over-nftables compat layer -
+# about 12 kmod packages and ~54 kernel modules that are not already here:
+# kmod-ipt-core, kmod-nf-ipt, kmod-nft-compat, kmod-ipt-conntrack{,-extra},
+# kmod-nf-conncount, kmod-ipt-ipopt, kmod-ipt-ipset, kmod-nfnetlink and the
+# IPv6 equivalents. kmod-nft-core and its nf-log/nf-reject deps are already in
+# via firewall4.
+#
+# No kernel symbols to add: every one is carried by the owning kmod's own
+# KCONFIG line and flipped by package-metadata.pl at build time. IPv4 and IPv6
+# policy routing (ip rule, multiple tables) are already on - CONFIG_IP_
+# ADVANCED_ROUTER and CONFIG_IP_MULTIPLE_TABLES in the generic config, and
+# KERNEL_IPV6_MULTIPLE_TABLES is def_bool y under KERNEL_IPV6 in
+# config/Config-kernel.in.
+#
+# One symbol does get pinned off: kmod-ipt-ipset sets
+# CONFIG_NET_EMATCH_IPSET=n. That only feeds kmod-sched-ipset, which is not in
+# this image, and kmod-sched's own ematch list is CMP/NBYTE/META/TEXT, so it
+# takes nothing away.
+#
+# Nothing here touches the XDP, GRO, BBRv3 or BPF work. XDP runs ahead of
+# netfilter entirely, GRO is decided in the driver, BBRv3 is socket-level, and
+# the only BPF-visible change is ~54 extra entries under /sys/kernel/btf/.
+# With the service disabled there is also no per-packet cost, because the
+# iptables tables register no hooks until something touches them.
+CONFIG_PACKAGE_mwan3=y
+CONFIG_PACKAGE_luci-app-mwan3=y
+
 # --- Explicitly OUT of the lean image (guards; last line wins) ------------
 # CONFIG_PACKAGE_qosify is not set
 # CONFIG_PACKAGE_sqm-scripts is not set

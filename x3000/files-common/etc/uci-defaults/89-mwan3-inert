@@ -1,0 +1,57 @@
+#!/bin/sh
+# Keep mwan3 present but not running.
+#
+# mwan3 is NOT inert as installed, which is the whole reason this file exists.
+# Four things line up to make it live on first boot:
+#
+#   1. default_postinst runs `rc.common <init> enable` whenever IPKG_INSTROOT
+#      is set, which is the case for anything baked into an image, so
+#      /etc/rc.d/S19mwan3 is already in the flashed rootfs.
+#   2. start_service() calls mwan3_set_general_iptables() with no guard at
+#      all. It always appends `-A PREROUTING -j mwan3_hook` and
+#      `-A OUTPUT -j mwan3_hook` to the mangle table, plus CONNMARK
+#      save/restore, whether or not any interface is configured.
+#   3. The shipped /etc/config/mwan3 is not empty: `config interface 'wan'`
+#      carries `option enabled '1'` and four track_ips.
+#   4. It also ships `config rule 'default_rule_v4'` matching 0.0.0.0/0 with
+#      `use_policy 'balanced'`, and mwan3_set_user_rules() applies every rule
+#      stanza unconditionally, without looking at interface state.
+#
+# On this box that combination is a trap. mwan3's stock config names `wan` and
+# `wanb`; our modem is `wwan`, so policy `balanced` has no member on the
+# uplink that actually carries traffic. The default last resort is
+# `unreachable` (config_get last_resort "$1" last_resort unreachable), which
+# installs an `ip rule ... unreachable`, so IPv4 matching default_rule_v4 is
+# dropped. And because software flow offload is on, the symptom would be
+# partial rather than clean: flows already in the flowtable keep working while
+# new connections fail, because the SYN takes the slow path through mangle.
+# That is a much nastier thing to diagnose than a dead router.
+#
+# Disabling the service avoids all of it. The kernel modules still load - they
+# autoload from /etc/modules.d whatever the service does - but that costs
+# nothing per packet: iptable_filter and iptable_mangle only call
+# xt_register_template() at init and create no table, so no netfilter hook
+# exists until something touches those tables. iptable_filter's pernet init
+# is gated on its `forward` parameter, which defaults true and returns early.
+#
+# Marker-guarded so a deliberate `/etc/init.d/mwan3 enable` is not undone the
+# next time these defaults run. See /lib/x3000/defaults.sh.
+#
+# Before turning it on, fix /etc/config/mwan3 first. At minimum give the modem
+# its own `config interface 'wwan'` stanza and point the policies at it, or
+# set `option last_resort 'default'` so a policy with no live member falls
+# through instead of black-holing. Worth knowing too: an offloaded flow cannot
+# follow a routing change, so failover leaves established connections pinned
+# to the dead uplink until conntrack times them out - the usual fix is an
+# /etc/mwan3.user hook running `conntrack -D -m <mark>/<mask>`, which needs
+# conntrack-tools.
+. /lib/x3000/defaults.sh
+
+[ -x /etc/init.d/mwan3 ] || exit 0
+x3000_applied mwan3_disable && exit 0
+
+# No stop() needed: uci-defaults run from /etc/init.d/boot (START=10), ahead
+# of mwan3's START=19, so it has never started at this point.
+/etc/init.d/mwan3 disable
+x3000_mark mwan3_disable
+exit 0
