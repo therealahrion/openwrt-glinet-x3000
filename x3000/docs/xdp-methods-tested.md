@@ -302,15 +302,15 @@ it bypasses everything *after* 5538, including the bridge `rx_handler`.
 
 | path | native XDP | generic XDP | tc-BPF | HW BPF offload |
 |---|---|---|---|---|
-| wired LAN/WAN (`mtk_eth_soc`) | **yes** — `BASIC\|REDIRECT\|NDO_XMIT\|NDO_XMIT_SG` (`mtk_eth_soc.c:4706`), gated on NETSYS v2+; MT7981 is v2 | yes | yes | no |
+| wired LAN/WAN (`mtk_eth_soc`) | **yes** — `BASIC\|REDIRECT\|NDO_XMIT\|NDO_XMIT_SG` (`mtk_eth_soc.c:5360-5363`), gated on NETSYS v2+; MT7981 is v2 | yes | yes | no |
 | DSA user ports | no — `net/dsa/user.c`: 0 `ndo_bpf` | yes | yes | no |
 | `br-lan` | no — `net/bridge/br_device.c`: 0 `ndo_bpf` | yes | yes | no |
 | wireless LAN (mac80211/mt76) | no — `net/mac80211/iface.c`: 0 `ndo_bpf` | yes | yes | no |
 | wireless WAN (`wwan0`) | 992's hook, `BASIC` only | yes (full set) | yes (raw-IP-aware) | no |
 
 **Hardware BPF/XDP offload does not exist on this box.** Whole-tree grep:
-`NETDEV_XDP_ACT_HW_OFFLOAD` is set in exactly two files — `netdevsim/netdev.c:629`
-and `nfp/nfp_net_common.c:2768` — and `bpf_offload_dev_create()` has exactly those
+`NETDEV_XDP_ACT_HW_OFFLOAD` is set in exactly two files — `netdevsim/netdev.c:639`
+and `nfp/nfp_net_common.c:2767` — and `bpf_offload_dev_create()` has exactly those
 two callers. Nothing MediaTek, nothing mt76, nothing MHI.
 
 **MediaTek PPE hardware NAT can never carry LAN↔wwan0.**
@@ -337,7 +337,8 @@ BTF_ID_FLAGS(func, bpf_xdp_flow_lookup, KF_TRUSTED_ARGS | KF_RET_NULL)
 
 A kfunc for `BPF_PROG_TYPE_XDP` that looks a packet up in the software flowtable
 from inside an XDP program. Registration happens in
-`nf_flow_offload_xdp_setup()` (`nf_flow_table_offload.c:1195`), precisely when the
+`nf_flow_offload_xdp_setup()` (defined `nf_flow_table_xdp.c:133`, called
+`nf_flow_table_offload.c:1259`), precisely when the
 flowtable is **not** hardware-offloaded.
 
 Build gating, `net/netfilter/Makefile`:
@@ -463,7 +464,7 @@ would mean adding `ndo_xdp_xmit` to `mhi_wwan_mbim` - see section 13.
 | `eth0` (WAN) | yes - `BASIC\|REDIRECT\|NDO_XMIT\|NDO_XMIT_SG` | yes | yes | `napi_gro_receive` (2207) | yes |
 | `eth1` (LAN) | same program as `eth0` | yes | yes | same | yes |
 | `br-lan` | no `ndo_bpf` | yes | yes | inherited | no |
-| wireless (mt76/mac80211) | no `ndo_bpf` in `net/mac80211/iface.c` | yes | yes | `napi_gro_receive` (mt76 `mac80211.c:1550` -> `ieee80211_rx_napi` -> `rx.c:5533`) | no |
+| wireless (mt76/mac80211) | no `ndo_bpf` in `net/mac80211/iface.c` | yes | yes | `napi_gro_receive` (mt76 `mac80211.c:1550` -> `ieee80211_rx_napi` -> backports `rx.c:5497`) | no |
 | `wwan0` | 992, `BASIC\|REDIRECT` | yes | yes (raw-IP aware) | 991 gro_cells | **no** |
 
 Hardware BPF offload still does not exist anywhere on this box; that part of
@@ -785,7 +786,7 @@ holds, no entry appears for that traffic. If entries do appear, the source
 reading is wrong and this document needs correcting. That is worth doing before
 anyone acts on section 10.2's recommendation.
 
-Both units are in use, so check both. `mtk_eth_soc.c:3466-3475` assigns
+Both units are in use, so check both. `mtk_eth_soc.c:5586-5592` assigns
 `ppe_idx` per MAC, and `mt7981_data.ppe_num = 2`, so gmac0 uses ppe0 and gmac1
 uses ppe1.
 
@@ -1342,15 +1343,19 @@ ports too and is the most important finding in this file.
 
 ### 17.1 Wireless LAN has no native XDP at all, and attaching generic XDP costs GRO
 
-> **Wrong tree, flagged 2026-09-11.** Every `net/mac80211/` citation in this
-> subsection was read from the kernel's own `net/mac80211`. The image does not
-> build that: `package/kernel/mac80211` ships **backports 6.18.39**, built at
-> `mac80211-regular/backports-6.18.39`, and the running box confirms it -
-> `modinfo mac80211` reports `depends: cfg80211,compat`, and `compat` is the
-> backports shim. The mt76 half of this subsection **is** against the shipped
-> tree and holds: `grep -c xdp` returns 0 for `dma.c`, `mt76.h` and `mac80211.c`
-> in `mt76-2026.03.19~39c960c3`. The mac80211 half needs re-reading against
-> backports before it is relied on.
+> **Re-verified against the shipped trees, 2026-09-11.** The citations below were
+> originally read from the kernel's own `net/mac80211`, which this image does not
+> build - `package/kernel/mac80211` ships **backports 6.18.39**, and the box
+> confirms it (`modinfo mac80211` reports `depends: cfg80211,compat`; `compat` is
+> the backports shim). Re-read against `mac80211-regular/backports-6.18.39`, the
+> conclusion holds and only the addresses changed: **no mac80211 source file
+> mentions `xdp` at all** - `grep -rl --include=*.c --include=*.h xdp
+> net/mac80211/` returns nothing, and the three `net_device_ops` tables in
+> `iface.c` (`ieee80211_dataif_ops` 896, `ieee80211_monitorif_ops` 934,
+> `ieee80211_dataif_8023_ops` 1002) have no `ndo_bpf` between them. The line
+> numbers below are corrected to backports 6.18.39. The mt76 half is also
+> confirmed: `grep -c xdp` returns 0 for `dma.c`, `mt76.h` and `mac80211.c` in
+> `mt76-2026.03.19~39c960c3`.
 
 `mt76` uses a page pool for RX buffers, which makes it look like an XDP driver
 from a distance. It is not one. There is no `xdp_rxq_info`, no `xdp_buff`, no
@@ -1362,10 +1367,11 @@ generic-XDP-only.
 Where the skb actually gets built on the wireless path:
 
     mt76 `dma.c`:1045       skb = napi_build_skb(data, q->buf_size);
-      -> ieee80211_rx_napi()                        mac80211 rx.c:5510
+      -> ieee80211_rx_napi()                        mac80211 rx.c:5474
         -> ieee80211_rx_list()   decrypt, defrag, A-MSDU split, 802.11->802.3
-          -> ieee80211_deliver_skb()                mac80211 rx.c:2662
-            -> napi_gro_receive()                   mac80211 rx.c:5533
+                                                  mac80211 rx.c:5337
+          -> ieee80211_deliver_skb()                mac80211 rx.c:2677
+            -> napi_gro_receive()                   mac80211 rx.c:5497
               -> __netif_receive_skb_core()  <- generic XDP hook is here
 
 The allocation happens in the driver's NAPI poll, before mac80211 has even
@@ -1375,12 +1381,15 @@ from "before allocation" as it is possible to get.
 
 And it is not free to attach. `generic_xdp_install()` does
 `rcu_assign_pointer(dev->xdp_prog, new)` and `dev_disable_lro(dev)`
-(`dev.c:5944-5960`), and `netif_elide_gro()` is:
+(`dev.c:5949-5976`), and `netif_elide_gro()` is:
 
-    netdevice.h:2423   if (!(dev->features & NETIF_F_GRO) || dev->xdp_prog)
+    netdevice.h:2433   if (!(dev->features & NETIF_F_GRO) || dev->xdp_prog)
                                return true;
 
-which `dev_gro_receive()` tests on every packet (`gro.c:488`, `goto normal`).
+which `dev_gro_receive()` tests on every packet (`gro.c:488`, function at 477).
+`gro_cells_receive()` tests the same predicate at `gro_cells.c:23` and falls back
+to bare `netif_rx()` when it fires - which is exactly why 992 keeps its program
+on `link->xdp_prog`, and what the 2.12x measurement in 20.3 confirms.
 So attaching any generic XDP program to `phy0-ap0` or `phy1-ap0` **turns GRO off
 for that interface**. This is the same trap 992 was written to avoid on the
 modem - it is exactly why 992 keeps the program on `link->xdp_prog` instead of
@@ -1399,9 +1408,9 @@ wired ports equally.
 Both redirect paths converge:
 
     filter.c:4655            generic_xdp_tx(skb, xdp_prog);   /* bpf_redirect() */
-    devmap.c                 generic_xdp_tx(skb, xdp_prog);   /* bpf_redirect_map() */
+    devmap.c:721             generic_xdp_tx(skb, xdp_prog);   /* bpf_redirect_map() */
 
-and `generic_xdp_tx()` is (`dev.c:5237-5257`):
+and `generic_xdp_tx()` is (`dev.c:5242-5263`):
 
     txq = netdev_core_pick_tx(dev, skb, NULL);
     HARD_TX_LOCK(dev, txq, cpu);
@@ -1805,12 +1814,31 @@ number in sections 0-17.
 | `napi_gro_receive(napi, skb)` | mt76 `mac80211.c` | 1550 |
 | `grep -c xdp` = 0 | mt76 `dma.c`, `mt76.h`, `mac80211.c` | - |
 | `debugfs_create_file("preempt", ...)`, needs `CONFIG_SCHED_DEBUG` | `kernel/sched/debug.c` | 506 |
+| `netif_elide_gro(dev)` test, falls back to bare `netif_rx()` | `gro_cells.c` | 23 (fn at 13) |
+| `cell = this_cpu_ptr(gcells->cells)` | `gro_cells.c` | 28 |
+| `generic_xdp_install()` full extent | `dev.c` | 5949-5976 |
+| `tun_netdev_ops` / `tap_netdev_ops` | `tun.c` | 1246 / 1330 |
+| `__skb_push(skb, skb->mac_len)` | `cls_bpf.c` | 99 |
+| `NETDEV_XDP_ACT_HW_OFFLOAD` - the only two setters in the tree | `netdevsim/netdev.c` / `nfp_net_common.c` | 639 / 2767 |
+| `nf_flow_offload_xdp_setup()` definition | `nf_flow_table_xdp.c` | 133 |
+| `mtk_wed_add_hw(np, eth, ...)` | `mtk_eth_soc.c` | 5592 |
+| `ieee80211_deliver_skb()` | backports `mac80211/rx.c` | 2677 |
+| `ieee80211_deliver_skb_to_local_stack()` (new in 6.18) | backports `mac80211/rx.c` | 2626 |
+| `ieee80211_rx_list()` | backports `mac80211/rx.c` | 5337 |
+| `ieee80211_rx_napi()` | backports `mac80211/rx.c` | 5474 |
+| `napi_gro_receive()` in the 802.11 rx path | backports `mac80211/rx.c` | 5497 |
+| the three `net_device_ops` tables, none with `ndo_bpf` | backports `mac80211/iface.c` | 896 / 934 / 1002 |
+| `grep -rl xdp net/mac80211/*.c *.h` = **no matches** | backports 6.18.39 | - |
 
-**Not resolved.** `net/mac80211/` citations in 17.1 (wrong tree - backports
-6.18.39, see the warning there); `nf_tables_api.c:8460`; `tun.c` and `cls_bpf.c`
-citations in sections 0-4; `netdevsim/netdev.c:629` and `nfp_net_common.c:2768`;
-`nf_flow_table_offload.c:1195`; `mtk_eth_soc.c:3466-3475`; `gro_cells.c:23` and
-`:28`. Re-find these by symbol before citing them.
+**Still not resolved.** One: `nf_tables_api.c:8460`, cited in section 9 for the
+`hooknum != NF_NETDEV_INGRESS` rejection. The hook validation that returns
+`-EOPNOTSUPP` is at `2300`, `2311` and `2315` in this tree, and the claim the doc
+makes is consistent with that code, but I could not map it to a single line - so
+treat the address as unverified and the claim as read from the hook-validation
+block rather than from one statement.
+
+Everything else previously listed here is now resolved above, including the
+entire `net/mac80211/` chain against backports 6.18.39.
 
 ## 20. Hardware audit of 990-993 and the BPF platform, 2026-09-11
 
