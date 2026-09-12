@@ -326,9 +326,17 @@ no scheduler replacement required.
    compose fine.
    What software offload actually skips is conntrack re-lookup, the
    filter/nat/mangle chains and the routing lookup — everything after
-   `nf_ingress` (`dev.c:5664`). Generic XDP (`dev.c:5616`) and tc ingress
-   (`dev.c:5656`) both run earlier and are unaffected. XDP
+   `nf_ingress` (`dev.c:5669`). Generic XDP (`dev.c:5621`) and tc ingress
+   (`dev.c:5661`) both run earlier and are unaffected. XDP
    filtering/observation coexists fine.
+   (Those three numbers were corrected 2026-09-12. They had been read against
+   pristine v6.12.103, where they are 5664, 5616 and 5656, while the rest of
+   this repo cites the build tree — `net/core/dev.c` there sits 5 lines lower
+   throughout, from one OpenWrt hack patch at `xmit_one()`. The `neighbour.c`,
+   `nf_flow_table_ip.c` and `filter.c` citations on this page need no such
+   shift and were re-checked as correct — none of those files is patched here.
+   `xdp-methods-tested.md` carries the offsets for every source area and is the
+   authority for citations into the network stack.)
 3. **Layers compose; semantics can clash.** Endpoint pacing/CC never
    conflicts with middlebox shaping. The one semantic caveat: RFC 3168
    CE-marking (cake) vs L4S ECT(1) flows when cake is the bottleneck.

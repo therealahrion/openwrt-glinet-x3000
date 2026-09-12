@@ -364,6 +364,39 @@ those SHAs.
 ```
 x3000/
 ├── README.md           This file.
+├── docs/               Reference documents. One subject per file, and the
+                        named file is the authority for that subject —
+                        follow the pointer rather than re-deriving.
+│   ├── lean-overlay.md            Inventory: what the overlay adds, why,
+                                   where each lever lives, what stays out
+                                   on purpose, and the known gaps.
+│   ├── xdp-methods-tested.md      XDP / eBPF / GRO / BTF on this
+                                   hardware. Every method tried and what
+                                   it measured, the feature interaction
+                                   matrix, the resolved source-citation
+                                   index, and the kernel line-number
+                                   offsets this build carries.
+│   ├── qos-latency-research.md    Queueing, pacing and congestion-control
+                                   research, appended by round and dated.
+                                   Predates the file above; for offload,
+                                   XDP and flow-table claims that one wins.
+│   ├── downlink-stall.md          The wwan0 downlink stall: captures,
+                                   analysis, and how it was settled.
+│   ├── wan-stall-runbook.md       What to do when the WAN hangs. Capture
+                                   first; do not fix it.
+│   ├── 993-upstream-report.md     Draft report of the MHI doorbell
+                                   deadlock for the MHI maintainers.
+│   ├── 992-upstream-submission.md Plan for sending 991 and 992 to netdev,
+                                   with the reviewer answers worked out.
+│   ├── verify-992a.sh             On-router verifier for the 991/992/993
+                                   platform. Extend this rather than
+                                   writing another one-off sampler.
+│   ├── verify-992a-sources.md     The BPF programs that script embeds.
+│   ├── bpf/                       Their compiled objects, fetched by the
+                                   script at run time.
+│   ├── modem-nv-state.md          Settings that live in the modem's own
+                                   NV, not in this repo.
+│   └── cake-wan.init              Reference cake shaper. NOT installed.
 ├── prepare.sh          Variant-aware tree setup: feeds-local/, feeds.conf,
                         composes .config and files/ from common + variant
                         sources, applies x3000/patches/ with `-F 0`.
@@ -405,10 +438,24 @@ target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
 target/linux/mediatek/patches-6.12/
+├── 990-tcp-bbr3.patch  Replaces the kernel's BBR v1 with BBRv3
+                        (CachyOS 0002-bbr3). bbr is already the boot
+                        default via kmod-tcp-bbr, so the module simply
+                        becomes v3.
+├── 991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
+                        MBIM RX delivered through gro_cells instead of
+                        per-datagram netif_rx. Measured 2.09x RX
+                        aggregation, from 1.00x.
+├── 992-net-wwan-mhi_wwan_mbim-native-xdp.patch
+                        ndo_bpf plus a per-datagram do_xdp_generic() hook
+                        on the same path. Applies after 991.
 └── 993-bus-mhi-host-optional-doorbell-write.patch
                         Adds the mhi force_db_brst_disable parameter
-                        (commit aaec43cb0d).
+                        (commit aaec43cb0d). Turned on at boot by
+                        files-common/etc/modules.d/mhi-doorbell.
 ```
+
+Each of the four is described in full in `x3000/docs/lean-overlay.md`.
 
 `prepare.sh` writes its composed outputs to `/.config` and `/files/`
 (both gitignored), and records the active variant in `/.x3000-variant`.

@@ -45,21 +45,35 @@ Check whether `rx` was still climbing through the window before calling it a
 stall; on 2026-09-10 a six-second dump turned out to have rx moving at twice
 its average rate.
 
-## 4. Do not enable 993 during a hang
+## 4. Do not touch 993 during a hang
 
-Turning on `force_db_brst_disable` requires an unbind/bind, and that
-re-initialises the MHI channels - which clears a doorbell deadlock by itself.
-It would look like a fix no matter what the real cause was.
+**993 is already on.** The image sets it at every boot, from
+`x3000/files-common/etc/modules.d/mhi-doorbell`, so
+`/sys/module/mhi/parameters/force_db_brst_disable` reads `Y` on a running box.
+Corrected 2026-09-12; this page previously said to turn it on, which was true
+only before it was baked in.
 
-The test is only meaningful the other way round: enable it while everything is
-healthy, then compare a similar stretch of normal use.
+Changing it either way requires an unbind/bind, and that re-initialises the MHI
+channels - which clears a doorbell deadlock by itself. Whatever you did would
+look like the fix.
 
-    echo 1 > /sys/module/mhi/parameters/force_db_brst_disable
+Check what it is set to:
+
+    cat /sys/module/mhi/parameters/force_db_brst_disable    # Y on a stock image
+    dmesg | grep 'forcing doorbell writes'                  # names channels 100 and 101
+
+The A/B that is still missing runs the other way: turn it **off** while
+everything is healthy and see whether the stall comes back at matched
+throughput. That is the controlled reproduction the upstream report names as its
+weakness, and it has not been run.
+
+    echo 0 > /sys/module/mhi/parameters/force_db_brst_disable
     echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/unbind
     echo 0000:01:00.0 > /sys/bus/pci/drivers/mhi-pci-generic/bind
-    dmesg | grep 'forcing doorbell writes'      # should name channels 100 and 101
 
-Write 0 and re-probe to go back. A reboot does not keep the setting.
+Write 1 and re-probe to go back, or just reboot - the image sets it again. Do
+not leave the box running with it off unattended; that is the configuration the
+deadlock was captured in.
 
 ## 5. After a reboot or a flash
 

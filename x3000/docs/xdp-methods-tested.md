@@ -13,17 +13,42 @@ this repo's lean overlay. Paths are relative to
 | wireless driver | `mt76-2026.03.19~39c960c3` | separate package; files are `dma.c`, `mac80211.c`, not `mt76_*.c` |
 | 802.11 stack | `mac80211-regular/backports-6.18.39` | **backports, not the kernel's own `net/mac80211`**. Confirmed on the box: `modinfo mac80211` shows `depends: cfg80211,compat` |
 
-**Sections 0 through 17 carry line numbers from earlier trees and most of them no
-longer resolve.** Sections 5 and 9 already note this for themselves. Measured
-drift against the shipped kernel: `net/netfilter/` and `kernel/bpf/` citations are
-accurate to within a line or two; `net/core/dev.c` drifts 5 to 131 lines; and
-`drivers/net/ethernet/mediatek/` drifts 300 to 600 lines, because that is where
-the patches accumulate. **Section 19 is the resolved index** - citations verified
-against the shipped trees on 2026-09-11. Anything not listed there should be
-re-found by symbol name, not by line number:
+**Sections 0 through 17 carry line numbers from earlier trees.** Sections 5 and 9
+already note this for themselves. Drift against the shipped kernel, re-measured
+2026-09-12 against a pristine `v6.12.103` checkout with this tree's patch set
+diffed against it:
+
+| source area | offset from pristine v6.12.103 | why |
+|---|---|---|
+| `net/core/dev.c` | **exactly +5 below line 3693** | one patch touches this file: `generic/hack-6.12/721-net-add-packet-mangeling.patch`, +5 lines at `xmit_one()`. Nothing else in the tree patches `dev.c` |
+| `include/linux/netdevice.h` | **+10 below line 2242** | patches 651 (+0), 721 (+1, +5, +4), 731 (+0) |
+| `net/core/gro.c`, `gro_cells.c`, `filter.c`, `kernel/bpf/*`, `net/xdp/*`, `net/netfilter/*` | **0** | unpatched in this tree; citations resolve as written |
+| `drivers/net/ethernet/mediatek/` | 300 to 600 | where the patches accumulate |
+| `drivers/net/wwan/mhi_wwan_mbim.c` | shifts with 991/992 | cite against pristine and say so, as sections 20 and 22 do |
+
+So a `dev.c` citation in this file can be checked arithmetically rather than
+re-found: subtract 5 and it must match pristine v6.12.103. Fifteen citations were
+checked that way on 2026-09-12 and all fifteen matched, including
+`do_xdp_generic` 5621/5616, `sch_handle_ingress` 5661/5656, `generic_xdp_tx`
+5242/5237, `napi_threaded_poll_loop` 7004/6999 and the `dev_xdp_mode()` mode line
+9457/9452. **Section 19 is the resolved index** - citations verified against the
+shipped trees on 2026-09-11. Anything not listed there should be re-found by
+symbol name, not by line number:
 
     K=$(echo build_dir/target-*/linux-*/linux-6.12*)
     grep -n '<symbol>' "$K/<path>"
+
+To re-derive the offsets rather than trust them, diff this tree's patches against
+a pristine checkout of the same release:
+
+    git clone --filter=blob:none --no-checkout --depth 1 -b v6.12.103 \
+        https://github.com/gregkh/linux.git linux-pristine
+    cd linux-pristine && git sparse-checkout init --cone
+    git sparse-checkout set net/core net/xdp include/linux include/net kernel/bpf drivers/net
+    git checkout
+    # then, in this repo:
+    grep -rl -E '^(---|\+\+\+) [ab]?/?net/core/dev\.c' \
+        target/linux/generic/ target/linux/mediatek/
 
 Compile tests (historical): **x86_64 defconfig + `MHI_BUS=y WWAN=m
 MHI_WWAN_MBIM=m GRO_CELLS=y BPF_SYSCALL=y XDP_SOCKETS=y TCP_CONG_BBR=m`**, driver
@@ -47,8 +72,9 @@ net/core/dev.c:5301:  EXPORT_SYMBOL_GPL(do_xdp_generic);
 ```
 
 and `drivers/net/tun.c` calls it from a driver in exactly the shape we'd need
-(tun.c:1929 and tun.c:2523). I was looking one level too deep in the call chain
-and stopped at the first unexported symbol.
+(tun.c:1929 and tun.c:2529 - the second was cited as 2523 here until 2026-09-12,
+which is `eth_type_trans()`, six lines short). I was looking one level too deep in
+the call chain and stopped at the first unexported symbol.
 
 **992 changed the default XDP attach mode on `wwan0`, and that is why
 `xdp-loader load wwan0` broke.**
@@ -67,7 +93,15 @@ That is the whole story of the crash you hit: `xdp-loader load wwan0` installed
 libxdp's `xsk_def_prog`, 992's `ndo_bpf` captured it into native mode, the
 program called `bpf_redirect_map()` from the MHI tasklet, and there was no
 `bpf_net_context`. The `bpf_net_context` fix stopped the oops; the redirect
-itself is still refused.
+itself was still refused at that point.
+
+**That last sentence describes the hand-rolled hook, not the shipped patch.** 992
+as it stands routes through `do_xdp_generic()`, which dispatches `XDP_REDIRECT`
+and `XDP_TX` itself and sets up its own `bpf_net_context`, and the patch
+advertises `NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT`. So redirect and
+AF_XDP are supported on `wwan0` now; what is *incompatible* with a redirect is the
+shaper, because every redirect path ends in `generic_xdp_tx()` with no qdisc - see
+section 21.1. Noted 2026-09-12.
 
 ---
 
@@ -1955,3 +1989,256 @@ Both working trees clean, both tracking
   x3000/ebpf` returns `2c45f07780` (creation) and `654de33149` (package
   conversion, which *was* applied and later dropped). Sources are at
   `git show 654de33149:package/x3000-ebpf/src/`.
+
+## 21. Feature interaction matrix
+
+Every feature in this build was added for its own reasons, but what matters in
+practice is whether they survive each other: whether GRO still works once XDP is
+attached, whether the flowtable kfunc is reachable from a program, whether a
+redirect still passes through the shaper. Those answers are scattered across
+sections 9 to 20. This is the single table.
+
+The untested rows are the useful part. They are the places the build currently
+rests on an assumption.
+
+### 21.1 Pairs that interact
+
+**Compatible** means verified to coexist. **Incompatible** means one silently or
+explicitly disables the other. Evidence column points at the section or the
+`file:line` from section 19.
+
+| A | B | verdict | evidence |
+|---|---|---|---|
+| GRO | native XDP on `eth0`/`eth1` | **compatible** | program runs on an `xdp_buff` at `mtk_eth_soc.c:2486`; `napi_build_skb` 2493 and `napi_gro_receive` 2583 are reached only on `XDP_PASS`, so the program never sees a coalesced frame (16.1) |
+| native XDP | HWLRO | **mutually exclusive**, driver-enforced | `mtk_xdp_setup()` returns `-EOPNOTSUPP` "XDP not supported with HWLRO". A successful `xdp-filter load -m native eth1` therefore proves HWLRO is off here (18.4) |
+| GRO and LRO | generic / skb XDP, any device | **incompatible**, silently | `generic_xdp_install()` (`dev.c:5949-5976`) stores on `dev->xdp_prog` and calls `dev_disable_lro()`; `netif_elide_gro()` (`netdevice.h:2433`) is true for any `dev->xdp_prog`; `dev_gro_receive()` tests it at `gro.c:488` (17.1) |
+| `gro_cells` | `dev->xdp_prog` | **incompatible. Measured.** | `gro_cells_receive()` tests the same predicate at `gro_cells.c:23` and drops to bare `netif_rx()`. measured twice - **1.00x skb against 24.8x detached** (2026-09-09, recorded in `lean-overlay.md`) and 1.06x against 2.20x at a lower link rate (2026-09-11). Correct-but-silent, and not fixable in the core: see 22 |
+| `gro_cells` | 992's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-992a section 6 |
+| BTF | BPF CO-RE tooling | **required, present** | `DEBUG_INFO_BTF=y`, `_MODULES=y`; `/sys/kernel/btf/vmlinux` 3846 KB; per-module BTF present (20.5) |
+| BTF | `bpf_xdp_flow_lookup` kfunc | **required** | `net/netfilter/Makefile:147-151` gates `nf_flow_table_bpf.o` on `DEBUG_INFO_BTF_MODULES` / `DEBUG_INFO_BTF`. Without this repo's BTF platform the kfunc does not exist at all |
+| flowtable kfunc | native XDP on `eth0`/`eth1` | **incompatible, structurally** | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, ...)` then `nf_flowtable_by_dev()`, keyed on the `net_device *` **pointer** (`nf_flow_table_xdp.c:27-33`). The rxq carries `eth->dummy_dev` (`mtk_eth_soc.c:2115`), never inserted in any flowtable. Permanent `-ENOENT`; a correct `fib_tuple->ifindex` does not help, because the *table* is selected by the pointer (16.2, 18.7) |
+| hardware flow offload (PPE) | flowtable kfunc | **mutually exclusive** | 10.2 |
+| PPE hardware NAT | `wwan0` | **impossible** | egress PSE port resolved only from `eth->netdev[0..2]`: `mtk_flow_get_dsa_port` 170, `PSE_GDM1_PORT` 225, `PSE_GDM2_PORT` 227 (10.1) |
+| `XDP_REDIRECT` | cake / SQM | **incompatible** | both paths end in `generic_xdp_tx()` then `netdev_start_xmit()` with no qdisc: `filter.c:4655` for `bpf_redirect()`, `devmap.c:721` for `bpf_redirect_map()` (17.2) |
+| **992's `XDP_TX`** | **cake / SQM** | **incompatible** - see 21.3 | `do_xdp_generic()` dispatches `case XDP_TX` to `generic_xdp_tx()` at `dev.c:5287`, which is the same qdisc-bypassing path |
+| XDP | tc ingress | **XDP wins** | `do_xdp_generic` at `dev.c:5621`, `sch_handle_ingress` at 5661 - so a redirect escapes tc ingress shaping too (17.2) |
+| AF_XDP | 992 | **compatible, deliberately** | libxdp's `xsk_def_prog` emits only `bpf_redirect_map()`, so refusing `XDP_REDIRECT` would refuse AF_XDP. Routing through `do_xdp_generic()` provides it. verify-992a section 11: no pstore crash records |
+| AF_XDP | cake / SQM | **incompatible** | it is a redirect, so the row above applies |
+| wireless (mt76 + mac80211) | XDP of any kind | **generic only** | no mac80211 source file mentions `xdp` in backports 6.18.39, and none of its three `net_device_ops` tables has `ndo_bpf`; `grep -c xdp` is 0 for mt76's `dma.c`, `mt76.h`, `mac80211.c`. So attaching costs GRO and LRO by the row above, for a hook that runs after decrypt, defrag and A-MSDU split (17.1) |
+| WED | flows crossing `wwan0` | **unreachable** | WED's forwarding half cannot carry a flow that crosses the modem (17.3) |
+| RPS | threaded NAPI | **compatible** | `dev.c:4919` skips raising `NET_RX_SOFTIRQ` when `sd->in_napi_threaded_poll`; `dev.c:7027-7030` dispatches pending RPS IPIs inside the bh-disabled region of `napi_threaded_poll_loop()` (18.4) |
+| RPS | `XDP_DROP` | **RPS disappears** | no skb is built, so nothing is enqueued to any backlog. Observed across the #114 runs |
+| threaded NAPI | `/proc/stat` accounting | **interferes with measurement** | the poll runs under `local_bh_disable()`, so the same microseconds appear as `softirq` in `/proc/stat` and as the thread's `stime`. Compounded by 18.3 |
+| zram, irqbalance, mwan3 | the datapath | **orthogonal** | no interaction; mwan3 ships inert |
+
+### 21.2 Untested - this is the work queue
+
+Each of these is a claim the build currently rests on without evidence.
+
+| A | B | what is assumed | how to settle it |
+|---|---|---|---|
+| software nft flow offload | cake | that offloaded flows still traverse the egress qdisc, so cake keeps shaping. `lean-overlay.md` says in as many words to verify this before trusting it | bufferbloat run with `flow_offloading` on and off, latency under load |
+| BBRv3 | cake / `fq_codel` | that BBR's internal pacing and the qdisc's do not fight | throughput and latency A/B against `cubic` at the same shaper settings |
+| flowtable kfunc | XDP on `wwan0` | that it *should* work here, unlike the wired ports: generic XDP takes its rxq from `netif_get_rxqueue(skb)` (`dev.c:5039`, called 5084), the real netdev, and `wwan0` is in the fw4 flowtable (#112) | a program that actually calls the kfunc on `wwan0` and reports hit or `-ENOENT` |
+| AF_XDP | native XDP on `eth0`/`eth1` | that XSK redirect works on the wired path as it does on `wwan0` | bind a socket, check for pstore records as verify-992a section 11 does |
+| aggregation | arrival rate | that `gro_cells` aggregation scales with load. A 60x reading was withdrawn because it implies an 84 KB skb against a 65536 ceiling, but it is possible if those datagrams were under 1092 bytes, which was never measured | one run at a fast link with the fixed `gro_measure()`, which now reports bytes per skb and `rx_dropped` |
+
+### 21.3 Two things this table clarified
+
+**`XDP_TX` bypasses the shaper, not just `XDP_REDIRECT`.** Section 17.2 established
+that both redirect paths end in `generic_xdp_tx()`. The same is true of `XDP_TX`:
+992 routes every verdict through `do_xdp_generic()`, whose `case XDP_TX` calls
+`generic_xdp_tx()` at `dev.c:5287`, which goes to `netdev_start_xmit()` under
+`HARD_TX_LOCK` with no qdisc (`dev.c:5242-5263`).
+
+So the rule, and it is the most useful line in this section: **only `XDP_PASS` and
+`XDP_DROP` coexist with SQM.** Any fastpath built on `XDP_TX` or `XDP_REDIRECT`
+leaves cake behind, on `wwan0` and on the wired ports alike.
+
+**The skb-mode collapse was measured twice, a day apart, and the earlier figure is
+the stronger one.** `lean-overlay.md`'s 992 row has recorded since 2026-09-09 that
+attaching the same program with `xdpgeneric` measures **1.00x aggregation against
+24.8x detached**. The 2026-09-11 run reproduced it at a lower link rate: 1.06x
+against 2.20x. Both are the same phenomenon; quote whichever matches the rate you
+can demonstrate.
+
+That pair also settles a question 18.5 left open. A 24.8x reading is arithmetically
+comfortable - about 34.7 KB per delivered skb against a 65536 ceiling - so
+aggregation genuinely is far higher at higher arrival rates than the 2.1x measured
+at 3.3 Mbit/s. The 60x reading withdrawn in 18.5 therefore needs only datagrams
+averaging under 1092 bytes to be real, rather than being impossible. It stays
+unquoted until a run with the instrumented `gro_measure()` reports bytes per skb
+alongside it, but the rate-scaling behaviour itself is no longer in doubt.
+
+### 21.4 Design rules that fall out
+
+1. **Never attach in skb mode on this box.** It costs GRO and LRO everywhere, and
+   on `wwan0` it costs the whole point of 991. Use native mode, which on the wired
+   ports is genuinely pre-skb and on `wwan0` is 992's hook.
+2. **A drop is the only verdict that is free.** `XDP_PASS` keeps everything;
+   `XDP_DROP` additionally skips the skb, the stack and RPS. `XDP_TX` and
+   `XDP_REDIRECT` both cost you the shaper.
+3. **The flowtable kfunc is reachable from `wwan0` and not from the wired ports.**
+   That is the opposite of where the pre-skb saving is, which is why no
+   flow-aware fastpath fits this hardware (16.4).
+4. **The BTF platform is load-bearing, not decorative.** It is what makes the
+   flowtable kfunc exist at all, and what let the BBRv3 identity be proven from
+   the module itself when OpenWrt had stripped the version tag (20.2).
+5. **Do not evaluate any of this with `/proc/stat`.** See 18.3. Use exact
+   counters, or a fixed-work yardstick timed by wall clock.
+
+---
+
+## 22. The gro_cells + XDP ordering problem, settled
+
+21.1 records that `gro_cells` and `dev->xdp_prog` are incompatible, measured. The
+open question was whether that is fixable in the core - because if it were, the
+driver-side XDP code in 992 could be deleted and every `gro_cells` driver would
+get a GRO-preserving XDP hook for free. That was the most valuable thing this work
+had found, so it needed an answer from the tree rather than from reasoning.
+
+Answered 2026-09-12. **It is not fixable in the core, and 992's existing design is
+the correct one.** Method: a pristine `v6.12.103` checkout, plus a diff of every
+patch in this tree against it to establish the offsets in the header table above.
+Line numbers below are pristine; add 5 for `net/core/dev.c` to get this build.
+
+### 22.1 A hook inside `gro_cells_receive()` double-executes
+
+Every skb a gro_cell receives reaches `__netif_receive_skb_core()`, and that
+function runs `dev->xdp_prog` itself:
+
+    gro_cells.c:61      napi_gro_receive(napi, skb)             in gro_cell_poll()
+    gro.c:303/618/710   gro_normal_one(napi, skb, ...)
+    gro.h:514-518       gro_normal_list() -> netif_receive_skb_list_internal()
+    dev.c:6000          netif_receive_skb_list_internal()
+    dev.c:5914          __netif_receive_skb_list()
+    dev.c:5848          __netif_receive_skb_list_core()
+    dev.c:5583          __netif_receive_skb_core()
+    dev.c:5612          if (static_branch_unlikely(&generic_xdp_needed_key)) {
+    dev.c:5616              ret2 = do_xdp_generic(rcu_dereference(skb->dev->xdp_prog), &skb);
+
+An skb-mode attach is what turns that static key on - `generic_xdp_install()` does
+`static_branch_inc()` at `dev.c:5958-5959` - so a hook added inside
+`gro_cells_receive()` runs the program twice: once per datagram going in, once
+more on whatever GRO produced coming out. **The second run is the worse half.** It
+hands the program a coalesced superframe, which is precisely the input
+`netif_elide_gro()` exists to prevent.
+
+The second site cannot be suppressed. There is no per-skb "XDP already ran" marker
+anywhere in the core. The only thing that makes `__netif_receive_skb_core()` skip
+is `skb->dev->xdp_prog` being NULL, because that is the argument it passes and
+`do_xdp_generic()` returns `XDP_PASS` immediately on a NULL program (`dev.c:5266`,
+`5290`). Adding a marker means a new skb bit for one niche case.
+
+One nuance, for honesty: the core does not guarantee one run per skb today either.
+The `another_round:` label sits at `dev.c:5607`, *above* the generic-XDP block, so
+a VLAN untag or an `rx_handler` returning `RX_HANDLER_ANOTHER` re-runs the program
+on the same frame. But those re-runs are the same frame after a header
+transformation, never a coalesced aggregate, so they do not license the
+gro_cells shape.
+
+### 22.2 Letting the driver opt out of the elision is worse, not smaller
+
+The other candidate was a driver flag that `netif_elide_gro()` honours, leaving
+the program on `dev->xdp_prog`. Then `gro_cells` coalesces first and the core runs
+the program once, at `dev.c:5616`, on the coalesced skb alone. Per-datagram
+filtering disappears entirely. That inverts the guarantee rather than narrowing
+it.
+
+### 22.3 What works, and the in-tree precedent
+
+Hold the program on a driver-private pointer, run it per datagram through the
+core's own helper, leave `dev->xdp_prog` NULL. Then `netif_elide_gro()` stays
+false so GRO survives, and the core's own call site sees NULL so nothing runs
+twice. `do_xdp_generic()` takes the program as an argument for exactly this
+purpose, and is exported for it:
+
+    dev.c:5262   int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff **pskb)
+    dev.c:5296   EXPORT_SYMBOL_GPL(do_xdp_generic);
+
+`drivers/net/tun.c` does this, verified rather than assumed - this closes the
+"verify the tun.c precedent" item that 992's commit message was resting on:
+
+    tun.c:210    struct bpf_prog __rcu *xdp_prog;          in struct tun_struct
+    tun.c:1200   rcu_assign_pointer(tun->xdp_prog, prog);  from ndo_bpf
+    tun.c:1926   rcu_read_lock();
+    tun.c:1929   ret = do_xdp_generic(xdp_prog, &skb);
+    tun.c:2529   ret = do_xdp_generic(xdp_prog, &skb);
+
+`tun` never assigns `dev->xdp_prog` anywhere in the file. So 992's driver-side code
+is not a workaround for a missing core feature - **it is the mechanism**, and the
+only shape that keeps both halves of the contract. Nothing in it should be deleted
+or simplified.
+
+### 22.4 Scale: eight drivers, none of them with XDP
+
+`gro_cells_receive()` callers in 6.12.103: `vxlan_core.c`, `geneve.c`,
+`bareudp.c`, `macsec.c`, `amt.c`, `pfcp.c`, `rmnet_handlers.c`, and with 991,
+`mhi_wwan_mbim.c`. **None of the first seven implements `ndo_bpf`, and `grep -ci
+xdp` returns 0 for every one of them.** So this build is the first `gro_cells`
+driver anywhere with an XDP hook, which is why the interaction has gone unnoticed,
+and why there is no driver to copy for this specific pairing. `tun` supplies the
+call-pattern precedent but does not use `gro_cells` (`grep -c gro_cells
+drivers/net/tun.c` is 0).
+
+### 22.5 Two candidate enhancements to 992 that the tree disproved
+
+Both of these looked like real defects and both were checked before being
+claimed. Recording them so they are not "found" again.
+
+**A missing `xdp_do_flush()`.** 992 advertises `XDP_REDIRECT` and never calls
+`xdp_do_flush()`, which on a NAPI driver would leave redirected frames sitting in
+a per-CPU bulk queue. Not so here: every *generic* redirect target completes its
+work inline. devmap's `dev_map_generic_redirect()` ends in `generic_xdp_tx()`
+(`devmap.c:721`); xskmap calls `xsk_generic_rcv()`, which takes `pool->rx_lock` and
+calls `xsk_flush()` itself; cpumap's `cpu_map_generic_redirect()` does
+`ptr_ring_produce()` then `wake_up_process()`. Nothing is deferred, so
+`xdp_do_check_flushed()` - called from `__napi_poll()` at `dev.c:6899` under
+`CONFIG_DEBUG_NET` - cannot fire for this hook. The bulk queues belong to the
+*native* redirect helpers, which this path never uses.
+
+**A missing `rcu_read_lock()`.** 992 does `rcu_dereference(link->xdp_prog)` with no
+visible lock. The lock is already held, by upstream code, across the whole
+datagram loop:
+
+    mhi_wwan_mbim.c:296   rcu_read_lock();
+    mhi_wwan_mbim.c:298   link = mhi_mbim_get_link_rcu(mbim, session);
+    mhi_wwan_mbim.c:306   for (n = 0; n < nframes; n++, ...)
+    mhi_wwan_mbim.c:348       netif_rx(skbn);          <- the call 991 replaces
+    mhi_wwan_mbim.c:351   rcu_read_unlock();
+
+992's pointer read and its `do_xdp_generic()` call both sit inside that region.
+Adding a second `rcu_read_lock()` would be noise, and claiming the patch needed one
+would have been wrong.
+
+### 22.6 What is actually left for the core: visibility, not capability
+
+The elision is correct. What is wrong is that it is silent. `ethtool -k` keeps
+reporting `generic-receive-offload: on` while GRO is elided, so an order of
+magnitude of aggregation disappears with no user-visible cause. The install path
+already switches off the two *visible* neighbours:
+
+    dev.c:5960   dev_disable_lro(dev);
+    dev.c:5961   dev_disable_gro_hw(dev);
+
+Clearing `NETIF_F_GRO` through the same `wanted_features` +
+`netdev_update_features()` machinery that `dev_disable_lro()` uses would make the
+feature bits describe reality, and would make `netif_elide_gro()`'s
+`dev->xdp_prog` test redundant rather than load-bearing. That is a small patch
+worth one attempt upstream, on its own and not attached to the MBIM series. It
+changes nothing for this build - rule 1 in 21.4 already says never to attach in
+skb mode here.
+
+### 22.7 What this closes
+
+* **No patch 994.** The core fix that was going to be the project's one genuinely
+  new patch does not exist. The honest output of the investigation is that 992 was
+  already right, for reasons its commit message stated correctly and could not
+  cite.
+* **992 is not to be simplified.** The plan to strip its driver-side XDP once a
+  core hook existed is void.
+* **The tun.c precedent is verified**, in four parts, at the line numbers above.
+* **The series is the deliverable**, unchanged in shape:
+  `[PATCH net]` for the use-after-free fix currently bundled in 991, then
+  `[PATCH net-next 1/2]` gro_cells and `[PATCH net-next 2/2]` the XDP hook. See
+  `992-upstream-submission.md`, section 2 onward.

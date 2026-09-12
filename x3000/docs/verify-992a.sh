@@ -169,20 +169,40 @@ else
 fi
 
 # --- GRO aggregation measurement -------------------------------------------
+# Locate InReceives by its header name rather than by a fixed column. On the
+# data line $1 is "Ip:", $2 Forwarding, $3 DefaultTTL and $4 InReceives, so a
+# hardcoded $3 silently reads a constant and the IPv4 term contributes nothing.
+# That bug was invisible here because the load generator downloads over IPv6 and
+# the snmp6 term carried the whole measurement.
+_in4() { awk '/^Ip:/{ if(h==""){ for(i=1;i<=NF;i++) if($i=="InReceives") c=i; h=1; next } print $c+0 }' /proc/net/snmp; }
+_in6() { awk '/^Ip6InReceives/{print $2+0}' /proc/net/snmp6 2>/dev/null || echo 0; }
+
+# Reports five fields: datagrams, delivered skbs, ratio, datagrams dropped,
+# bytes per delivered skb.
+#
+# The last two are not decoration. This ratio divides a driver-side counter by an
+# IP-side one, so anything discarded in between is booked as aggregation -
+# gro_cells_receive() drops on backlog overflow (gro_cells.c:30-34) and bumps
+# rx_dropped, and a busy link can therefore fake an arbitrarily high ratio.
+# Bytes-per-skb is the independent check: it cannot exceed gro_max_size, so a
+# ratio implying more than that is loss, not coalescing.
 gro_measure() {
 	_s=${1:-12}
 	_p0=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
-	_i0=$(awk '/^Ip:/{c++; if(c==2) print $3}' /proc/net/snmp)
-	_j0=$(awk '/^Ip6InReceives/{print $2}' /proc/net/snmp6 2>/dev/null || echo 0)
+	_b0=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
+	_d0=$(cat /sys/class/net/$WANIF/statistics/rx_dropped)
+	_i0=$(_in4); _j0=$(_in6)
 	sleep "$_s"
 	_p1=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
-	_i1=$(awk '/^Ip:/{c++; if(c==2) print $3}' /proc/net/snmp)
-	_j1=$(awk '/^Ip6InReceives/{print $2}' /proc/net/snmp6 2>/dev/null || echo 0)
-	_dp=$((_p1-_p0)); _ds=$(( (_i1-_i0) + (_j1-_j0) ))
+	_b1=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
+	_d1=$(cat /sys/class/net/$WANIF/statistics/rx_dropped)
+	_i1=$(_in4); _j1=$(_in6)
+	_dp=$((_p1-_p0)); _db=$((_b1-_b0)); _dd=$((_d1-_d0))
+	_ds=$(( (_i1-_i0) + (_j1-_j0) ))
 	if [ "$_ds" -gt 0 ] && [ "$_dp" -gt 0 ]; then
-		awk "BEGIN{printf \"%d %d %.2f\", $_dp, $_ds, $_dp/$_ds}"
+		awk "BEGIN{printf \"%d %d %.2f %d %d\", $_dp, $_ds, $_dp/$_ds, $_dd, $_db/$_ds}"
 	else
-		echo "$_dp $_ds 0"
+		echo "$_dp $_ds 0 $_dd 0"
 	fi
 }
 
@@ -197,6 +217,13 @@ info "measuring for 12s ..."
 set -- $(gro_measure 12)
 BASE_RATIO=$3
 info "$WANIF rx_packets=$1   IP InReceives=$2   aggregation=${3}x"
+info "dropped=$4   bytes per delivered skb=$5 (gro_max_size caps this)"
+if [ "$4" -gt 0 ]; then
+	bad "$4 datagrams dropped - the ratio above is inflated by loss, not aggregation"
+fi
+if [ "$5" -gt 65536 ]; then
+	bad "$5 bytes per skb exceeds gro_max_size - the ratio is not coalescing"
+fi
 if [ "$1" -lt 500 ]; then
 	skip "only $1 packets seen — too little traffic for a meaningful ratio"
 	BASE_RATIO=0
@@ -248,6 +275,36 @@ hdr "8. detach"
 if [ -z "$ATTACHED" ]; then skip "nothing to detach"; else
 $IP link set dev "$WANIF" xdp off 2>/dev/null
 $IP -d link show "$WANIF" | grep -q "prog/xdp" && bad "program still attached after detach" || ok "detached cleanly"
+fi
+
+hdr "8b. skb-mode attach must collapse GRO — the gro_cells interaction"
+# This is the inverse of step 6 and the reason 992 owns ndo_bpf at all.
+# generic_xdp_install() stores the program on dev->xdp_prog; netif_elide_gro()
+# tests that pointer, and gro_cells_receive() consults it per datagram
+# (gro_cells.c:23), dropping to bare netif_rx(). So attaching the SAME program in
+# skb mode should switch GRO off. If it does not, the premise behind keeping the
+# program on link->xdp_prog is wrong and 992 can be simplified.
+if [ "$BASE_RATIO" = "0" ]; then
+	skip "no usable baseline from step 4"
+elif $IP link set dev "$WANIF" xdpgeneric obj $D/xdp_pass.o sec xdp 2>$D/err; then
+	info "attached in skb mode; measuring for 12s ..."
+	set -- $(gro_measure 12)
+	info "skb mode: rx_packets=$1  InReceives=$2  aggregation=${3}x  dropped=$4  bytes/skb=$5"
+	$IP link set dev "$WANIF" xdp off 2>/dev/null
+	if [ "$4" -gt 0 ]; then
+		skip "$4 datagrams dropped during the window - ratio not trustworthy"
+	elif awk "BEGIN{exit !($3 < 1.15)}"; then
+		ok "GRO collapsed to ${3}x in skb mode (baseline ${BASE_RATIO}x) — confirms the gro_cells/dev->xdp_prog interaction"
+	else
+		bad "GRO survived skb mode at ${3}x — 992's link->xdp_prog rationale does not hold, investigate"
+	fi
+	sleep 2
+	set -- $(gro_measure 8)
+	awk "BEGIN{exit !($3 > $BASE_RATIO * 0.6)}" \
+		&& ok "aggregation restored to ${3}x after detach" \
+		|| bad "aggregation still ${3}x after detach — state not cleaned up"
+else
+	skip "skb-mode attach failed: $(head -2 $D/err | tr '\n' ' ')"
 fi
 
 if [ "$WITH_DROP" = 1 ]; then
