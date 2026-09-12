@@ -9,7 +9,7 @@
 # Marker-guarded rather than "only if unset", because the packaged value is a
 # real 0: there is no way to tell "package default" from "user turned it off",
 # and a plain set would re-enable it every time these defaults run. Applying
-# once per factory state is the behaviour we want. See /lib/x3000/defaults.sh.
+# once per factory state is the wanted behaviour. See /lib/x3000/defaults.sh.
 #
 # To have it off permanently, drop CONFIG_PACKAGE_irqbalance from
 # x3000/config.common rather than fighting this script.

@@ -76,7 +76,7 @@ like. What carries weight is that the count is not zero. `wanlog` now
 records these columns on every sample, which supplies the missing
 healthy-under-load control.
 
-## Why it is not ours
+## Why it is not mine
 
 The kernel-side difference between this tree and `jeeves-r8` is exactly:
 
@@ -86,7 +86,7 @@ The kernel-side difference between this tree and `jeeves-r8` is exactly:
 - ramoops record-size and console-size in the board dts
 - `CONFIG_KERNEL_MHI_BUS_DEBUG=y`
 
-The two MHI-adjacent patches are not ours. `gl-x3000-quectel-pci-id.patch` is
+The two MHI-adjacent patches are not mine. `gl-x3000-quectel-pci-id.patch` is
 Marcello Barnaba's, and `790-bus-mhi-core-add-SBL-state-callback.patch` is
 Robert Marko's ath11k patch, which only touches a control-plane execution
 environment transition.
@@ -312,7 +312,7 @@ over QMI, the modem detaches and re-registers, and recovery takes 10-21 s via a
 ## Clean-baseline run, 2026-09-10
 
 The router was reflashed to GL.iNet stock, the modem's band selection reset to
-auto there, then our image flashed back. That removed every inherited setting
+auto there, then my image flashed back. That removed every inherited setting
 at once - band locks, TTL, MTU override - which no previous capture had.
 
 Seven and a half minutes of heavy traffic followed: 1.75 million packets at

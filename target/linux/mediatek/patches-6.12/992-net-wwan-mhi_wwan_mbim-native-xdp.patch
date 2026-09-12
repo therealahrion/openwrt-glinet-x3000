@@ -258,7 +258,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  
 +	/* dev_xdp_uninstall() has normally already detached the program
-+	 * via ndo_bpf by the time we get here; this is belt and braces
++	 * via ndo_bpf by the time this runs; this is belt and braces
 +	 * for any path that has not, and is a no-op when the pointer is
 +	 * already NULL.
 +	 */

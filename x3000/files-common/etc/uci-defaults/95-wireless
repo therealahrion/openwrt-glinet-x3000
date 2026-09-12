@@ -24,13 +24,13 @@
 # time these defaults run. See /lib/x3000/defaults.sh.
 #
 # Two things deliberately left alone: `encryption` and `key`. Rewriting those
-# from a defaults script is how you lock yourself out of your own wifi.
+# from a defaults script is how a box locks everyone out of its own wifi.
 #
 # About the values. HE is what LuCI calls "Mode: AX". HE160 needs DFS channels
 # in the US, so with channel=auto the driver may settle on 80 MHz depending on
 # radar state and what mt76 allows - check `iw phy1 info` rather than assuming
-# you got 160. txpower is a ceiling, not a request: the driver still clamps to
-# whatever the US regulatory domain permits on the chosen channel.
+# 160 was granted. txpower is a ceiling, not a request: the driver still
+# clamps to whatever the US regulatory domain permits on the chosen channel.
 . /lib/x3000/defaults.sh
 
 x3000_applied wireless && exit 0

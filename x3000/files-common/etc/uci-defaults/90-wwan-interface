@@ -23,7 +23,7 @@
 # deliberately absent here rather than set to a string the proto would not
 # recognise. Same for init_allowedauth.
 #
-# Heads up if you ever add a username: the proto reads `init_user` into a shell
+# Heads up before adding a username: the proto reads `init_user` into a shell
 # variable but then uses `${init_username:+...}` when building the connect
 # arguments, so the Initial EPS Bearer username is broken upstream. Irrelevant
 # with auth none.

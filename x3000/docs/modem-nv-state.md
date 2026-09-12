@@ -6,7 +6,7 @@ firmware, because nothing on the host ever writes them. They are invisible to
 `uci show` and to git, and they will quietly shape the behaviour of any test
 run against this unit until someone reads them back.
 
-This bit us: a band lock set years earlier in GL.iNet's admin panel was still
+This bit me: a band lock set years earlier in GL.iNet's admin panel was still
 active through every build in this repo, and was only found by asking the modem
 directly.
 
@@ -34,7 +34,7 @@ default is every band the modem supports; restoring it means writing that list
 back explicitly, not resetting the router.
 
 `nr5g_disable_mode` was set to 2 while trying to force 5G SA. The polarity is
-not documented in a way we could confirm - setting 2 left the modem on NSA,
+not documented in a way I could confirm - setting 2 left the modem on NSA,
 which suggests 2 disables SA rather than NSA, but that was never proven. Forcing
 SA also needs `mode_pref` set to NR5G, and the one attempt at that had its write
 swallowed when the AT server went briefly mute during the `CFUN` cycle.

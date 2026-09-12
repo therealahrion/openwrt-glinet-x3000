@@ -10,7 +10,7 @@ Nothing here has been sent.
 There is no core fix to send instead.** The 2026-09-11 entry here said the
 opposite; it was a plan resting on an unread call path. Section 2 records what the
 tree actually says and why both core shapes are dead, because the question will
-come up on-list. Sections 3 onward are the series to send. Read "Before you send"
+come up on-list. Sections 3 onward are the series to send. Read "Before sending"
 last.
 
 ## 1. The problem, stated without reference to any patch
@@ -29,8 +29,8 @@ and `gro_cells_receive()` tests it on every skb, falling back to bare
     gro_cells.c:23     if (!gcells->cells || skb_cloned(skb) || netif_elide_gro(dev)) {
     gro_cells.c:24             res = netif_rx(skb);
 
-The elision is right for the case it was written for - you cannot hand a
-GRO-coalesced superframe to a program that expects one packet. It is wrong for a
+The elision is right for the case it was written for - a GRO-coalesced
+superframe cannot be handed to a program that expects one packet. It is wrong for a
 driver that runs XDP itself, per datagram, *before* `gro_cells_receive()`: by then
 the program has already seen each datagram individually and coalescing afterwards
 is harmless.
@@ -85,7 +85,7 @@ The defect in section 1 is real. Both shapes that would fix it inside the core a
 not, and reading the tree is what settled that.
 
 **Canonical record: `xdp-methods-tested.md` section 22.** What follows is the
-argument in the form you would paste into an on-list reply, so the decisive
+argument in the form to paste into an on-list reply, so the decisive
 citations are repeated here rather than only linked. Line numbers are pristine
 v6.12.103; this build's `net/core/dev.c` sits exactly 5 lines lower, because one
 OpenWrt hack patch adds 5 lines at `xmit_one()` and nothing else in the tree
@@ -174,7 +174,7 @@ it.
 
 ### 2.2 Two reviewer questions, answered in advance
 
-**"Where is your `xdp_do_flush()`?"** Not needed on this path - checked, not
+**"Where is the `xdp_do_flush()`?"** Not needed on this path - checked, not
 assumed. Every generic-redirect target finishes its work inline: devmap ends in
 `generic_xdp_tx()` (`devmap.c:721`), xskmap calls `xsk_generic_rcv()` which takes
 `pool->rx_lock` and calls `xsk_flush()` itself, and cpumap's
@@ -183,7 +183,7 @@ Nothing is parked in a per-CPU bulk queue, so `xdp_do_check_flushed()` - called
 from `__napi_poll()` at `dev.c:6899` under `CONFIG_DEBUG_NET` - cannot fire for
 this hook.
 
-**"You dereference an RCU pointer without `rcu_read_lock()`."** It is already
+**"This dereferences an RCU pointer without `rcu_read_lock()`."** It is already
 held, by upstream code, not by the patch:
 
     mhi_wwan_mbim.c:296   rcu_read_lock();
@@ -278,7 +278,7 @@ Both messages are otherwise ready as written.
 GL-X3000 lean build; applies after 991."* That line goes. The dependency is
 expressed by the series ordering, not by prose.
 
-**Add a sign-off to both**, which `git format-patch -s` does for you:
+**Add a sign-off to both**, which `git format-patch -s` does automatically:
 
     Signed-off-by: Ahrion Gallegos <ahrionmgallegos@gmail.com>
 
@@ -436,7 +436,7 @@ answer.
 a hand-rolled hook produced is the strongest single argument for routing through
 `do_xdp_generic()`. Keep the call trace.
 
-## 7. Before you send
+## 7. Before sending
 
 In order. The first step replaces guesswork about recipients entirely - do not
 hand-curate that list, and do not trust any list I or anyone else writes from

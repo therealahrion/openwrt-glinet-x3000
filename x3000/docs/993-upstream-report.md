@@ -1,6 +1,6 @@
 # Draft: reporting the MHI burst-mode doorbell deadlock upstream
 
-Not sent yet. This is the report we would send, kept here so the argument and
+Not sent yet. This is the report to send, kept here so the argument and
 the evidence stay in one place and stay revisable.
 
 ## Where it goes
@@ -16,13 +16,13 @@ Subject line, roughly:
     bus: mhi: host: IP_HW0 downlink deadlocks when nothing re-arms the
     burst-mode doorbell
 
-Send as a bug report, not a patch series. The change we run locally is a debug
+Send as a bug report, not a patch series. The change carried locally is a debug
 knob, not an upstream-shaped fix, and the right fix is a question for the
-maintainer - see "What we are asking" below.
+maintainer - see "What I am asking" below.
 
 ## Why this is worth their time
 
-The device we tested is bound through an out-of-tree PCI ID patch (Qualcomm
+The device tested is bound through an out-of-tree PCI ID patch (Qualcomm
 vendor and subvendor, `0x17cb:0x0308` / `0x17cb:0x5201` - a GL.iNet variant of
 the RM520N-GL not in the upstream table). That has to be disclosed up front.
 
@@ -75,7 +75,7 @@ Channel 101 state from debugfs during the freeze:
 The host had gone a full lap of a 128-element ring and written the doorbell
 zero times. `db` still pointed where it had been one lap earlier.
 
-## Mechanism, as we read it
+## Mechanism, as I read it
 
 `MHI_CHANNEL_CONFIG_HW_UL`/`_HW_DL` set `.doorbell = MHI_DB_BRST_ENABLE` and
 `.doorbell_mode_switch = true`, so `parse_ch_cfg()` selects `mhi_db_brstmode()`
@@ -100,7 +100,7 @@ Two things re-arm `db_mode`:
 On this device the first never happens under load, and the second cannot,
 because the M0 transition only occurs on resume from M3 - and `mhi_queue()`
 takes a runtime-PM reference per queued buffer, so sustained traffic keeps the
-device out of M3 entirely. We measured the counters standing still for the whole
+device out of M3 entirely. I measured the counters standing still for the whole
 freeze.
 
 M2 is not an escape either: `states` reports **`M2: 0`** after 80 M0 and 79 M3
@@ -114,25 +114,25 @@ far enough for a suspend/resume cycle.
 
 ## Corroboration
 
-We could find nothing in `Documentation/mhi/` describing burst mode or the
+I could find nothing in `Documentation/mhi/` describing burst mode or the
 DB_MODE event at all. The closest thing to a specification is Qualcomm's own
 downstream device-tree binding, which documents `mhi,db-mode-switch` as:
 
     Must switch to doorbell mode whenever MHI M0 state transition happens.
 
 That is an independent statement that M0 transitions are the re-arm trigger,
-matching what we measured, and it describes no other host-side re-arm - the
+matching what I measured, and it describes no other host-side re-arm - the
 device is expected to ask.
 
 ## Upstream state
 
-We diffed the whole of `drivers/bus/mhi/host/` from 6.12.103 to mainline
+I diffed the whole of `drivers/bus/mhi/host/` from 6.12.103 to mainline
 master. There is no change touching `brstmode`, `db_mode`, `db_cfg` or the
 doorbell logic; the one `mhi_ring_chan_db()` change in `main.c` is the removal
 of the unrelated `pre_alloc`/auto-queue path. `MHI_CHANNEL_CONFIG_HW_UL`/`_DL`
 still use `MHI_DB_BRST_ENABLE` with `doorbell_mode_switch = true`.
 
-## What we run locally
+## What I run locally
 
 A module parameter on `mhi`, default off, that downgrades `MHI_DB_BRST_ENABLE`
 channels to `MHI_DB_BRST_DISABLE` in `parse_ch_cfg()` so the doorbell is written
@@ -140,24 +140,24 @@ unconditionally on every queued buffer. With it on, `db` tracks `wp` on every
 sample and the stalls stop; the box has held sustained 250+ Mbps in the band
 where it previously deadlocked. Cost is two MMIO writes per queued buffer.
 
-We are not proposing that as the fix. It is a bisection tool.
+I am not proposing that as the fix. It is a bisection tool.
 
-## What we are asking
+## What I am asking
 
   * Is `doorbell_mode_switch = true` correct for these HW channels on sdx6x
     devices, or inherited? `mhi_quectel_rm5xx_info` reuses
     `modem_quectel_em1xx_config`, which is the sdx24 configuration.
   * Is the device expected to emit `MHI_EV_CC_DB_MODE` under sustained load,
-    making this a modem firmware bug we should take to Quectel?
+    making this a modem firmware bug to take to Quectel?
   * If not, should the host re-arm on some condition other than an M0
     transition - for instance when a channel ring fills - or should these
     channels simply not use burst mode?
 
-We can test patches on the hardware.
+I can test patches on the hardware.
 
 ## Weakness to disclose
 
-The reverse direction has not been run. We have a clean capture of the deadlock
+The reverse direction has not been run. I have a clean capture of the deadlock
 with the workaround off, and sustained clean operation with it on, but not a
 controlled reproduction at matched throughput with it switched back off. A
 maintainer will reasonably ask for that, and it should be produced before

@@ -4,7 +4,7 @@
 # stop() only runs during a clean shutdown/reboot, so a missing marker on
 # the next boot means the box went down without one — panic, watchdog, or
 # power loss. That distinguishes a real crash from a deliberate reboot
-# (yours, or vjt's 5g-watchdog at_mute_reboot) without needing anyone
+# (mine, or vjt's 5g-watchdog at_mute_reboot) without needing anyone
 # present to observe it.
 #
 # The log lives in /root, which x3000/files-common/etc/sysupgrade.conf

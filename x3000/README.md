@@ -84,9 +84,9 @@ helpers alongside ModemManager:
    `--without-brotli` explicitly.
 
 A fifth problem — the modem's downlink stopping dead under sustained
-load — is fixed by a patch of our own rather than by anything inherited,
-so it lives with the other patches this fork adds. See **Patches we add
-on top of vjt's tree** in the repo-root `README.md`, and
+load — is fixed by a patch of my own rather than by anything inherited,
+so it lives with the other patches this fork adds. See **Patches and
+enhancements** in the repo-root `README.md`, and
 `x3000/docs/downlink-stall.md` for the capture and the analysis.
 
 One note on how that one is switched on, because it is build machinery
@@ -113,8 +113,8 @@ Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
 
 The kernel, driver and firewall patches this fork adds on top of those
-are listed in the repo-root `README.md` under **Patches we add on top of
-vjt's tree**, one entry each.
+are listed in the repo-root `README.md` under **Patches and
+enhancements**, one entry each.
 
 The build config drops a few things that upstream's GL-X3000 device
 recipe pulls in:
@@ -429,8 +429,8 @@ target/linux/generic/pending-6.12/
 target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
-target/linux/mediatek/patches-6.12/   Our kernel patches. Numbered 99x so
-                        they sort last and stay obviously ours. 992
+target/linux/mediatek/patches-6.12/   My kernel patches. Numbered 99x so
+                        they sort last and stay obviously mine. 992
                         applies after 991; the rest are independent.
 ├── 990-tcp-bbr3.patch                     BBRv3.
 ├── 991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
@@ -444,11 +444,11 @@ target/linux/mediatek/patches-6.12/   Our kernel patches. Numbered 99x so
 package/network/config/firewall4/patches/
 └── 001-flowtable-fall-back-to-l3-device.patch
                         Lets an L3-only interface, which is what
-                        ModemManager gives us, into the flow table.
+                        ModemManager produces, into the flow table.
 ```
 
-What each of those six does and why it is worth carrying: **Patches we
-add on top of vjt's tree** in the repo-root `README.md`. Where each lever
+What each of those six does and why it is worth carrying: **Patches and
+enhancements** in the repo-root `README.md`. Where each lever
 lives and how to confirm it in a running image:
 `x3000/docs/lean-overlay.md`.
 

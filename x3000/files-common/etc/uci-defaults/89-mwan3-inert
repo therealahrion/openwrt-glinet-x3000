@@ -18,7 +18,7 @@
 #      stanza unconditionally, without looking at interface state.
 #
 # On this box that combination is a trap. mwan3's stock config names `wan` and
-# `wanb`; our modem is `wwan`, so policy `balanced` has no member on the
+# `wanb`; the modem here is `wwan`, so policy `balanced` has no member on the
 # uplink that actually carries traffic. The default last resort is
 # `unreachable` (config_get last_resort "$1" last_resort unreachable), which
 # installs an `ip rule ... unreachable`, so IPv4 matching default_rule_v4 is

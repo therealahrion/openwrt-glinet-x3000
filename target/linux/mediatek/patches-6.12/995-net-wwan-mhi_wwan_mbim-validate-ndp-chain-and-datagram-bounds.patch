@@ -34,7 +34,7 @@ The three error paths now share mhi_mbim_rx_error(), which also replaces
 the open-coded counting on the existing unknown-protocol path.
 
 Provenance, because this matters for how long the patch lives here:
-these are upstream bugs, not ours, and fixes for two of them were posted
+these are upstream bugs, not mine, and fixes for two of them were posted
 to netdev on 2026-09-11 by Guanglei Zhu ("guard against a cyclic NDP
 chain" and "check skb_copy_bits() return value"), both tagged against
 commit aa730a9905b7 and copied to stable, with an earlier bounds-check
@@ -43,7 +43,7 @@ of 2026-09-12 none had been merged, and OpenWrt 25.12 is pinned to
 6.12.103, so the image needs its own copy in the meantime.
 
 That makes this patch a local carry with an expiry date, and it is NOT
-for submission - sending our own version of a fix already on the list
+for submission - sending a separate version of a fix already on the list
 would waste reviewer time. Drop it when the upstream versions reach
 6.12.y. The helper is named mhi_mbim_rx_error() rather than upstream's
 mhi_mbim_rx_drop() so that the collision is loud when that happens.

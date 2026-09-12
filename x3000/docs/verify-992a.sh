@@ -80,7 +80,7 @@ stop_traffic() {
 }
 start_traffic() {
 	[ "$WITH_TRAFFIC" = 1 ] || return
-	command -v wget >/dev/null 2>&1 || { info "no wget — drive traffic yourself"; return; }
+	command -v wget >/dev/null 2>&1 || { info "no wget — drive traffic by hand"; return; }
 	for u in ${TRAFFIC_URL:-} "https://proof.ovh.net/files/1Gb.dat"; do
 		[ -n "$u" ] || continue
 		_n=0
@@ -101,7 +101,7 @@ start_traffic() {
 		fi
 		stop_traffic
 	done
-	info "could not start a load generator — drive traffic yourself for steps 4, 6 and 8b"
+	info "could not start a load generator — drive traffic by hand for steps 4, 6 and 8b"
 }
 
 cleanup() {
@@ -139,7 +139,7 @@ fetch_objs
 hdr "0. identity"
 info "$(uname -srvm)"
 info "board: $(cat /tmp/sysinfo/model 2>/dev/null || echo unknown)"
-info "kernel build stamp: $(uname -v)   <- must match the HEAD you built from"
+info "kernel build stamp: $(uname -v)   <- must match the HEAD this was built from"
 for f in $D/xdp_pass.o $D/xdp_drop.o $D/tc_rawip.o; do
 	[ -s "$f" ] || bad "missing $f -- put the .bpf files in $BPF_DIR, or allow the router to reach $BPF_URL"
 done

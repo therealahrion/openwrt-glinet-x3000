@@ -6,9 +6,9 @@
 # interfaces.js, not guessed:
 #     packet_steering   0 = Disabled
 #                       1 = Enabled
-#                       2 = Enabled (all CPUs)      <- what we want
+#                       2 = Enabled (all CPUs)      <- the one to set
 #     steering_flows   '' = Standard: none
-#                     128 = Suggested: 128          <- what we want
+#                     128 = Suggested: 128          <- the one to set
 #                     256 = 256
 #
 # How they are consumed: /etc/init.d/packet_steering (START=25) reads

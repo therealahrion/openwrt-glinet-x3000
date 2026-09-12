@@ -1,8 +1,8 @@
 #!/bin/sh /etc/rc.common
 #
 # cake-wan — Phase-1 hand-driven cake shaper for the lean image (no sqm,
-# no qosify). NOT installed by apply.sh: the lever stays OFF until you
-# choose to pull it. To use, after baselining (Waveform bufferbloat +
+# no qosify). NOT installed by apply.sh: the lever stays OFF until it is
+# pulled by hand. To use, after baselining (Waveform bufferbloat +
 # a game session) with NO shaper:
 #
 #   scp cake-wan.init root@router:/etc/init.d/cake-wan
@@ -25,14 +25,14 @@
 #   * ack-filter on egress helps an asymmetric uplink; 'ingress' on the
 #     ifb side tells cake it is shaping the far end of the bottleneck.
 #   * diffserv3 (default) honours DSCP for game/voice marks; besteffort
-#     if you find the carrier remarks everything anyway.
+#     if the carrier remarks everything anyway.
 
 START=99
 STOP=10
 
 WAN="wwan0"
-UP_KBIT="20000"        # <-- set: ~0.9 x your measured upload kbit/s
-DOWN_KBIT="250000"     # <-- set: ~0.9 x your measured download kbit/s
+UP_KBIT="20000"        # <-- set: ~0.9 x measured upload kbit/s
+DOWN_KBIT="250000"     # <-- set: ~0.9 x measured download kbit/s
 IFB="ifb4${WAN}"
 EGRESS_OPTS="nat dual-srchost ack-filter"
 INGRESS_OPTS="nat dual-dsthost ingress"

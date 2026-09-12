@@ -30,7 +30,7 @@ only fix their own problems:
 
 Two iron laws follow. **A router cannot choose congestion control for
 traffic it forwards** — BBR/TSQ/pacing on the X3000 affect only the router's
-own connections (speedtests, its downloads), never your PC's game traffic.
+own connections (speedtests, its downloads), never a LAN client's game traffic.
 And **an endpoint cannot fix a bloated bottleneck it doesn't own** — which
 is why the middlebox layer (cake + autorate) is where a 5G router earns its
 keep.
@@ -108,7 +108,7 @@ eBPF-imposed ceiling; composes fine, still endpoint-land.
 ### eBPF + EDT (Cilium-style bandwidth management)
 The tc-eBPF program stamps `skb->tstamp` (`bpf_skb_set_tstamp`) and `sch_fq`
 enforces the schedule — how Kubernetes/Cilium shape pod egress without HTB.
-On this router you *could* reproduce it (tc-bpf + sch_fq + BTF all baked)
+On this router it *could* be reproduced (tc-bpf + sch_fq + BTF all baked)
 — a great learning lab — but for forwarded WAN traffic it amounts to
 rebuilding cake's shaper minus its AQM and fairness. **Verdict: excellent
 experiment, wrong tool for the 5G latency job.**
@@ -130,7 +130,7 @@ upstream. None of it is in this 6.12 kernel or the 25.12 feeds — BUT the
 L4S team maintains a dedicated **`l4steam-6.12.y` branch**
 ([L4STeam/linux](https://github.com/L4STeam/linux), tracked by
 [phoepsilonix/linux-l4s](https://github.com/phoepsilonix/linux-l4s)) with
-Prague + dualpi2 + AccECN on our exact kernel series, with prebuilt
+Prague + dualpi2 + AccECN on this exact kernel series, with prebuilt
 releases. Extracting that branch's diff into `target/linux/generic`
 patches is a real, maintained backport path — the heaviest of the bunch
 (core TCP + ECN + qdisc), but existing, not hypothetical. Notably, with
@@ -149,8 +149,8 @@ the bottleneck it CE-marks with RFC 3168 semantics, which L4S ECT(1) flows
 interpret aggressively; if L4S traffic matters on this link, the pragmatic
 posture is to shape (bufferbloat control) and observe, and revisit when
 DualPI2 reaches an OpenWrt kernel. A 6.12 **backport of the dualpi2 qdisc
-is feasible** (self-contained scheduler) if we ever want the router itself
-to be an L4S bottleneck — flagged as a future project.
+is feasible** (self-contained scheduler) if the router itself ever has to be
+an L4S bottleneck — flagged as a future project.
 
 ### AQM alternatives in the feeds
 `kmod-sched-pie` and `kmod-sched-fq-pie` (RFC 8033 PIE — the DOCSIS AQM)
@@ -200,14 +200,14 @@ freshly flashed image with both aboard starts them inert. The only
 bake-time exclusivities in this whole space, all already handled:
 
 1. **Same-binary variants** — `tc-tiny` vs `tc-bpf` vs `tc-full` (one
-   `tc` binary; we bake tc-bpf), and the old uqmi/qmi-wwan vs QModem
+   `tc` binary; this build bakes tc-bpf), and the old uqmi/qmi-wwan vs QModem
    pair (unset long ago). Resolved.
 2. **Patch-level replacements** — the BBRv3 backport *replaces*
    `tcp_bbr.c` in place; v1 and v3 cannot coexist in one kernel. This one
    **is applied** (`990-tcp-bbr3.patch`, 2026-09-04) — a deliberate
    replacement, not a conflict. The other source patches (DualPI2, Prague,
    AccECN, BORE, sched_ext flip) are additive, but any of them changes the
-   kernel you ship — they're rebuild decisions, not package adds. Not
+   kernel being shipped — they're rebuild decisions, not package adds. Not
    applied.
 3. That's it. Nothing else conflicts at bake time.
 
@@ -294,7 +294,7 @@ candidate for the 9950X3D desktop instead.**
 **BORE** ([firelzrd/bore-scheduler](https://github.com/firelzrd/bore-scheduler)):
 burstiness-based EEVDF tweak for desktop responsiveness. Verified: a
 maintained `stable/linux-6.12-bore` patch series exists (pinned at
-6.12.37 vs our 6.12.103 — would need an apply-test/minor rebase), pure
+6.12.37 vs this tree's 6.12.103 — would need an apply-test/minor rebase), pure
 arch-agnostic kernel-sched code, so **backportable in form**. Dismissed
 on merit for the router: it improves interactive-task scheduling under
 desktop load, which a headless router has none of, and the packet path
@@ -457,16 +457,16 @@ already documented above (RPS/affinity/threaded-NAPI vs offload-vs-cake).
 
 ### GitHub-ecosystem sweep (2026-09-05)
 
-Checked the out-of-tree fork/feed ecosystem for MT7981 optimizations we
-might be missing. Method: directory-diffed ImmortalWrt's
+Checked the out-of-tree fork/feed ecosystem for MT7981 optimizations this
+tree might be missing. Method: directory-diffed ImmortalWrt's
 `openwrt-25.12` branch (same kernel 6.12) against this tree, patch by
 patch, plus the MediaTek vendor feed.
 
-* **ImmortalWrt 25.12 vs us, `target/linux/mediatek/patches-6.12`:**
+* **ImmortalWrt 25.12 vs this tree, `target/linux/mediatek/patches-6.12`:**
   their entire delta is 2 SPI-NAND flash-chip patches + 1 Realtek PHY
   LED patch — zero performance patches. Generic
   hack/pending/backport-6.12 deltas: cpuinfo cosmetics, Motorcomm
-  PHY/ethernet drivers (hardware we don't have), regulator infra —
+  PHY/ethernet drivers (hardware this board does not have), regulator infra —
   zero datapath. Meanwhile WE carry `990-tcp-bbr3.patch`, which they
   don't: this tree is *ahead* of the flagship optimization fork.
 * **The one real find — fullcone NAT** (`fullconenat` /

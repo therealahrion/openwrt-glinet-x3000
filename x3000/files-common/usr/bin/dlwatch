@@ -45,8 +45,8 @@
 #             a refill once free descriptors reach half the queue, so the ring
 #             drains to ~64 posted before being topped back up. Values hovering
 #             near 0 would mean the host could not post fast enough, which
-#             would make the stall ours. Measured 2026-09-09: a clean sawtooth
-#             with a floor of 65-72, i.e. never starved.
+#             would make the stall host-side. Measured 2026-09-09: a clean
+#             sawtooth with a floor of 65-72, i.e. never starved.
 #   dl_free   127 - dl_qd, i.e. what mhi_get_free_desc_count() returns.
 #   er3_bk    unprocessed entries in the downlink completion ring, out of 1024.
 #             mhi_ev_task() drains that ring with no budget (event_quota is

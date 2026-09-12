@@ -60,7 +60,7 @@ clang 18 / libbpf 1.3 / iproute2 6.1. On-hardware results are labelled as such.
 
 ---
 
-## 0. Two corrections to what I told you earlier
+## 0. Two corrections to earlier claims
 
 **I was wrong about the blocker for XDP_REDIRECT on `wwan0`.**
 I said it needed a one-line `EXPORT_SYMBOL_GPL(xdp_do_generic_redirect)` kernel
@@ -71,7 +71,7 @@ the `XDP_TX` path and its own `bpf_net_context` — **is already exported**:
 net/core/dev.c:5301:  EXPORT_SYMBOL_GPL(do_xdp_generic);
 ```
 
-and `drivers/net/tun.c` calls it from a driver in exactly the shape we'd need
+and `drivers/net/tun.c` calls it from a driver in exactly the shape needed
 (tun.c:1929 and tun.c:2529 - the second was cited as 2523 here until 2026-09-12,
 which is `eth_type_trans()`, six lines short). I was looking one level too deep in
 the call chain and stopped at the first unexported symbol.
@@ -86,10 +86,10 @@ net/core/dev.c:9457:  return dev->netdev_ops->ndo_bpf ? XDP_MODE_DRV : XDP_MODE_
 Pristine `mhi_wwan_mbim.c` has **0** `ndo_bpf` references; 991 has **0**; 992
 adds **6**. So before 992, an attach with no mode flag went to `XDP_MODE_SKB`
 (full generic XDP, redirect and AF_XDP included). After 992 it goes to
-`XDP_MODE_DRV` — our hand-rolled hook, which advertises `NETDEV_XDP_ACT_BASIC`
+`XDP_MODE_DRV` — the hand-rolled hook, which advertises `NETDEV_XDP_ACT_BASIC`
 and refuses `XDP_REDIRECT`. Verified at runtime (test C5 below).
 
-That is the whole story of the crash you hit: `xdp-loader load wwan0` installed
+That is the whole story of the crash: `xdp-loader load wwan0` installed
 libxdp's `xsk_def_prog`, 992's `ndo_bpf` captured it into native mode, the
 program called `bpf_redirect_map()` from the MHI tasklet, and there was no
 `bpf_net_context`. The `bpf_net_context` fix stopped the oops; the redirect
@@ -238,7 +238,7 @@ Two things the implementation has to get right that aren't obvious:
   `ri->map_type`, `ri->tgt_index` and `ri->tgt_value` live in it. Clearing it
   right after `bpf_prog_run_xdp()`, which is what 992 does today, throws the
   verdict away.
-- `xdp_do_flush()` must be called before clearing the context. We're not inside
+- `xdp_do_flush()` must be called before clearing the context. This is not inside
   `net_rx_action()`, so nothing else will drain the devmap/cpumap/xsk bulk queues
   this redirect just appended to.
 
@@ -288,7 +288,7 @@ ETHER-MISPARSE h_proto=a09 (not IPv4) -> bailing
 ```
 
 `0x0a09` is the first two octets of the source address `10.9.9.1`, read as an
-EtherType. Every packet looks like "not IPv4" and sails through unfiltered. Your
+EtherType. Every packet looks like "not IPv4" and sails through unfiltered. The
 `config.common` comment on `xdp-filter` ("It parses an Ethernet header, so it
 belongs on the eth LAN/WAN ports, not the raw-IP wwan0 modem netdev") is exactly
 right, and now demonstrated rather than inferred.
@@ -355,8 +355,8 @@ returns `-EOPNOTSUPP` otherwise (line 227). `wwan0` is not one of those.
 
 ## 6. The one kernel hook that *does* tie nft-offload to XDP
 
-You asked whether there's a specific hook inside `kmod-nft-offload` or the kernel
-that makes hardware/software offload reachable from BPF. There is exactly one:
+There is exactly one hook inside `kmod-nft-offload` or the kernel that makes
+hardware/software offload reachable from BPF:
 
 ```
 net/netfilter/nf_flow_table_bpf.c:59
@@ -386,7 +386,7 @@ Build gating, `net/netfilter/Makefile`:
 The device→flowtable registration (`nf_flow_table_xdp.o`) is unconditional. Only
 the **kfunc** needs BTF.
 
-**Your build already has it.** `x3000/config.common` sets
+**This build already has it.** `x3000/config.common` sets
 `CONFIG_KERNEL_DEBUG_INFO_BTF=y` and `CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y`
 (lines 203–204), and `kmod-nft-offload` → `kmod-nf-flow` makes `NF_FLOW_TABLE` a
 module, so `_BTF_MODULES` is the gate that applies. `bpf_xdp_flow_lookup()` will
@@ -552,7 +552,7 @@ It degrades on its own in two places:
   path.
 
 **So "Hardware flow offloading" already means "software, plus hardware for the
-flows the hardware will take."** Choosing it never costs you the software path.
+flows the hardware will take."** Choosing it never costs the software path.
 
 ### 10.1 On this box, hardware offload cannot touch the traffic that matters
 
@@ -628,8 +628,8 @@ into the XDP map. There is no partial mode and no fallback - the check is at the
 top of the setup function and it returns.
 
 On this board that trade is strictly bad: hardware offload cannot carry
-LAN-to-`wwan0` at all (10.1), so you would be giving up the only kernel hook that
-lets an XDP program consult the flowtable in exchange for nothing. **Leave the
+LAN-to-`wwan0` at all (10.1), so it gives up the only kernel hook that lets an
+XDP program consult the flowtable in exchange for nothing. **Leave the
 dropdown on Software flow offloading.**
 
 That also corrects the ordering intuition. The flowtable's own hook runs at
@@ -913,7 +913,7 @@ Caveats worth stating plainly. RPS hashes per flow, so one big TCP stream moves
 to one other core rather than spreading; on a dual-core A53 that still splits
 IRQ plus GRO on CPU0 from stack processing on CPU1, which is the useful split.
 It costs an IPI per batch, so at low rates it is a small loss. And the captures
-we have showed both CPUs at 0-6 percent during the stall, so **this box has not
+on hand showed both CPUs at 0-6 percent during the stall, so **this box has not
 yet been shown to be CPU-bound at all** - which makes RPS a lever to test at
 250+ Mbps, not a known win. Measure `cpu0_busy`/`cpu0_si` in `dlwatch` with it
 off and on before keeping it.
@@ -1165,7 +1165,7 @@ third.
   fast path available now.
 - **The software flowtable now covers `wwan0`** (section 10.3). It skips
   conntrack re-lookup and the filter/nat/mangle chains at `nf_ingress`, and -
-  unlike an XDP redirect - it does the NAT for you, because it *is* netfilter.
+  unlike an XDP redirect - it does the NAT itself, because it *is* netfilter.
 
 ### 15.4 The measurement that is missing
 
@@ -1176,13 +1176,13 @@ third.
 > identified as the problem. Do not re-run it as written.
 
 Everything above is optimising a bottleneck nobody has demonstrated. Every
-capture we have shows both CPUs at 0-6 percent, including during the 43-second
+capture taken shows both CPUs at 0-6 percent, including during the 43-second
 deadlock at full downlink rate. The box has never been shown to be CPU-bound.
 
 So the order is: measure first. #98 (RPS) is a one-line sysfs write that shows
 whether moving work off CPU0 changes anything at all. If it does not, the whole
 XDP fast-path line of work is solving a problem this hardware does not have, and
-#101 and #102 should stay parked. If it does, that same measurement tells us how
+#101 and #102 should stay parked. If it does, that same measurement says how
 much headroom is actually on the table and whether it justifies a driver patch
 plus a NAT-rewriting BPF program.
 
@@ -1430,8 +1430,8 @@ modem - it is exactly why 992 keeps the program on `link->xdp_prog` instead of
 `dev->xdp_prog` - and on a wifi netdev there is no equivalent dodge available,
 because there is no driver hook to own the pointer.
 
-Net: on wireless you pay a certain, measurable loss (GRO and LRO) to buy a hook
-that runs after every expensive thing has already happened. There is no version
+Net: on wireless a certain, measurable loss (GRO and LRO) buys a hook that runs
+after every expensive thing has already happened. There is no version
 of this that pays.
 
 ### 17.2 Every generic-XDP redirect bypasses the qdisc, and tc ingress
@@ -2063,8 +2063,8 @@ leaves cake behind, on `wwan0` and on the wired ports alike.
 the stronger one.** `lean-overlay.md`'s 992 row has recorded since 2026-09-09 that
 attaching the same program with `xdpgeneric` measures **1.00x aggregation against
 24.8x detached**. The 2026-09-11 run reproduced it at a lower link rate: 1.06x
-against 2.20x. Both are the same phenomenon; quote whichever matches the rate you
-can demonstrate.
+against 2.20x. Both are the same phenomenon; quote whichever matches the rate
+being demonstrated.
 
 That pair also settles a question 18.5 left open. A 24.8x reading is arithmetically
 comfortable - about 34.7 KB per delivered skb against a 65536 ceiling - so
@@ -2081,7 +2081,7 @@ alongside it, but the rate-scaling behaviour itself is no longer in doubt.
    ports is genuinely pre-skb and on `wwan0` is 992's hook.
 2. **A drop is the only verdict that is free.** `XDP_PASS` keeps everything;
    `XDP_DROP` additionally skips the skb, the stack and RPS. `XDP_TX` and
-   `XDP_REDIRECT` both cost you the shaper.
+   `XDP_REDIRECT` both cost the shaper.
 3. **The flowtable kfunc is reachable from `wwan0` and not from the wired ports.**
    That is the opposite of where the pre-skb saving is, which is why no
    flow-aware fastpath fits this hardware (16.4).

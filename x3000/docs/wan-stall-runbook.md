@@ -30,7 +30,7 @@ If the router is affected too:
 | what the columns show | what it means |
 |---|---|
 | `dl_db` frozen while `dl_wp` keeps moving, `irq91` flat | the burst-mode doorbell case; 993 is the fix |
-| `dl_qd` collapsing toward 0 | host ran out of RX buffers, which would make it ours |
+| `dl_qd` collapsing toward 0 | host ran out of RX buffers, which would make it mine |
 | RSRP or SINR falling apart in `5g-info` | the radio; no code change helps |
 | `er3_bk` climbing toward 1023 | the event drain loop fell behind |
 
@@ -54,8 +54,8 @@ Corrected 2026-09-12; this page previously said to turn it on, which was true
 only before it was baked in.
 
 Changing it either way requires an unbind/bind, and that re-initialises the MHI
-channels - which clears a doorbell deadlock by itself. Whatever you did would
-look like the fix.
+channels - which clears a doorbell deadlock by itself. Whatever was done
+would look like the fix.
 
 Check what it is set to:
 
@@ -87,8 +87,8 @@ Their logs still live in `/tmp` and are still lost on reboot - only the tools
 are permanent.
 
 `kptr_restrict` matters: without it the driver's ring pointers print as hashes
-and `dl_qd`/`dl_free` record -1 for the whole run. If you are on an image
-predating the sysctl file, set it by hand first with
+and `dl_qd`/`dl_free` record -1 for the whole run. On an image predating the
+sysctl file, set it by hand first with
 `sysctl -w kernel.kptr_restrict=1`.
 
 Confirm the recorders took, since a failed start is silent in the background:

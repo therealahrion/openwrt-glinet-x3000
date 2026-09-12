@@ -29,8 +29,8 @@
 # been given and has not filled. It splits the two faults that look identical
 # from outside the kernel:
 #
-#   dl_out near 0        the host ran out of buffers to post - our problem,
-#                        in mhi_net_rx_refill_work
+#   dl_out near 0        the host ran out of buffers to post - a host-side
+#                        fault, in mhi_net_rx_refill_work
 #   dl_out high, frozen  the modem has somewhere to write and is not writing -
 #                        below the driver, nothing above MHI can be at fault
 #
