@@ -1517,10 +1517,15 @@ of an earlier session.
 
 ### 18.1 The rig
 
-Hand-compiled BPF objects were the original plan and never arrived - base64
-pasted through `ttyd` decoded to zero bytes, which `libxdp` reports as the
-misleading `BPF object format invalid`. The objects themselves were fine; libbpf
-1.3 opened them off-box.
+Hand-compiled BPF objects were the original plan and never arrived. The cause
+was not the paste, as first assumed: **busybox on this image has no `base64`
+applet**. `base64 -d > file <<EOF` then creates the empty file anyway and the
+"not found" error scrolls past, so the objects were zero bytes and `libxdp`
+reported the misleading `BPF object format invalid`. The objects themselves were
+fine - libbpf 1.3 opened them off-box. `x3000/docs/verify-992a.sh` had already
+documented this and says so in its own header: *"OpenWrt's busybox ships without
+the base64 applet, so a base64 blob in this script cannot be decoded on the
+router."* Confirmed on the box: `command -v base64` finds nothing.
 
 `xdp-tools` on this image ships `xdp-filter`, so no compiler or transfer is
 needed:
@@ -1806,3 +1811,119 @@ number in sections 0-17.
 citations in sections 0-4; `netdevsim/netdev.c:629` and `nfp_net_common.c:2768`;
 `nf_flow_table_offload.c:1195`; `mtk_eth_soc.c:3466-3475`; `gro_cells.c:23` and
 `:28`. Re-find these by symbol before citing them.
+
+## 20. Hardware audit of 990-993 and the BPF platform, 2026-09-11
+
+Prompted by a reasonable worry that the kernel patches might be wrong. They are
+not. Every item below is **measured on the running box** or read from the
+prepared source that was compiled, not from an earlier session's notes.
+
+### 20.1 All four patches applied
+
+Signature strings that exist only if the patch landed, grepped in
+`build_dir/.../linux-6.12.103`:
+
+| patch | signature | hits |
+|---|---|---|
+| 990 | `MODULE_VERSION(__stringify(BBR_VERSION))` in `net/ipv4/tcp_bbr.c` | 1 |
+| 990 | `bbr_version` in `include/uapi/linux/inet_diag.h` | 1 |
+| 991 | `select GRO_CELLS` in `drivers/net/wwan/Kconfig` | 1 |
+| 991 | `gro_cells_receive(&link->gcells` in `mhi_wwan_mbim.c` | 1 |
+| 992 | `mhi_mbim_ndo_bpf` | 2 (definition + `.ndo_bpf =`) |
+| 992 | `xdp_set_features_flag` | 1 |
+| 993 | `force_db_brst_disable` in `drivers/bus/mhi/host/init.c` | 4 |
+
+### 20.2 990 is BBRv3, proven from the module's own BTF
+
+`modinfo tcp_bbr` shows no `version:` field, which looked like a failure and is
+not: `CONFIG_MODULE_STRIPPED=y` and `# CONFIG_MODULE_SRCVERSION_ALL is not set`,
+so OpenWrt strips `version`, `srcversion`, `author` and `description` from every
+module while keeping `vermagic`, `name`, `intree`, `license` and `depends`. That
+also explains the absent `srcversion` on `mhi_wwan_mbim`.
+
+`DEBUG_INFO_BTF_MODULES=y` gives a better proof.
+`bpftool btf dump file /sys/kernel/btf/tcp_bbr format c` prints a `struct bbr`
+carrying `bw_hi[2]`, `bw_lo`, `bw_latest`, `inflight_hi`, `inflight_lo`,
+`inflight_latest`, `undo_bw_lo`, `undo_inflight_lo`, `undo_inflight_hi`,
+`bw_probe_up_cnt`, `bw_probe_up_acks`, `bw_probe_up_rounds`, `bw_probe_samples`,
+`probe_wait_us`, `loss_round_start`, `loss_round_delivered`,
+`loss_events_in_round`, `ack_phase`, `ecn_alpha`, `startup_ecn_rounds` and
+`struct tcp_plb_state plb`. All are v3-only, and PLB does not exist in v1.
+
+What is **absent** is equally decisive: no `struct minmax bw`, no `rtt_cnt`, no
+`lt_is_sampling` / `lt_rtt_cnt` / `lt_use_bw` / `lt_bw` / `lt_last_*`, no
+`packet_conservation` - the long-term bandwidth sampling machinery BBRv3 removed.
+`mode` and `cycle_idx` are also narrowed to 2 bits from v1's 3.
+
+Selected and active: `net.ipv4.tcp_congestion_control = bbr`, available list
+`reno cubic bbr`, pinned by `/etc/sysctl.d/12-tcp-bbr.conf`. Module is 20,712
+bytes, about half again what v1 measures on this architecture.
+
+### 20.3 991 and 992 verified end to end by the repo's own verifier
+
+`x3000/docs/verify-992a.sh --traffic`: **PASS=25, FAIL=0, skipped=3.** The skips
+are the optional `--with-drop` and `--with-tc` paths, plus "this iproute2 does
+not print xdp-features", which is a tooling limitation and explains why
+`ip -d link show wwan0` lists no `xdpfeatures` line.
+
+| test | result |
+|---|---|
+| `bpf_xdp_flow_lookup` kfunc present | yes - BTF gates it and it compiled |
+| GRO baseline, no program attached | **2.09x** aggregation on `wwan0` |
+| attach `xdp_pass` in DRV mode | succeeded, `prog/xdp id 288` - 992's `ndo_bpf` took it |
+| **GRO survives the attach** | **2.12x vs 2.09x baseline** |
+| `rx_errors` while attached | steady at 0 |
+| detach | clean |
+| AF_XDP oops path | no `dmesg-ramoops-*` in `/sys/fs/pstore/` |
+
+The GRO-survives-attach result is the one worth keeping. 992 deliberately stores
+the program on `link->xdp_prog` rather than `dev->xdp_prog` so that
+`netif_elide_gro()` never sees it - 16.1 and 18.4 explain the mechanism, and this
+measures the outcome. Had it been stored on `dev->xdp_prog`, aggregation would
+have collapsed to 1.0x on attach.
+
+### 20.4 993 is live and firing
+
+`/sys/module/mhi/parameters/force_db_brst_disable` exists and reads `Y`, and the
+kernel log shows it taking effect on both MBIM channels:
+
+    mhi-pci-generic 0000:01:00.0: ch100 IP_HW0_MBIM: forcing doorbell writes
+    mhi-pci-generic 0000:01:00.0: ch101 IP_HW0_MBIM: forcing doorbell writes
+
+The patch's own default is 0, so something must set it. It is
+`/etc/modules.d/mhi-doorbell` line 30, `mhi force_db_brst_disable=1`, and that
+file is tracked at `x3000/files-common/etc/modules.d/mhi-doorbell` - so it is
+baked into the image and survives sysupgrade rather than being a local edit.
+
+### 20.5 The platform, as shipped
+
+Every kernel symbol the overlay claims, read from `/proc/config.gz` on the box:
+`BPF`, `BPF_SYSCALL`, `BPF_JIT`, `BPF_JIT_DEFAULT_ON`, `BPF_EVENTS`,
+`BPF_UNPRIV_DEFAULT_OFF`, `CGROUP_BPF`, `DEBUG_INFO_BTF`,
+`DEBUG_INFO_BTF_MODULES`, `GRO_CELLS`, `IKCONFIG`, `IKCONFIG_PROC`, `KPROBES`,
+`PERF_EVENTS`, `NET_SCH_CAKE=m`, `NET_ACT_BPF=m`, `NET_CLS_BPF=m`,
+`NF_FLOW_TABLE=m`, `NF_FLOW_TABLE_INET=m`, `NFT_FLOW_OFFLOAD=m`,
+`TCP_CONG_BBR=m`, `XDP_SOCKETS=y`, `XDP_SOCKETS_DIAG=m`, `PAGE_POOL=y`,
+`ZRAM=m`, `ZRAM_BACKEND_{LZO,LZ4,ZSTD}=y`, `ZRAM_DEF_COMP="lzo-rle"`.
+
+All thirteen userland packages present: `xdp-filter`, `xdp-loader`, `xdpdump`,
+`bpftool-full`, `libbpf`, `tc-bpf`, `irqbalance`, `zram-swap`, `mwan3`,
+`luci-app-mwan3`, `kmod-tcp-bbr`, `kmod-zram`, `kmod-nft-offload`.
+
+Both working trees clean, both tracking
+`github.com/therealahrion/openwrt-glinet-x3000`.
+
+### 20.6 Things this audit corrected
+
+- The zero-byte BPF objects were busybox lacking `base64`, not a paste failure
+  (18.1, now fixed).
+- `/sys/class/net/wwan0/threaded` reads 0. 991 gives `wwan0` real NAPI instances
+  through gro_cells, which is what makes the `threaded` control meaningful at all
+  - it does not turn threading on. Measured: `napi/mtk_eth-5`, `napi/mtk_eth-6`
+  and six `napi/phy0-*` threads exist; there is no `napi/wwan0-*`.
+- `napi/mtk_eth-5` **and** `-6` both exist, confirming 18.4's reading that the
+  driver registers one NAPI per direction on `eth->dummy_dev`.
+- The eBPF suite dropped on 2026-09-07 is recoverable: `git log --all --
+  x3000/ebpf` returns `2c45f07780` (creation) and `654de33149` (package
+  conversion, which *was* applied and later dropped). Sources are at
+  `git show 654de33149:package/x3000-ebpf/src/`.
