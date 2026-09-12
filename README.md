@@ -11,10 +11,9 @@ data plane.
 This is [therealahrion's fork](https://github.com/therealahrion/openwrt-glinet-x3000)
 of [vjt/openwrt-glinet-x3000](https://github.com/vjt/openwrt-glinet-x3000).
 It keeps vjt's tree and modem stack as they are and adds a lean
-optimization layer on top: a handful of kernel, driver and firewall
-patches (listed under **[Patches and Enhancements](#patches-and-enhancements)**
-below), an eBPF/XDP/BTF platform with the cake/bpf qdisc kmods and tools,
-PREEMPT_DYNAMIC + IKCONFIG, TCP/qdisc sysctl baselines, WireGuard —
+optimization layer on top: six patches, a set of kernel build options, and
+the packages and first-boot defaults that go with them — all of it listed
+under **[Patches and Enhancements](#patches-and-enhancements)** below, and
 nothing else. What, why and how to verify:
 [`x3000/docs/lean-overlay.md`](x3000/docs/lean-overlay.md). Images build
 from the [Build X3000 image workflow](../../actions/workflows/x3000-image.yml)
@@ -41,11 +40,14 @@ cd openwrt-glinet-x3000
 
 ## Patches and Enhancements
 
-Six patches that neither vjt's tree nor upstream OpenWrt has. **My Patches**
-is what I wrote; **Additional Patches** is everything carried in from
-somewhere else. The modem-enablement patches vjt's fork already has are a
-separate set, described in [`x3000/README.md`](x3000/README.md). Where each
-of these sits in the build and how to confirm it in a running image:
+Everything this fork adds that neither vjt's tree nor upstream OpenWrt has.
+**My Patches** is what I wrote, **Additional Patches** is what I carried in
+from somewhere else, and **Enhancements** is the rest: kernel build options,
+packages and first-boot defaults, grouped by what they give the box rather
+than listed symbol by symbol. The modem-enablement patches and package
+choices vjt's fork already has are a separate set, described in
+[`x3000/README.md`](x3000/README.md). Where each of these sits in the build
+and how to read its state on a running router:
 [`x3000/docs/lean-overlay.md`](x3000/docs/lean-overlay.md).
 
 ### My Patches
@@ -194,6 +196,196 @@ of these sits in the build and how to confirm it in a running image:
                       - <a href="https://lore.kernel.org/r/20260911021734.1396599-1-zhugl3@xiaopeng.com">netdev v2 1/3: guard against a cyclic NDP chain</a>
                       - <a href="https://lore.kernel.org/r/20260911021734.1396599-2-zhugl3@xiaopeng.com">netdev v2 2/3: check skb_copy_bits() return value</a>
                       - <a href="x3000/docs/992-upstream-submission.md">x3000/docs/992-upstream-submission.md</a>
+  </pre>
+
+### Enhancements
+
+* **eBPF, XDP and BTF platform**
+  `x3000/config.common`
+
+  <pre>
+  Description:    Kernel BTF plus the XDP and tc-BPF userspace, so eBPF
+                  programs can be built, loaded and inspected on the router
+                  itself. Adds DEBUG_INFO, DEBUG_INFO_BTF, BTF_MODULES,
+                  XDP_SOCKETS, BPF_EVENTS, CGROUP_BPF, KPROBES and
+                  PERF_EVENTS to the kernel, and bpftool-full, libbpf,
+                  tc-bpf, xdp-loader, xdpdump, xdp-filter, kmod-sched-bpf
+                  and kmod-xdp-sockets-diag to the image.
+  Benefit(s):     Portable eBPF binaries run unmodified here instead of
+                  being cross-compiled against a matching kernel
+                  elsewhere, and 992's XDP hook has something to attach.
+  Impact(s):      Debug info has to stay un-reduced for BTF to build, which
+                  costs image size. Kernel modules are tied to this exact
+                  build, so they are baked in rather than installable
+                  afterwards.
+  Limitation(s):  xdp-filter parses an Ethernet header, so it belongs on
+                  the wired ports rather than the raw-IP wwan0.
+  Attribution(s): Mine. Every method tried and what each one measured:
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+  </pre>
+
+* **Queue management and TCP baselines**
+  `x3000/config.common`, `x3000/files-common/etc/sysctl.d/`
+
+  <pre>
+  Description:    cake and the rest of the qdisc set (kmod-sched-core,
+                  kmod-sched, kmod-sched-cake, kmod-ifb) with full tc from
+                  tc-bpf, plus bash and fping so cake-autorate can be
+                  dropped in after flashing. Three sysctl files pin
+                  fq_codel as the default qdisc and turn on SACK and DSACK.
+  Benefit(s):     Everything needed to shape the 5G WAN is already in the
+                  image, which matters because these modules cannot be
+                  added later.
+  Impact(s):      sqm-scripts, luci-app-sqm, qosify and tc-tiny are kept
+                  out on purpose, so there is one unambiguous tc binary and
+                  nothing competing with a hand-driven setup.
+  Limitation(s):  No shaper is installed or running. cake-wan.init is a
+                  reference to copy and fill in, and the sysctl settings
+                  reach only connections the router itself opens, never a
+                  client's forwarded traffic.
+  Attribution(s): Mine. The reference shaper and the research behind it:
+                      - <a href="x3000/docs/cake-wan.init">x3000/docs/cake-wan.init</a>
+                      - <a href="x3000/docs/qos-latency-research.md">x3000/docs/qos-latency-research.md</a>
+  </pre>
+
+* **Software flow offload**
+  `x3000/files-common/etc/uci-defaults/96-flow-offload`
+
+  <pre>
+  Description:    kmod-nft-offload provides the software flowtable fast
+                  path, and a first-boot script switches it on unless
+                  something has already set it either way.
+  Benefit(s):     Established LAN-to-internet flows skip the conntrack
+                  re-lookup and the filter, nat and mangle chains. Both of
+                  its transmit paths still end in the normal transmit call,
+                  so a cake shaper keeps working.
+  Impact(s):      On by default. The firewall config survives sysupgrade,
+                  so the running state is whatever was last set - read it
+                  rather than assume it. Hardware offload stays off on
+                  purpose: turning it on would disable the flowtable lookup
+                  helper that XDP programs use, and MediaTek's engine
+                  cannot reach wwan0 anyway.
+  Limitation(s):  An offloaded flow is invisible to per-packet firewall
+                  rules, so the two cannot cover the same traffic. wwan0
+                  only joins the flowtable at all because of the firewall4
+                  patch above.
+  Attribution(s): Mine. The interaction matrix, sections 10.1 to 10.3:
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+  </pre>
+
+* **Preemption model and running-config introspection**
+  `target/linux/mediatek/filogic/config-6.12`
+
+  <pre>
+  Description:    Three kernel symbols that are not menu-exposed, so they
+                  are appended to the subtarget config rather than set in
+                  config.common: PREEMPT_DYNAMIC, IKCONFIG and
+                  IKCONFIG_PROC. PCI_DEBUG is turned back off.
+  Benefit(s):     The preemption model becomes a boot-time choice instead
+                  of a rebuild, and /proc/config.gz lets a running router
+                  answer what it was built with - which is how every
+                  config claim about this image gets checked on the box.
+  Impact(s):      Boots the same way as before, so nothing changes until
+                  the preempt option is passed. PCI_DEBUG only ever added
+                  log noise.
+  Limitation(s):  Whether a different preemption model helps here has not
+                  been measured.
+  Attribution(s): Mine. Inventory row and the on-box check:
+                      - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
+  </pre>
+
+* **WireGuard**
+  `x3000/config.common`
+
+  <pre>
+  Description:    kmod-wireguard with the userland tools and the LuCI
+                  protocol page.
+  Benefit(s):     A tunnel can be set up from the command line or the web
+                  interface with no rebuild, and the kernel module picks up
+                  the aarch64 NEON crypto automatically.
+  Impact(s):      Inert until a wg interface exists. Baked in because a
+                  kernel module cannot be installed after the fact on this
+                  build.
+  Limitation(s):  Nothing is configured - no keys, peers or interfaces
+                  ship in the image.
+  Attribution(s): Mine. Inventory row and verification:
+                      - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
+  </pre>
+
+* **Memory and interrupt headroom**
+  `x3000/config.common`, `x3000/files-common/etc/uci-defaults/`
+
+  <pre>
+  Description:    Compressed-RAM swap (kmod-zram with the LZO, LZ4 and
+                  ZSTD backends, defaulting to lzo-rle at 256 MB),
+                  irqbalance to spread hardware interrupts across both
+                  cores, and packet steering enabled for all CPUs.
+                  First-boot scripts switch each one on, because all three
+                  ship disabled.
+  Benefit(s):     512 MB of RAM goes further, and receive work is not
+                  pinned to one of only two cores.
+  Impact(s):      irqbalance moves hardware interrupt affinity while packet
+                  steering moves the NAPI threads and the steering mask, so
+                  the two can pull against each other - turn irqbalance off
+                  first if steering measurements come out noisy.
+  Limitation(s):  All three live in /etc/config, which survives sysupgrade,
+                  so the running values can differ from what the image
+                  sets. Whether steering helps on this box has not been
+                  measured under load.
+  Attribution(s): Mine. What each lever is and how to read its state:
+                      - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
+  </pre>
+
+* **On-box diagnostics and access**
+  `x3000/files-common/usr/bin/`
+
+  <pre>
+  Description:    MHI bus debugfs in the kernel, unhashed kernel pointers
+                  for root, and three recorders: wanlog and dlwatch follow
+                  the modem's state over time, collect-logs bundles
+                  everything for a report. boot-history marks clean
+                  shutdowns so a crash is distinguishable from a deliberate
+                  reboot. ttyd with the LuCI terminal and file manager
+                  pages give a shell and a file browser in the browser.
+  Benefit(s):     The downlink stall was only diagnosable because the
+                  per-channel view exists; without it there is nothing to
+                  read but interrupt counters.
+  Impact(s):      debugfs costs a little kernel size and nothing at runtime
+                  until something reads it. Unhashing pointers only affects
+                  readers that already have root, on files that are
+                  root-only anyway. ttyd pulls in full libwebsockets and
+                  OpenSSL, a few hundred KB.
+  Limitation(s):  The recorders write to /tmp, so their output is lost on
+                  reboot - only the tools themselves are permanent. The
+                  debugfs symbol should come back out once the stall is
+                  settled.
+  Attribution(s): Mine. Capture, analysis and what to do during a stall:
+                      - <a href="x3000/docs/downlink-stall.md">x3000/docs/downlink-stall.md</a>
+                      - <a href="x3000/docs/wan-stall-runbook.md">x3000/docs/wan-stall-runbook.md</a>
+  </pre>
+
+* **First-boot defaults**
+  `x3000/files-common/etc/uci-defaults/`
+
+  <pre>
+  Description:    Scripts that run once on a fresh config and then remove
+                  themselves: timezone, route metrics for the wired and
+                  modem WANs, the wireless radios, the modem interface,
+                  mwan3 installed but left disabled, and a guard that stops
+                  telegraf logging on every boot when no config was
+                  supplied. Two further packages wire the Fantastic
+                  Packages binary repository into apk so its catalogue is
+                  installable after flashing.
+  Benefit(s):     A freshly flashed router comes up configured instead of
+                  needing a checklist, and every script is safe to re-run.
+  Impact(s):      All of these write to /etc/config, which sysupgrade
+                  preserves, so after the first flash the image default and
+                  the running value can diverge.
+  Limitation(s):  mwan3's stock configuration is a trap on this board -
+                  read the inert script before enabling it. Nothing from
+                  the Fantastic catalogue is built into the image.
+  Attribution(s): Mine. The levers that drift, and how to read each one:
+                      - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
   </pre>
 
 ---

@@ -236,7 +236,10 @@ CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
 # touch the wwan0 MBIM path at all), the software flowtable is interface-
 # agnostic and shortcuts conntrack/netfilter for established LAN<->wwan0
 # flows while STILL re-transmitting through the egress qdisc, so cake keeps
-# shaping. Ships INERT: firewall `flow_offloading '1'` is off by default.
+# shaping. Ships ON: files-common/etc/uci-defaults/96-flow-offload sets
+# firewall `flow_offloading '1'` on a fresh config, and only when the option
+# is unset, so a deliberate '0' sticks. (This comment said INERT until
+# 2026-09-12, which stopped being true when that script was added.)
 # Caveat: offloaded flows skip per-packet nft rules (MSS clamp is fine — it
 # acts at SYN). Prove the cake interaction with a bufferbloat run on/off
 # before trusting it in production.
