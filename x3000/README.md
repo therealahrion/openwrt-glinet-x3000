@@ -449,10 +449,15 @@ target/linux/mediatek/patches-6.12/
 ├── 992-net-wwan-mhi_wwan_mbim-native-xdp.patch
                         ndo_bpf plus a per-datagram do_xdp_generic() hook
                         on the same path. Applies after 991.
-└── 993-bus-mhi-host-optional-doorbell-write.patch
+├── 993-bus-mhi-host-optional-doorbell-write.patch
                         Adds the mhi force_db_brst_disable parameter
                         (commit aaec43cb0d). Turned on at boot by
                         files-common/etc/modules.d/mhi-doorbell.
+└── 995-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch
+                        Bounds-checks three modem-supplied values the
+                        stock driver trusts, one of which can spin a
+                        softirq forever. A local carry until the
+                        upstream fixes reach 6.12.y — not ours to send.
 ```
 
 Each of the four is described in full in `x3000/docs/lean-overlay.md`.

@@ -2231,10 +2231,12 @@ skb mode here.
 
 ### 22.7 What this closes
 
-* **No patch 994.** The core fix that was going to be the project's one genuinely
-  new patch does not exist. The honest output of the investigation is that 992 was
-  already right, for reasons its commit message stated correctly and could not
-  cite.
+* **No core-fix patch, and the number 994 is retired.** The fix that was going to
+  be the project's one genuinely new patch does not exist. The honest output of
+  the investigation is that 992 was already right, for reasons its commit message
+  stated correctly and could not cite. The slot reserved for it is deliberately
+  left empty so that "994" keeps meaning only this, and an unrelated patch
+  written later that day took 995 rather than reusing it.
 * **992 is not to be simplified.** The plan to strip its driver-side XDP once a
   core hook existed is void.
 * **The tun.c precedent is verified**, in four parts, at the line numbers above.

@@ -2,13 +2,18 @@
 # =============================================================================
 # wwan0 receive-path A/B: where the datagrams are dropped, and what stops it.
 #
-#   sh gro-backlog-ab.sh
+#   sh gro-backlog-ab.sh              the backlog sweep
+#   sh gro-backlog-ab.sh --threaded   and a threaded-NAPI window
 #
-# Four load-matched windows under the same sustained download:
+# Three load-matched windows under the same sustained download:
 #   backlog-1000   GRO on, netdev_max_backlog at its default
 #   backlog-2000   GRO on, twice the queue
 #   backlog-4000   GRO on, four times the queue
-#   threaded-1k    GRO on, default queue, NAPI moved to kernel threads
+# A fourth, threaded-1k, runs only with --threaded. The comment where it runs
+# says why it is off by default.
+#
+# Overridable: WANIF, URL, STREAMS, WINDOW, PINGTGT. Most iterations need a
+# different environment, not a different script.
 #
 # What it is looking for. At ~20k datagrams/s this link overflows a queue and
 # drops about 0.2% of them. Which queue depends on GRO:
@@ -18,9 +23,9 @@
 #                                                 (cpu_backlog_drop in dev.c)
 # Both are capped by the same net.core.netdev_max_backlog. time_squeeze has
 # stayed 0 throughout, so the NAPI is not running out of poll budget - the
-# queues fill between polls, which is a scheduling-latency problem and the
-# reason the threaded window is worth running before reaching for a bigger
-# bucket.
+# queues fill between polls, which is a scheduling-latency problem. That is why
+# threaded NAPI is worth testing at all, but it has to be tested under a
+# LAN-driven load to mean anything; see --threaded.
 #
 # A deeper queue trades loss for latency, so each window also reports RTT under
 # load. That is the number that decides whether a larger backlog is worth
@@ -149,6 +154,8 @@ meas() {
 		printf "%-12s %6.1f Mbit/s %6d dgram/s %6d skb/s  agg=%5.2fx\n", lab, db*8/w/1000000, dp/w, ds/w, dp/ds
 		printf "%-12s rx_dropped=%-5d softnet_dropped=%-5d time_squeeze=%-4d rx_errors=%d\n", "", dd, sd, ss, de
 		printf "%-12s bytes/skb=%-6d  rtt=%s  ping loss=%s\n", "", db/ds, rtt, loss
+		if (db/ds > 65536)
+			printf "%-12s ** bytes/skb exceeds gro_max_size 65536, so the agg figure above is loss, not coalescing **\n", ""
 	}'
 	say ""
 }
@@ -163,9 +170,34 @@ for B in 1000 2000 4000; do
 done
 
 sysctl -w net.core.netdev_max_backlog=$ORIG_BACKLOG >/dev/null
-echo 1 > /sys/class/net/$WANIF/threaded 2>/dev/null
-say "threaded=$(cat /sys/class/net/$WANIF/threaded 2>/dev/null)  napi threads: $(ps 2>/dev/null | grep -c "[n]api/$WANIF")"
-meas "threaded-1k"
+
+# The threaded-NAPI window is OFF by default, and not because it is dangerous to
+# the box - it restores cleanly - but because it cannot give a valid answer while
+# the load is generated on the router itself.
+#
+# Threading moves receive processing out of softirq, which preempts user tasks,
+# into a normal-priority kthread, which competes with them. The four wget
+# processes pulling 300 Mbit/s to /dev/null are exactly the competition. Measured
+# 2026-09-12: this window took the link from 277 Mbit/s to 5.9, with 91% ping
+# loss and 2927 datagrams dropped, and bytes/skb of 100937 - above gro_max_size,
+# so even its aggregation figure was loss.
+#
+# That result says the kthread was starved by the generator, not that threaded
+# NAPI is bad for this driver. Re-run it with the download driven from a LAN
+# client, where nothing on the router competes for CPU, and it becomes a real
+# test. Until then it measures the harness.
+if [ "$1" = --threaded ]; then
+	say "WARNING: threaded NAPI under an on-box load generator measures CPU"
+	say "         starvation of the NAPI kthread, not the driver. See the comment"
+	say "         in this script. Expect a throughput collapse."
+	echo 1 > /sys/class/net/$WANIF/threaded 2>/dev/null
+	_nt=0
+	for _c in /proc/[0-9]*/comm; do
+		grep -q "^napi/$WANIF" "$_c" 2>/dev/null && _nt=$((_nt+1))
+	done
+	say "threaded=$(cat /sys/class/net/$WANIF/threaded 2>/dev/null)  napi kthreads for $WANIF: $_nt"
+	meas "threaded-1k"
+fi
 
 cleanup
 say ""

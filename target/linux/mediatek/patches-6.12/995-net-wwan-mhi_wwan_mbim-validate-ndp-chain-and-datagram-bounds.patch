@@ -1,0 +1,167 @@
+From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
+Subject: net: wwan: mhi_wwan_mbim: validate the NDP chain and datagram bounds
+
+Three unchecked modem-supplied values in mhi_mbim_rx(), all present in
+6.12.103 and so in every image built from it. The MBIM NTB is parsed
+straight out of the DMA buffer, so each of these is a value the modem
+firmware chooses and the driver trusts.
+
+1. The NDP chain can loop forever. wNextNdpIndex is taken as the next
+   offset with no check that it advances, so an NDP pointing at itself
+   or backwards spins the while loop indefinitely. This runs in the MHI
+   DL tasklet, i.e. softirq context, so it is a hard lockup of that CPU
+   rather than a hung process. Now the chain must move strictly forward.
+
+2. A datagram can be described as lying outside the buffer.
+   wDatagramIndex and wDatagramLength are used without checking that
+   they fall inside skb->len. Now they are checked before anything is
+   allocated.
+
+3. A failed datagram copy delivers uninitialized memory. skb_put() sizes
+   the new skb before skb_copy_bits() runs, and the return value was
+   discarded, so a short or fragmented source left whatever
+   netdev_alloc_skb() happened to hand back being delivered to the
+   stack. netdev_alloc_skb() does not zero. Now the copy is checked and
+   the datagram is dropped and counted.
+
+2 and 3 overlap deliberately. With the bounds check in place a failing
+copy is close to unreachable, but the NTB can be a frag_list chain built
+by mhi_net_skb_agg() across several MHI transfers, and a short chain
+fails the copy for reasons the offsets do not describe. Each check stands
+on its own.
+
+The three error paths now share mhi_mbim_rx_error(), which also replaces
+the open-coded counting on the existing unknown-protocol path.
+
+Provenance, because this matters for how long the patch lives here:
+these are upstream bugs, not ours, and fixes for two of them were posted
+to netdev on 2026-09-11 by Guanglei Zhu ("guard against a cyclic NDP
+chain" and "check skb_copy_bits() return value"), both tagged against
+commit aa730a9905b7 and copied to stable, with an earlier bounds-check
+patch from Aamir Ahmed on 2026-09-07 withdrawn in favour of them. As
+of 2026-09-12 none had been merged, and OpenWrt 25.12 is pinned to
+6.12.103, so the image needs its own copy in the meantime.
+
+That makes this patch a local carry with an expiry date, and it is NOT
+for submission - sending our own version of a fix already on the list
+would waste reviewer time. Drop it when the upstream versions reach
+6.12.y. The helper is named mhi_mbim_rx_error() rather than upstream's
+mhi_mbim_rx_drop() so that the collision is loud when that happens.
+
+Numbered 995, not 994: that number is retired. It was reserved earlier for a
+core gro_cells/XDP fix that the tree read showed cannot exist, and the record
+in xdp-methods-tested.md section 22.7 says so, so reusing it would make every
+future reference to "994" ambiguous.
+
+Applies after 992. It edits the same datagram loop 991 and 992 rewrite,
+so its context is the post-992 one; upstream's equivalents apply to
+pristine source instead.
+
+Out-of-tree patch for the GL-X3000 lean build.
+
+--- a/drivers/net/wwan/mhi_wwan_mbim.c
++++ b/drivers/net/wwan/mhi_wwan_mbim.c
+@@ -441,6 +441,19 @@
+ 	}
+ }
+ 
++/* Count a datagram that could not be delivered, freeing it if one was
++ * allocated. Called from the RX loop, which does not hold rx_syncp.
++ */
++static void mhi_mbim_rx_error(struct mhi_mbim_link *link, struct sk_buff *skbn)
++{
++	if (skbn)
++		dev_kfree_skb_any(skbn);
++
++	u64_stats_update_begin(&link->rx_syncp);
++	u64_stats_inc(&link->rx_errors);
++	u64_stats_update_end(&link->rx_syncp);
++}
++
+ static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
+ {
+ 	int ndpoffset;
+@@ -457,7 +470,7 @@
+ 		struct usb_cdc_ncm_ndp16 ndp16;
+ 		struct usb_cdc_ncm_dpe16 dpe16;
+ 		struct mhi_mbim_link *link;
+-		int nframes, n, dpeoffset;
++		int nframes, n, dpeoffset, nextoff;
+ 		unsigned int session;
+ 
+ 		if (skb_copy_bits(skb, ndpoffset, &ndp16, sizeof(ndp16))) {
+@@ -507,6 +520,18 @@
+ 			if (!dgram_offset || !dgram_len)
+ 				break; /* null terminator */
+ 
++			/* Both come from the modem. A datagram that claims to
++			 * end past the buffer would otherwise be allocated and
++			 * then filled from a copy that cannot succeed.
++			 */
++			if ((unsigned int)dgram_offset + dgram_len > skb->len) {
++				net_err_ratelimited("%s: datagram %u+%u outside the %u byte NTB\n",
++						    link->ndev->name, dgram_offset,
++						    dgram_len, skb->len);
++				mhi_mbim_rx_error(link, NULL);
++				continue;
++			}
++
+ 			/* XDP programs are entitled to XDP_PACKET_HEADROOM in front
+ 			 * of the data for bpf_xdp_adjust_head().  Reserving it here
+ 			 * keeps netif_skb_check_for_xdp() from having to
+@@ -523,7 +548,17 @@
+ 
+ 			skb_reserve(skbn, headroom);
+ 			skb_put(skbn, dgram_len);
+-			skb_copy_bits(skb, dgram_offset, skbn->data, dgram_len);
++
++			/* skb_put() has already sized skbn and
++			 * netdev_alloc_skb() does not zero, so an unchecked
++			 * failure here would deliver uninitialized memory.
++			 */
++			if (skb_copy_bits(skb, dgram_offset, skbn->data, dgram_len)) {
++				net_err_ratelimited("%s: datagram copy failed\n",
++						    link->ndev->name);
++				mhi_mbim_rx_error(link, skbn);
++				continue;
++			}
+ 
+ 			if (xdp_prog &&
+ 			    !mhi_mbim_xdp_rx(link, xdp_prog, &skbn))
+@@ -533,10 +568,7 @@
+ 			if (unlikely(!skbn->protocol)) {
+ 				net_err_ratelimited("%s: unknown protocol\n",
+ 						    link->ndev->name);
+-				dev_kfree_skb_any(skbn);
+-				u64_stats_update_begin(&link->rx_syncp);
+-				u64_stats_inc(&link->rx_errors);
+-				u64_stats_update_end(&link->rx_syncp);
++				mhi_mbim_rx_error(link, skbn);
+ 				continue;
+ 			}
+ 
+@@ -562,10 +594,21 @@
+ unlock:
+ 		rcu_read_unlock();
+ next_ndp:
+-		/* Other NDP to process? */
+-		ndpoffset = (int)le16_to_cpu(ndp16.wNextNdpIndex);
+-		if (!ndpoffset)
++		/* Other NDP to process? wNextNdpIndex comes from the modem and
++		 * nothing made it advance, so an NDP pointing at itself or
++		 * backwards would spin this loop forever. That runs in the MHI
++		 * DL tasklet, which makes it a hard lockup of this CPU rather
++		 * than a hung task, so require strictly forward motion.
++		 */
++		nextoff = (int)le16_to_cpu(ndp16.wNextNdpIndex);
++		if (!nextoff)
++			break;
++		if (nextoff <= ndpoffset) {
++			net_err_ratelimited("mbim: NDP chain does not advance (%d -> %d)\n",
++					    ndpoffset, nextoff);
+ 			break;
++		}
++		ndpoffset = nextoff;
+ 	}
+ 
+ 	/* free skb */

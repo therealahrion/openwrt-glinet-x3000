@@ -24,6 +24,7 @@ so the zero-reject BBRv3 verification carries over intact.
 | WAN GRO via gro_cells (2026-09-07) | `991` kernel patch: MBIM RX delivered through per-CPU NAPI + `napi_gro_receive` instead of per-datagram `netif_rx` — batches the ~21-datagram 32KB NTB bursts (the RM520N controller sets `mru_default=32768`), and gives `wwan0` real NAPI instances, which is what makes the per-device `threaded` control meaningful at all (it does not enable threading: `/sys/class/net/wwan0/threaded` reads 0 as shipped). Kill-switch: `ethtool -K wwan0 gro off`. **BENCH-FIRST**: iperf3 downlink CPU + latency-under-load A/B before trusting | `target/linux/mediatek/patches-6.12/991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` |
 | WAN XDP (2026-09-07, reworked 2026-09-09) | `992` kernel patch (applies after 991): `ndo_bpf` + per-datagram `do_xdp_generic()` on the MBIM RX path — the complete verdict set PASS / DROP / ABORTED / TX / REDIRECT. REDIRECT matters beyond redirection itself: every `xdp-loader load` of an AF_XDP program installs libxdp's `xsk_def_prog`, whose only verdict is `bpf_redirect_map()`, so refusing it refuses AF_XDP. The program sits on `link->xdp_prog`, never `dev->xdp_prog`, so `netif_elide_gro()` stays false and 991's GRO survives — attaching the same program with `xdpgeneric` instead measures 1.00x aggregation against 24.8x with it detached. Raw-IP link: programs see the IP header at offset 0, not an Ethernet header, and a redirect to an Ethernet device must prepend one with `bpf_xdp_adjust_head(ctx, -14)`. Inert with no program attached (one `rcu_dereference` per datagram). The private-pointer design was re-examined 2026-09-12 and is not a workaround: a hook inside `gro_cells_receive()` would double-execute, and a driver opt-out from the elision would run the program on the coalesced skb only, so this is the only shape that keeps both GRO and per-datagram XDP. `drivers/net/tun.c` does the same thing. See `xdp-methods-tested.md` section 22. **BENCH-FIRST** | `target/linux/mediatek/patches-6.12/992-net-wwan-mhi_wwan_mbim-native-xdp.patch` |
 | MHI doorbell workaround (2026-09-10) | `993` kernel patch: adds the `mhi` module parameter `force_db_brst_disable`, which downgrades `MHI_DB_BRST_ENABLE` channels to `MHI_DB_BRST_DISABLE` in `parse_ch_cfg()` so the doorbell is written on every queued buffer. The patch defaults it off; the image turns it **on** at every boot from `files-common/etc/modules.d/mhi-doorbell` — not `/etc/modules.conf`, which is a ubox conffile that sysupgrade would then preserve against a later image. Without it the downlink deadlocks under sustained load, in practice past roughly 200 Mbps. Cost is two MMIO writes per queued buffer. The controlled reverse test — turn it off at matched throughput and see the stall return — has never been run, and the upstream draft names that as its weakness. Analysis in `downlink-stall.md`, operator steps in `wan-stall-runbook.md`, upstream draft in `993-upstream-report.md` | `target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch`, `x3000/files-common/etc/modules.d/mhi-doorbell` |
+| MBIM RX input validation (2026-09-12) | `995` kernel patch: three modem-supplied values in `mhi_mbim_rx()` that 6.12.103 uses unchecked — `wNextNdpIndex` with no requirement that the NDP chain advances (an NDP pointing at itself spins the loop forever in the MHI DL tasklet, so a hard lockup of that CPU), `wDatagramIndex`/`wDatagramLength` with no check that they fall inside `skb->len`, and a discarded `skb_copy_bits()` return after `skb_put()` has already sized the skb, which delivers whatever `netdev_alloc_skb()` handed back. Applies after 992 because it edits the loop 991 and 992 rewrite. **A local carry with an expiry date, not ours to submit**: fixes for two of the three were posted upstream 2026-09-11 by Guanglei Zhu, tagged against `aa730a9905b7` and copied to stable, and were not merged as of 2026-09-12. Drop this when they reach 6.12.y; the helper is deliberately named `mhi_mbim_rx_error()` rather than upstream's `mhi_mbim_rx_drop()` so the collision is loud | `target/linux/mediatek/patches-6.12/995-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch` |
 | zram swap, ACTIVE (2026-09-11) | `kmod-zram` + `zram-swap`, enabled at boot by `92-zram-swap`. The real lever is `CONFIG_KERNEL_ZRAM_BACKEND_{LZO,LZ4,ZSTD}` — kernel 6.12 dropped zram's crypto-API path, and those symbols are what pull `kmod-lib-lzo`/`-lz4`/`-zstd` *and* let zram use them. LZO must be stated explicitly: enabling LZ4 or ZSTD cancels kmod-zram's `FORCE_LZO` auto-select. Compressor `lz4` and size 256 MiB, set by the same script. lz4 is faster than zstd at both ends, beats plain lzo, and is one of the three values LuCI's ZRam dropdown offers — `lzo-rle` is not, so it read as unset there. Size is a ceiling on the compressed store, not a reservation | `x3000/config.common`, `x3000/files-common/etc/uci-defaults/92-zram-swap` |
 | ttyd defaults (2026-09-11) | `command` set to `/bin/login -f root` and `ipv6` on, in the anonymous `@ttyd[0]` section. ttyd binds `@lan` only, so anyone who can reach it is already inside the firewall and the extra login prompt only slows down pasting diagnostics. Marker-guarded, since `command` ships with a real value | `x3000/files-common/etc/uci-defaults/88-ttyd` |
 | irqbalance (2026-09-11) | `irqbalance` + `luci-app-irqbalance`. No kernel symbols — it only writes `/proc/irq/*/smp_affinity`. Inert as packaged: `/etc/config/irqbalance` ships `enabled '0'` and the init returns early, so `93-irqbalance` flips it. Can pull against packet steering, which moves NAPI threads and `rps_cpus` on the same two cores | `x3000/config.common`, `x3000/files-common/etc/uci-defaults/93-irqbalance` |
@@ -72,21 +73,19 @@ Not deliberate omissions - outstanding defects, listed so they are not
 rediscovered. Found 2026-09-12 by checking upstream against the function 991
 and 992 rewrite.
 
-* **Three unfixed holes in `mhi_mbim_rx()`**, all present in 6.12.103 and so in
-  every image built from it. Verified against the pristine release:
-  * no bounds check, so an NDP entry with `dgram_offset + dgram_len > skb->len`
-    is accepted;
-  * `mhi_wwan_mbim.c:324` ignores the return of `skb_copy_bits()` after
-    `skb_put()` has already sized the skb, so a failed copy delivers
-    uninitialized kernel memory to the stack;
-  * `mhi_wwan_mbim.c:354` takes `wNextNdpIndex` with no check that it advances,
-    so an NDP pointing at itself or backwards loops forever in BH context.
+* **Three holes in `mhi_mbim_rx()` — closed locally by 995 on 2026-09-12**, see
+  the table above. They are in 6.12.103 and therefore in any image built from it
+  without that patch. The source of all three is the modem rather than the
+  network, so the probability is low and the impact is not: one of them is an
+  endless loop in softirq context.
 
-  The source is the modem, not the network, so the probability is low and the
-  impact is real. Upstream fixes were posted 2026-09-11 (Guanglei Zhu, v2 1/3
-  and 2/3, `Fixes: aa730a9905b7`, `Cc: stable`) and were not merged as of
-  2026-09-12. They restructure the same loop, so they will also conflict with
-  991 and 992 on the next kernel bump. Do not fold them into 991 or 992.
+  Two points that outlive the fix. The upstream versions restructure the same
+  loop, so **they will conflict with 991, 992 and 995 on the next kernel bump** —
+  expect to rebase all three, and drop 995 once its content arrives through
+  stable. And the lesson that found them: the holes had been sitting in the
+  exact function this project spent days rewriting, and nothing turned them up
+  until upstream's own recent activity on that file was checked. Read what
+  upstream is doing to the code you are patching.
 
 * **991 still bundles an unrelated use-after-free fix** - the un-hash when
   `register_netdevice()` fails. Functionally fine here; it matters only for
