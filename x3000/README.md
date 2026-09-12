@@ -86,7 +86,7 @@ helpers alongside ModemManager:
 A fifth problem — the modem's downlink stopping dead under sustained
 load — is fixed by a patch of my own rather than by anything inherited,
 so it lives with the other patches this fork adds. See **Patches and
-enhancements** in the repo-root `README.md`, and
+Enhancements** in the repo-root `README.md`, and
 `x3000/docs/downlink-stall.md` for the capture and the analysis.
 
 One note on how that one is switched on, because it is build machinery
@@ -114,7 +114,7 @@ files applied at the end of `prepare.sh`).
 
 The kernel, driver and firewall patches this fork adds on top of those
 are listed in the repo-root `README.md` under **Patches and
-enhancements**, one entry each.
+Enhancements**, one entry each.
 
 The build config drops a few things that upstream's GL-X3000 device
 recipe pulls in:
@@ -448,7 +448,7 @@ package/network/config/firewall4/patches/
 ```
 
 What each of those six does and why it is worth carrying: **Patches and
-enhancements** in the repo-root `README.md`. Where each lever
+Enhancements** in the repo-root `README.md`. Where each lever
 lives and how to confirm it in a running image:
 `x3000/docs/lean-overlay.md`.
 
