@@ -43,14 +43,18 @@ so the zero-reject BBRv3 verification carries over intact.
 * **ply** (needs the ftrace stack; deferred as before).
 * **Custom in-tree BPF programs** (`xdp_filter`, `tc_cake_mark`) — dropped
   2026-09-07 (recoverable from git history). The 991/992 kernel hooks and
-  the full BPF/XDP/BTF platform stay; upstream `xdp-filter` (packages feed,
-  not currently enabled) covers ingress filtering, and cake shapes fine
+  the full BPF/XDP/BTF platform stay; upstream `xdp-filter` (now enabled,
+  `CONFIG_PACKAGE_xdp-filter=y`) covers ingress filtering, and cake shapes fine
   without bespoke DSCP marking. Shipping bespoke `.o` plus a build-time LLVM
   toolchain wasn’t worth it for two lever-off utilities.
 * `CONFIG_SCHED_DEBUG` — would expose the runtime
   `/sys/kernel/debug/sched/preempt` toggle; deps are already satisfied and
   it is introspection-only, but it was never baked/validated. Opt in with
-  one line appended to the filogic fragment.
+  one line appended to the filogic fragment. There is now a concrete reason
+  to: `/proc/stat` does not conserve time on this box under load, and this
+  build carries `PREEMPT_DYNAMIC` where stock OpenWrt is `PREEMPTION=n`, so
+  the toggle is what would tell us whether the two are related. See
+  `x3000/docs/xdp-methods-tested.md` section 18.3.
 * Every HELD research item: mt76 bump, fullcone NAT, safexcel. (MHI-GRO
   graduated 2026-09-07: its mainline equivalent is the 991 gro_cells
   patch above — still bench-first.) Hardware flow offload (PPE/WED) stays off and is
