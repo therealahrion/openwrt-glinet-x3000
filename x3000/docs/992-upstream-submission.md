@@ -38,28 +38,46 @@ is harmless.
 Nothing in the API lets a driver say which case it is in, so the core assumes the
 first.
 
-**Measured on an RM520N-GL, 2026-09-11**, three load-matched 12s windows at about
-310 datagrams/s with a sustained downlink running, using `xdp-filter` with an
-empty port list (pass-everything) so only the attach mode varies:
+**Measured on an RM520N-GL, 2026-09-12.** This is the run to quote: one tool, one
+invocation, four windows under the same sustained downlink, with the same
+`xdp_pass` program throughout so the only variable is which pointer it is stored
+behind. `x3000/docs/verify-992a.sh --traffic`, sections 4, 6 and 8b. PASS=28,
+FAIL=0.
 
-| attach | wwan0 datagrams | IP InReceives | aggregation |
-|---|---|---|---|
-| `-m native` (program on `link->xdp_prog`) | 3876 | 1782 | **2.18x** |
-| `-m skb` (program on `dev->xdp_prog`) | 3754 | 3555 | **1.06x** |
-| unloaded | 3658 | 1662 | **2.20x** |
+| attach | wwan0 datagrams | IP InReceives | aggregation | dropped | bytes/skb |
+|---|---|---|---|---|---|
+| none (baseline, 12s) | 3445 | 1645 | **2.09x** | 0 | 2841 |
+| driver mode, on `link->xdp_prog` (12s) | 3214 | 1539 | **2.09x** | 0 | - |
+| skb mode, on `dev->xdp_prog` (12s) | 2863 | 2814 | **1.02x** | 0 | 1416 |
+| after detach (8s) | - | - | **2.01x** | 0 | - |
 
-In skb mode `InReceives` comes within 5% of the raw datagram count: GRO is off.
-Unloading restores it. The driver, its traffic and its configuration are identical
-across all three rows - the only variable is which pointer the program is stored
-behind.
+Driver mode is indistinguishable from no program at all. Skb mode takes GRO to
+nothing: `InReceives` comes within 2% of the raw datagram count. Detaching
+restores it.
 
-**Measured independently a day earlier, at a higher link rate**, and recorded in
-`x3000/docs/lean-overlay.md`: the same program attached with `xdpgeneric` gave
-**1.00x aggregation against 24.8x detached**. Two runs, two link rates, same
-result. The 24.8x figure is the better one to quote upstream - it is
-arithmetically comfortable at about 34.7 KB per delivered skb against a 65536
-ceiling, and it makes the cost of the defect an order of magnitude rather than a
-factor of two.
+Two properties make this better evidence than the ratio alone:
+
+* **No drops in any window.** The ratio divides a driver counter by an IP
+  counter, so anything discarded in between would be booked as aggregation.
+  `rx_dropped` moved by zero, so every one of these ratios is coalescing.
+* **Bytes per delivered skb corroborates the ratio independently.** Baseline is
+  2841 bytes per skb against 1416 in skb mode - so skb mode delivers exactly one
+  datagram per skb, and the baseline delivers 2841/1416 = 2.0 of them. That
+  matches the 2.09x ratio without using it, and both sit far below the 65536
+  `gro_max_size` ceiling.
+
+Rate matters for the size of the number, not for its direction. This run held
+about 3.1 Mbit/s - roughly 287 datagrams/s - because the load generator fell
+through to its `speedtest.tele2.net` fallback, which is slow. At a higher rate
+the same comparison has measured **1.00x against 24.8x** (2026-09-09, recorded in
+`x3000/docs/lean-overlay.md`), about 34.7 KB per delivered skb. Quote whichever
+rate can be demonstrated; the 24.8x figure makes the cost an order of magnitude
+rather than a factor of two, but the 2026-09-12 run is the one with loss
+counters and a corroborating second quantity.
+
+An earlier three-row table taken on 2026-09-11 with `xdp-filter` (2.18x native,
+1.06x skb, 2.20x unloaded) is superseded by the run above. It measured the same
+thing with a different tool and agreed.
 
 ## 2. Why there is no core fix to send instead
 
@@ -274,13 +292,17 @@ justification from reasoning into evidence. Replace the paragraph beginning
     tests the same predicate on every datagram (net/core/gro_cells.c),
     falling back to bare netif_rx() when it fires; attaching the same
     program in XDP_MODE_SKB therefore silently switches off the GRO that
-    patch 1/2 exists to provide. Measured on an RM520N-GL over three
-    load-matched 12s windows at ~310 datagrams/s, varying only the attach
-    mode: 2.18x RX aggregation in driver mode, 1.06x in skb mode, 2.20x
-    with nothing attached. In skb mode InReceives comes within 5% of the
-    raw datagram count. Owning ndo_bpf also makes XDP_MODE_DRV the default
-    attach mode for this device (dev_xdp_mode()), so `ip link set dev wwan0
-    xdp ...` lands here rather than in the generic path.
+    patch 1/2 exists to provide. Measured on an RM520N-GL over four
+    load-matched windows at ~287 datagrams/s, varying only the attach mode
+    and nothing else: 2.09x RX aggregation with the program in driver mode,
+    1.02x with the same program in skb mode, 2.09x with nothing attached,
+    2.01x again after detaching. rx_dropped moved by zero in every window,
+    so these are coalescing ratios and not loss. Bytes per delivered skb
+    corroborates them without reusing the ratio: 2841 at baseline against
+    1416 in skb mode, i.e. skb mode delivers one datagram per skb.
+    Owning ndo_bpf also makes XDP_MODE_DRV the default attach mode for this
+    device (dev_xdp_mode()), so `ip link set dev wwan0 xdp ...` lands here
+    rather than in the generic path.
 
 **Add the same kind of evidence to 991.** Append to the Details list:
 
@@ -324,8 +346,9 @@ other and aggregation held flat at 2.11-2.15x across them.
     bpf_net_context that the redirect helpers dereference unchecked and
     that only core entry points establish; and GRO, which survives only
     because the program is held on link->xdp_prog where netif_elide_gro()
-    cannot see it. Measured: aggregation 2.12x with a program attached
-    against 2.09x without.
+    cannot see it. Measured: 2.09x aggregation with the program attached in
+    driver mode against 2.09x with nothing attached, and 1.02x with the
+    same program attached in skb mode.
 
     The honest limit is stated in patch 2: MBIM NTB aggregation means
     datagrams share one 32KB DMA buffer and each is copied out before the
@@ -449,12 +472,20 @@ separately hand-written samplers during this work produced 2.09x, 2.12x and 2.07
 - the same quantity the verifier reports, at the cost of re-deriving it each time
 and of two metric bugs the verifier would not have had.
 
-The one thing the verifier does **not** cover is the skb-mode row, which is the
-whole point of section 1. That gap should be closed by adding a section to the
-verifier rather than by another ad-hoc script. Until it is, the method is:
+**The skb-mode row is now covered too**, by section 8b, added 2026-09-11 and first
+run clean on 2026-09-12. It attaches the same `xdp_pass` object with
+`xdpgeneric`, asserts the collapse below 1.15x, detaches and asserts the
+restoration, and refuses to trust any window in which `rx_dropped` moved. So the
+whole of section 1's table comes out of one invocation, which is what makes the
+rows comparable.
 
-    xdp-filter load -m skb -f udp wwan0     # then measure aggregation
-    xdp-filter unload wwan0
+One trap that section hit first time round, worth knowing before writing any
+similar test by hand: **detach a generic program with `xdpgeneric off`, never
+`xdp off`.** With `ndo_bpf` implemented, `dev_xdp_mode()` resolves an unqualified
+request to `XDP_MODE_DRV` (`dev.c:9457`), and `dev_xdp_attach()` then finds
+`new_prog == cur_prog == NULL` for that mode, skips the driver call and returns 0
+(`dev.c:9711`). The generic program stays attached and the command reports
+success.
 
 Aggregation is wwan0's pre-GRO `rx_packets` over post-GRO `InReceives`, and
 **`InReceives` must be summed across `/proc/net/snmp` and `/proc/net/snmp6`** -

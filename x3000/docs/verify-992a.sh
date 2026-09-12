@@ -56,22 +56,53 @@ if [ -z "$IP" ]; then
 	exit 2
 fi
 
-TRAFFIC_PID=""
+# Load generator. Override the source with TRAFFIC_URL=, the stream count with
+# TRAFFIC_STREAMS=.
+#
+# Two lessons are baked in here, both measured on 2026-09-12.
+#
+# The source is usually the ceiling, not the link. speedtest.tele2.net delivered
+# 3 Mbit/s on a link that did 111 Mbit/s from proof.ovh.net in the same minute,
+# and every aggregation figure taken before that date was capped by the
+# generator rather than by the modem. speed.cloudflare.com answers HTTP 403 to a
+# bare wget. So: rank sources before trusting a rate, and report the rate
+# alongside every ratio.
+#
+# One stream cannot fill a cellular bandwidth-delay product. At a few hundred
+# Mbit/s and 100+ ms of RTT there are megabytes in flight, which a single TCP
+# connection will not hold through any loss at all. Several streams are not
+# optional.
+TRAFFIC_PIDS=""
+TRAFFIC_STREAMS=${TRAFFIC_STREAMS:-4}
+stop_traffic() {
+	for p in $TRAFFIC_PIDS; do kill "$p" 2>/dev/null; done
+	TRAFFIC_PIDS=""
+}
 start_traffic() {
 	[ "$WITH_TRAFFIC" = 1 ] || return
-	for u in "https://speed.cloudflare.com/__down?bytes=1000000000" \
-	         "http://speedtest.tele2.net/1GB.zip"; do
-		if command -v wget >/dev/null 2>&1; then
-			wget -q -O /dev/null "$u" 2>/dev/null &
-			TRAFFIC_PID=$!
-			sleep 2
-			kill -0 "$TRAFFIC_PID" 2>/dev/null && { info "load generator running (pid $TRAFFIC_PID, $u)"; return; }
+	command -v wget >/dev/null 2>&1 || { info "no wget — drive traffic yourself"; return; }
+	for u in ${TRAFFIC_URL:-} "https://proof.ovh.net/files/1Gb.dat"; do
+		[ -n "$u" ] || continue
+		_n=0
+		while [ "$_n" -lt "$TRAFFIC_STREAMS" ]; do
+			wget -qO /dev/null "$u" 2>/dev/null &
+			TRAFFIC_PIDS="$TRAFFIC_PIDS $!"
+			_n=$((_n+1))
+		done
+		sleep 3
+		_live=0
+		for p in $TRAFFIC_PIDS; do kill -0 "$p" 2>/dev/null && _live=$((_live+1)); done
+		if [ "$_live" -gt 0 ]; then
+			info "load generator: $_live of $TRAFFIC_STREAMS streams from $u"
+			_r0=$(cat /sys/class/net/$WANIF/statistics/rx_bytes); sleep 3
+			_r1=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
+			info "offered load about $(( (_r1-_r0)*8/3/1000000 )) Mbit/s — quote this next to every ratio below"
+			return
 		fi
+		stop_traffic
 	done
-	TRAFFIC_PID=""
-	info "could not start a load generator — drive traffic yourself for steps 4 and 6"
+	info "could not start a load generator — drive traffic yourself for steps 4, 6 and 8b"
 }
-stop_traffic() { [ -n "$TRAFFIC_PID" ] && kill "$TRAFFIC_PID" 2>/dev/null; TRAFFIC_PID=""; }
 
 cleanup() {
 	stop_traffic
