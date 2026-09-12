@@ -290,7 +290,19 @@ elif $IP link set dev "$WANIF" xdpgeneric obj $D/xdp_pass.o sec xdp 2>$D/err; th
 	info "attached in skb mode; measuring for 12s ..."
 	set -- $(gro_measure 12)
 	info "skb mode: rx_packets=$1  InReceives=$2  aggregation=${3}x  dropped=$4  bytes/skb=$5"
-	$IP link set dev "$WANIF" xdp off 2>/dev/null
+	# Must be "xdpgeneric off", not "xdp off". With 992's ndo_bpf present,
+	# dev_xdp_mode() resolves an unqualified request to XDP_MODE_DRV
+	# (net/core/dev.c:9457), so "xdp off" asks to detach a DRV program that is
+	# not there; dev_xdp_attach() then sees new_prog == cur_prog == NULL,
+	# skips the driver call and returns 0 (dev.c:9711). A silent no-op that
+	# leaves the generic program attached and makes the restore check below
+	# fail for the wrong reason.
+	$IP link set dev "$WANIF" xdpgeneric off 2>/dev/null
+	if $IP -d link show "$WANIF" 2>/dev/null | grep -q 'prog/xdp'; then
+		bad "skb-mode program still attached after 'xdpgeneric off'"
+	else
+		ok "skb-mode program detached"
+	fi
 	if [ "$4" -gt 0 ]; then
 		skip "$4 datagrams dropped during the window - ratio not trustworthy"
 	elif awk "BEGIN{exit !($3 < 1.15)}"; then
