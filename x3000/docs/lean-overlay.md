@@ -20,7 +20,7 @@ so the zero-reject BBRv3 verification carries over intact.
 | kernel / verification | `CONFIG_IKCONFIG=y` + `CONFIG_IKCONFIG_PROC=y` — `zcat /proc/config.gz` on the live box | same fragment |
 | eBPF / XDP / BTF platform | `KERNEL_CGROUP_BPF`, `BPF_EVENTS`, `KPROBES`, `PERF_EVENTS`, `XDP_SOCKETS`, `DEBUG_INFO` (+`_BTF`, `_BTF_MODULES`; `_REDUCED` off) | `x3000/config.common` (lean block at the end) |
 | qdisc / classifier kmods | `kmod-sched-core`, `kmod-sched`, `kmod-sched-cake`, `kmod-sched-bpf`, `kmod-ifb`, `kmod-xdp-sockets-diag` — vermagic-locked, bake now or never | `x3000/config.common` |
-| software flow offload (2026-09-07) | `kmod-nft-offload` — nft flowtable fast path; lever-OFF (firewall `flow_offloading '0'`). Interface-agnostic, so it shortcuts LAN↔wwan0 flows yet still hits the egress qdisc (cake keeps shaping). Verify cake interaction empirically before trusting | `x3000/config.common` |
+| software flow offload (2026-09-07) | `kmod-nft-offload` — nft flowtable fast path. **Image default is off** (firewall `flow_offloading '0'`); the running state is whatever LuCI last set, because `/etc/config/firewall` survives sysupgrade — read it, do not assume it (see "Levers that drift" below). Interface-agnostic, so it shortcuts LAN↔wwan0 flows yet still hits the egress qdisc (cake keeps shaping). Two things still unproven: the cake interaction, and any CPU saving at all — `time_squeeze` has read 0 in every window ever measured here. It is also **mutually exclusive with any per-packet netfilter rule** on the same traffic, which is what rules out NFQUEUE-style inspection while it is on | `x3000/config.common` |
 | WAN GRO via gro_cells (2026-09-07) | `991` kernel patch: MBIM RX delivered through per-CPU NAPI + `napi_gro_receive` instead of per-datagram `netif_rx` — batches the ~21-datagram 32KB NTB bursts (the RM520N controller sets `mru_default=32768`), and gives `wwan0` real NAPI instances, which is what makes the per-device `threaded` control meaningful at all (it does not enable threading: `/sys/class/net/wwan0/threaded` reads 0 as shipped). Kill-switch: `ethtool -K wwan0 gro off`. **BENCH-FIRST**: iperf3 downlink CPU + latency-under-load A/B before trusting | `target/linux/mediatek/patches-6.12/991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` |
 | WAN XDP (2026-09-07, reworked 2026-09-09) | `992` kernel patch (applies after 991): `ndo_bpf` + per-datagram `do_xdp_generic()` on the MBIM RX path — the complete verdict set PASS / DROP / ABORTED / TX / REDIRECT. REDIRECT matters beyond redirection itself: every `xdp-loader load` of an AF_XDP program installs libxdp's `xsk_def_prog`, whose only verdict is `bpf_redirect_map()`, so refusing it refuses AF_XDP. The program sits on `link->xdp_prog`, never `dev->xdp_prog`, so `netif_elide_gro()` stays false and 991's GRO survives — attaching the same program with `xdpgeneric` instead measures 1.00x aggregation against 24.8x with it detached. Raw-IP link: programs see the IP header at offset 0, not an Ethernet header, and a redirect to an Ethernet device must prepend one with `bpf_xdp_adjust_head(ctx, -14)`. Inert with no program attached (one `rcu_dereference` per datagram). The private-pointer design was re-examined 2026-09-12 and is not a workaround: a hook inside `gro_cells_receive()` would double-execute, and a driver opt-out from the elision would run the program on the coalesced skb only, so this is the only shape that keeps both GRO and per-datagram XDP. `drivers/net/tun.c` does the same thing. See `xdp-methods-tested.md` section 22. **BENCH-FIRST** | `target/linux/mediatek/patches-6.12/992-net-wwan-mhi_wwan_mbim-native-xdp.patch` |
 | MHI doorbell workaround (2026-09-10) | `993` kernel patch: adds the `mhi` module parameter `force_db_brst_disable`, which downgrades `MHI_DB_BRST_ENABLE` channels to `MHI_DB_BRST_DISABLE` in `parse_ch_cfg()` so the doorbell is written on every queued buffer. The patch defaults it off; the image turns it **on** at every boot from `files-common/etc/modules.d/mhi-doorbell` — not `/etc/modules.conf`, which is a ubox conffile that sysupgrade would then preserve against a later image. Without it the downlink deadlocks under sustained load, in practice past roughly 200 Mbps. Cost is two MMIO writes per queued buffer. The controlled reverse test — turn it off at matched throughput and see the stall return — has never been run, and the upstream draft names that as its weakness. Analysis in `downlink-stall.md`, operator steps in `wan-stall-runbook.md`, upstream draft in `993-upstream-report.md` | `target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch`, `x3000/files-common/etc/modules.d/mhi-doorbell` |
@@ -73,11 +73,19 @@ Not deliberate omissions - outstanding defects, listed so they are not
 rediscovered. Found 2026-09-12 by checking upstream against the function 991
 and 992 rewrite.
 
-* **Three holes in `mhi_mbim_rx()` — closed locally by 995 on 2026-09-12**, see
-  the table above. They are in 6.12.103 and therefore in any image built from it
-  without that patch. The source of all three is the modem rather than the
-  network, so the probability is low and the impact is not: one of them is an
-  endless loop in softirq context.
+* **Three holes in `mhi_mbim_rx()` — closed by 995, flashed and verified on
+  hardware 2026-09-12.** See the table above. They are in 6.12.103 and therefore
+  in any image built from it without that patch. The source of all three is the
+  modem rather than the network, so the probability is low and the impact is not:
+  one of them is an endless loop in softirq context.
+
+  Verified in the running kernel rather than inferred from the build: the
+  installed `mhi_wwan_mbim.ko` contains all three message strings the patch adds,
+  and `dmesg` shows none of the three paths firing, which is the correct result on
+  a healthy modem. Re-check after any flash with
+  `for s in 'NDP chain does not advance' 'outside the' 'datagram copy failed'; do
+  grep -ac "$s" /lib/modules/$(uname -r)/mhi_wwan_mbim.ko; done` — expect three
+  non-zero counts.
 
   Two points that outlive the fix. The upstream versions restructure the same
   loop, so **they will conflict with 991, 992 and 995 on the next kernel bump** —
@@ -91,6 +99,41 @@ and 992 rewrite.
   `register_netdevice()` fails. Functionally fine here; it matters only for
   upstream, where it has to be its own `[PATCH net]`. See
   `992-upstream-submission.md` section 3.
+
+## Levers that drift
+
+`/etc/config/*` survives sysupgrade, so for anything set by a `uci-defaults`
+script the image default stops describing the board the moment someone changes it
+in LuCI. Nothing in these docs used to say which of the two was being described,
+and that went wrong once already: flow offload was documented as dormant while the
+flowtable was installed on `br-lan`, `eth0` and `wwan0` with a third of live
+forwarded flows in `OFFLOAD` state. Read the board, do not trust the row.
+
+| lever | image default | read the running state with |
+|---|---|---|
+| software flow offload | off | `uci -q get firewall.@defaults[0].flow_offloading`, then `nft list ruleset \| grep -c 'flow add'` |
+| packet steering / RPS | `2` and `128` | `uci -q get network.globals.packet_steering; uci -q get network.globals.steering_flows` |
+| irqbalance | enabled | `/etc/init.d/irqbalance enabled && echo on` |
+| zram | `lz4`, 256 MiB | `uci -q get zram.@zram[0].zram_comp_algo; free -m \| grep -i swap` |
+| ttyd command | `/bin/login -f root` | `uci -q get ttyd.@ttyd[0].command` |
+| MHI doorbell (993) | on, via `modules.d` | `cat /sys/module/mhi/parameters/force_db_brst_disable` |
+| GRO on `wwan0` (991) | on | `ethtool -k wwan0 \| grep '^generic-receive-offload'` |
+| `netdev_max_backlog` | 1000 | `cat /proc/sys/net/core/netdev_max_backlog` |
+
+## Work queue, easiest to hardest
+
+The task list prefixes every open item with a tier so it reads in difficulty
+order. The point is that T1 to T3 can be picked up at any time while T4 needs a
+scheduled session, so they should not be interleaved when planning.
+
+* **T1** — desk work. No router, no build. Docs, patch authoring, script edits.
+* **T2** — one command on a running box.
+* **T3** — needs a build and a flash.
+* **T4** — needs the LAN load rig: traffic driven from a PC so the router is only
+  routing, which is both the realistic path and the only way to measure without
+  the generator competing for CPU. Tabled 2026-09-12.
+* **T5** — long or externally gated: waiting on a stall to happen, on a net-next
+  rebase, or on an upstream decision.
 
 ## Build
 

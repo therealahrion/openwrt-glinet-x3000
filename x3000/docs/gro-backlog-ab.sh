@@ -63,6 +63,7 @@ cleanup() {
 	echo "$ORIG_THREADED" > /sys/class/net/$WANIF/threaded 2>/dev/null
 	[ "$ORIG_GRO" = on ] && ethtool -K $WANIF gro on 2>/dev/null
 	rm -f /tmp/.gro_ab_ping
+	[ -s "$LOADLOG" ] && say "fetcher errors were logged to $LOADLOG"
 	say ""
 	say "restored: netdev_max_backlog=$(cat /proc/sys/net/core/netdev_max_backlog) threaded=$(cat /sys/class/net/$WANIF/threaded 2>/dev/null) gro=$(ethtool -k $WANIF 2>/dev/null | awk '/^generic-receive-offload:/{print $2}')"
 }
@@ -89,10 +90,24 @@ sq() {
 # Each stream restarts when its file completes, so the offered load does not
 # decay mid-run. An earlier attempt without this had windows at 26768, 22989
 # and 15645 datagrams/s and could not be read across.
+#
+# A live-driver count is not proof of load. On 2026-09-12 a run reported "4 of 4
+# stream drivers running" and then three windows of agg=0.00x, because every
+# fetch was failing with "Failed to send request: Operation not permitted" and
+# the count only checks that the retry loops are alive. The firewall, policy
+# routing and both address families were all cleared as causes afterwards, so it
+# is something in the fetcher or its concurrency. Rather than chase it: confirm
+# bytes are actually arriving before measuring anything, and keep the fetcher
+# stderr so the next occurrence is evidence instead of a mystery.
+LOADLOG=/tmp/.gro_ab_load.log
 start_load() {
+	: > $LOADLOG
 	_n=0
 	while [ "$_n" -lt "$STREAMS" ]; do
-		( while :; do wget -qO /dev/null "$URL" || sleep 2; done ) &
+		( while :; do
+			wget -qO /dev/null "$URL" 2>>$LOADLOG ||
+				{ echo "fetch exit $? at $(date +%T)" >>$LOADLOG; sleep 2; }
+		done ) &
 		PIDS="$PIDS $!"
 		_n=$((_n+1))
 	done
@@ -100,7 +115,21 @@ start_load() {
 	_live=0
 	for p in $PIDS; do kill -0 $p 2>/dev/null && _live=$((_live+1)); done
 	say "load: $_live of $STREAMS stream drivers running against $URL"
-	say "      (hosts commonly cap concurrent connections, so fewer may be moving data)"
+
+	_t0=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
+	sleep 3
+	_t1=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
+	_mb=$(( (_t1-_t0) * 8 / 3 / 1000000 ))
+	if [ "$_mb" -lt 5 ]; then
+		say ""
+		say "FATAL: only $_mb Mbit/s arriving on $WANIF, so there is no load to measure."
+		say "       Every window would have reported noise. Fetcher output:"
+		sed -n '1,6p' $LOADLOG | sed 's/^/         /'
+		say "       Try the URL by hand: wget -O /dev/null \"$URL\""
+		cleanup
+		exit 1
+	fi
+	say "load confirmed: about $_mb Mbit/s arriving on $WANIF"
 }
 
 # ---- one measurement window -----------------------------------------------
@@ -154,6 +183,8 @@ meas() {
 		printf "%-12s %6.1f Mbit/s %6d dgram/s %6d skb/s  agg=%5.2fx\n", lab, db*8/w/1000000, dp/w, ds/w, dp/ds
 		printf "%-12s rx_dropped=%-5d softnet_dropped=%-5d time_squeeze=%-4d rx_errors=%d\n", "", dd, sd, ss, de
 		printf "%-12s bytes/skb=%-6d  rtt=%s  ping loss=%s\n", "", db/ds, rtt, loss
+		if (dp < ds)
+		    printf "%-12s ** fewer datagrams than delivered skbs: InReceives is system-wide, so this ratio is not about this interface **\n", ""
 		if (db/ds > 65536)
 			printf "%-12s ** bytes/skb exceeds gro_max_size 65536, so the agg figure above is loss, not coalescing **\n", ""
 	}'
