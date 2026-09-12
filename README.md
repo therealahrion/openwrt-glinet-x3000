@@ -68,7 +68,7 @@ of these sits in the build and how to confirm it in a running image:
                   to arrive close together for there to be anything to
                   merge, so it does little at low rates.
   Attribution(s): Mine, written for this fork. Background:
-    <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
 * **992 — XDP on the modem interface**
@@ -92,7 +92,7 @@ of these sits in the build and how to confirm it in a running image:
                   the source address as an EtherType.
   Attribution(s): Mine, written for this fork. The same-shaped hook in the
                   in-tree tun driver is the precedent. Background:
-    <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
 * **993 — MHI doorbell writes**
@@ -114,8 +114,8 @@ of these sits in the build and how to confirm it in a running image:
                   a reboot returns to the image default.
   Attribution(s): Mine, written for this fork. Capture, analysis and the
                   draft report for the MHI maintainers:
-    <a href="x3000/docs/downlink-stall.md">x3000/docs/downlink-stall.md</a>
-    <a href="x3000/docs/993-upstream-report.md">x3000/docs/993-upstream-report.md</a>
+                      - <a href="x3000/docs/downlink-stall.md">x3000/docs/downlink-stall.md</a>
+                      - <a href="x3000/docs/993-upstream-report.md">x3000/docs/993-upstream-report.md</a>
   </pre>
 
 * **firewall4 — flow offload on a modem WAN**
@@ -138,7 +138,7 @@ of these sits in the build and how to confirm it in a running image:
                   netfilter, so it cannot be combined with a per-packet
                   rule on the same traffic.
   Attribution(s): Mine, written for this fork. Background, section 10.3:
-    <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
 ### Additional Patches
@@ -160,8 +160,8 @@ of these sits in the build and how to confirm it in a running image:
                   the mainline kernel.
   Attribution(s): Peter Jung's BBRv3 patch as carried by CachyOS, which in
                   turn tracks Google's BBRv3 branch:
-    <a href="https://github.com/CachyOS/kernel-patches/blob/master/6.12/0002-bbr3.patch">CachyOS kernel-patches: 6.12/0002-bbr3.patch</a>
-    <a href="https://github.com/google/bbr">google/bbr, the BBRv3 development branch</a>
+                      - <a href="https://github.com/CachyOS/kernel-patches/blob/master/6.12/0002-bbr3.patch">CachyOS kernel-patches: 6.12/0002-bbr3.patch</a>
+                      - <a href="https://github.com/google/bbr">google/bbr, the BBRv3 development branch</a>
   </pre>
 
 * **995 — modem input validation**
@@ -191,9 +191,9 @@ of these sits in the build and how to confirm it in a running image:
                   maintainer Loic Poulain; on-list but not merged as of
                   2026-09-12. The implementation here is mine, against the
                   post-992 tree. Who posted what, and what was withdrawn:
-    <a href="https://lore.kernel.org/r/20260911021734.1396599-1-zhugl3@xiaopeng.com">netdev v2 1/3: guard against a cyclic NDP chain</a>
-    <a href="https://lore.kernel.org/r/20260911021734.1396599-2-zhugl3@xiaopeng.com">netdev v2 2/3: check skb_copy_bits() return value</a>
-    <a href="x3000/docs/992-upstream-submission.md">x3000/docs/992-upstream-submission.md</a>
+                      - <a href="https://lore.kernel.org/r/20260911021734.1396599-1-zhugl3@xiaopeng.com">netdev v2 1/3: guard against a cyclic NDP chain</a>
+                      - <a href="https://lore.kernel.org/r/20260911021734.1396599-2-zhugl3@xiaopeng.com">netdev v2 2/3: check skb_copy_bits() return value</a>
+                      - <a href="x3000/docs/992-upstream-submission.md">x3000/docs/992-upstream-submission.md</a>
   </pre>
 
 ---
