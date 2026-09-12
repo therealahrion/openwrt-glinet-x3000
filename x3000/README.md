@@ -11,7 +11,7 @@ ModemManager owning the data plane.
 The GL.iNet stock firmware ships an old OpenWrt 21.02 + kernel 5.4
 + a vendor-patched `pcie_mhi` driver that's never been upstreamed.
 Vanilla OpenWrt 25.12 (kernel 6.12) supports the rest of the device
-out of the box but needs five small fixes before the modem actually
+out of the box but needs four small fixes before the modem actually
 comes up, stays up under load, and lets us keep using our own AT
 helpers alongside ModemManager:
 
@@ -83,34 +83,20 @@ helpers alongside ModemManager:
    `x3000/patches/0002-curl-disable-brotli-autodetect.patch` to pass
    `--without-brotli` explicitly.
 
-5. **MHI stops ringing the downlink doorbell under sustained
-   load.** The modem's data channels are set up for
-   `MHI_DB_BRST_ENABLE` ("burst mode"), where the host writes the
-   channel doorbell only while the device has explicitly asked it to.
-   If the modem stops asking, the host goes on refilling RX
-   descriptors the modem never learns about and the downlink simply
-   stops. Caught in the act at roughly 300 Mbps: all 127 RX
-   descriptors queued, `rx` frozen for 43 seconds straight, `tx`
-   still flowing, the downlink event ring's interrupt count not
-   moving at all, no power transitions, and the radio healthy
-   throughout (RSRP -100, SINR 17).
+A fifth problem — the modem's downlink stopping dead under sustained
+load — is fixed by a patch of our own rather than by anything inherited,
+so it lives with the other patches this fork adds. See **Patches we add
+on top of vjt's tree** in the repo-root `README.md`, and
+`x3000/docs/downlink-stall.md` for the capture and the analysis.
 
-   `target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch`
-   adds an `mhi` module parameter, `force_db_brst_disable`, which
-   downgrades those channels to `MHI_DB_BRST_DISABLE` at probe time
-   so the doorbell is written on every queued buffer. It defaults to
-   off; `x3000/files-common/etc/modules.d/mhi-doorbell` turns it on for
-   this board.
-
-   It has to be enabled there rather than on the kernel command line.
-   `mhi` is a loadable module in this build (`kmod-mhi-bus`) and
-   OpenWrt's kmodloader takes module options from `/etc/modules.conf`
-   and `/etc/modules.d/` only -- it never reads `/proc/cmdline` -- so
-   an `mhi.force_db_brst_disable=1` bootarg would be silently ignored.
-   `/etc/modules.d/` is the one to use: `/etc/modules.conf` is a ubox
-   conffile, so once modified it is preserved across flashes and a later
-   image can no longer change the value. Full capture and analysis in
-   `x3000/docs/downlink-stall.md`.
+One note on how that one is switched on, because it is build machinery
+rather than a finding. `mhi` is a loadable module here (`kmod-mhi-bus`)
+and OpenWrt's kmodloader reads module options from `/etc/modules.conf`
+and `/etc/modules.d/` only -- never from `/proc/cmdline` -- so a kernel
+bootarg would be silently ignored. Of those two, `/etc/modules.d/` is the
+one to use: `/etc/modules.conf` is a ubox conffile, so once modified it
+survives every flash and a later image can no longer change the value.
+Hence `x3000/files-common/etc/modules.d/mhi-doorbell`.
 
 ## What's different from a stock OpenWrt 25.12 build
 
@@ -122,10 +108,13 @@ Commits on top of upstream `openwrt-25.12`:
     + variant split under `x3000/`)
   * `swap modem stack from umbim+watchdog to ModemManager`
   * `patch curl to disable brotli autodetect`
-  * `mhi: optional doorbell writes, enabled via /etc/modules.d/`
 
 Plus the build-prep machinery under `x3000/` (incl. patches to feed
 files applied at the end of `prepare.sh`).
+
+The kernel, driver and firewall patches this fork adds on top of those
+are listed in the repo-root `README.md` under **Patches we add on top of
+vjt's tree**, one entry each.
 
 The build config drops a few things that upstream's GL-X3000 device
 recipe pulls in:
@@ -394,6 +383,9 @@ x3000/
 │   ├── verify-992a-sources.md     The BPF programs that script embeds.
 │   ├── bpf/                       Their compiled objects, fetched by the
                                    script at run time.
+│   ├── gro-backlog-ab.sh          Load-driven A/B harness for GRO and
+                                   the receive backlog. Needs real WAN
+                                   traffic to mean anything.
 │   ├── modem-nv-state.md          Settings that live in the modem's own
                                    NV, not in this repo.
 │   └── cake-wan.init              Reference cake shaper. NOT installed.
@@ -437,30 +429,28 @@ target/linux/generic/pending-6.12/
 target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
-target/linux/mediatek/patches-6.12/
-├── 990-tcp-bbr3.patch  Replaces the kernel's BBR v1 with BBRv3
-                        (CachyOS 0002-bbr3). bbr is already the boot
-                        default via kmod-tcp-bbr, so the module simply
-                        becomes v3.
+target/linux/mediatek/patches-6.12/   Our kernel patches. Numbered 99x so
+                        they sort last and stay obviously ours. 992
+                        applies after 991; the rest are independent.
+├── 990-tcp-bbr3.patch                     BBRv3.
 ├── 991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
-                        MBIM RX delivered through gro_cells instead of
-                        per-datagram netif_rx. Measured 2.09x RX
-                        aggregation, from 1.00x.
+                                           Modem RX through gro_cells.
 ├── 992-net-wwan-mhi_wwan_mbim-native-xdp.patch
-                        ndo_bpf plus a per-datagram do_xdp_generic() hook
-                        on the same path. Applies after 991.
+                                           XDP hook on the same path.
 ├── 993-bus-mhi-host-optional-doorbell-write.patch
-                        Adds the mhi force_db_brst_disable parameter
-                        (commit aaec43cb0d). Turned on at boot by
-                        files-common/etc/modules.d/mhi-doorbell.
+                                           MHI doorbell writes.
 └── 995-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch
-                        Bounds-checks three modem-supplied values the
-                        stock driver trusts, one of which can spin a
-                        softirq forever. A local carry until the
-                        upstream fixes reach 6.12.y — not ours to send.
+                                           Modem input validation.
+package/network/config/firewall4/patches/
+└── 001-flowtable-fall-back-to-l3-device.patch
+                        Lets an L3-only interface, which is what
+                        ModemManager gives us, into the flow table.
 ```
 
-Each of the four is described in full in `x3000/docs/lean-overlay.md`.
+What each of those six does and why it is worth carrying: **Patches we
+add on top of vjt's tree** in the repo-root `README.md`. Where each lever
+lives and how to confirm it in a running image:
+`x3000/docs/lean-overlay.md`.
 
 `prepare.sh` writes its composed outputs to `/.config` and `/files/`
 (both gitignored), and records the active variant in `/.x3000-variant`.
