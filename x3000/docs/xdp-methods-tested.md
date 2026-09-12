@@ -1422,7 +1422,7 @@ between the two trees; the fix is entirely in `wed.c`.
 
 | Attach point | Native XDP | Runs pre-skb | Flow lookup | Cost to attach | Verdict |
 |---|---|---|---|---|---|
-| `eth0`/`eth1` | yes | yes | no - dummy dev | link bounce, both ports | measure first (#114) |
+| `eth0`/`eth1` | yes | yes | no - dummy dev | link bounce, both ports | static filter only - see 18 |
 | `wwan0` | yes (992) | no - MBIM copy | yes | none | shape A, but see 17.2 |
 | AP netdevs | no | no | n/a | **GRO and LRO off** | not worth it |
 | `br-lan` | no | no | n/a | GRO and LRO off | not worth it |
@@ -1430,3 +1430,281 @@ between the two trees; the fix is entirely in `wed.c`.
 For wireless the answer is WED, not XDP - and WED needs #111 first, and even
 then delivers only its DMA and token half, because its forwarding half cannot
 reach a flow that crosses the modem.
+
+---
+
+## 18. #114 run on hardware, 2026-09-11: what it measured, and why the CPU numbers do not stand
+
+Section 16.6 asked for a bracket: the cost of the XDP hook itself, and the cost
+of everything a pre-`sk_buff` drop skips. The test ran on the box across eight
+attempts. It produced one solid throughput result, one instrument that has to be
+abandoned, and two structural findings about the receive path that matter more
+than the number it was after.
+
+Read 18.3 and 18.6 before repeating any of this. Most of the attempts were
+invalidated by the rig rather than by the box.
+
+Everything in this section is labelled by how it is known: **measured** on the
+router, **read** from `6.12.103` in the build tree at
+`build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic/linux-6.12.103`,
+or **reasoned**. The re-verification pass behind the `read` labels is 18.7.
+
+### 18.1 The rig, and why it ended up using `xdp-filter`
+
+Hand-compiled BPF objects were the original plan and they did not survive
+transfer - base64 pasted into `ttyd` decoded to **zero bytes**, which `libxdp`
+reports as the misleading `BPF object format invalid`. The same objects opened
+cleanly under libbpf 1.3 off-box, so the objects were fine and the paste was not.
+
+`xdp-tools` on this image ships `xdp-filter` alongside `xdp-loader` and
+`xdpdump`, which removes the problem entirely - a prebuilt native XDP program is
+already on the router:
+
+    xdp-filter load -m native -f udp eth1      # parses to UDP, passes everything
+    xdp-filter port -m dst -p udp 9999         # now udp/9999 dies pre-skb
+
+The same program, `xdpfilt_alw_udp`, runs in both conditions and differs only by
+one entry in its port map, so the difference isolates the drop rather than
+comparing two different programs. It keeps its own per-action and per-port
+counters, which turned out to be the only trustworthy numbers in the exercise.
+
+The test flow is 64-byte UDP to the router's own LAN address, paced from a PC on
+a wired LAN port. An `nft` rule at `type filter hook input priority 10` sinks it,
+so the kernel never generates ICMP port-unreachable replies - without that, the
+pass conditions carry a rate-limited ICMP path that the drop conditions do not.
+
+### 18.2 What was actually measured
+
+**Measured.** At roughly 100,000 pkt/s offered, over repeated 40 and 45 second
+windows:
+
+| path | result |
+|---|---|
+| full receive path to the input chain | zero loss |
+| native `XDP_DROP` on udp/9999 | zero loss |
+
+So capacity on both paths **exceeds 100k pkt/s on this port**, and no upper bound
+was established. That is the entire measured result, and it is less than 16.6
+asked for.
+
+Two corrections to assumptions from earlier sections, both confirmed on hardware:
+
+**The driver does export XDP counters to ethtool.** `rx_xdp_pass` and
+`rx_xdp_drop` are present at `mtk_eth_soc.c:247-248` and they move. I had
+predicted they were absent because those names come from the Marvell and Intel
+drivers.
+
+**`/proc/net/dev` `rx_packets` counts frames that XDP dropped.** Measured: in one
+window `xdp-filter` counted 12,032,615 drops - `XDP_DROP` moved 500,849 to
+12,533,464 and the port hit counter moved by the identical amount - while
+`rx_packets` on `eth1` moved 12,000,459, agreeing to 0.3%. Read: that follows
+from `mtk_get_stats64()` pulling from `mac->hw_stats` via
+`mtk_stats_update_mac()`, where the non-MT7628 branch does
+
+    hw_stats->rx_packets += mtk_r32(mac->hw, reg_map->gdm1_cnt + 0x8 + offs);
+
+with `offs = hw_stats->reg_offset` selecting GDM1 or GDM2 per MAC. That is a
+**hardware GDM frame counter**, incremented at the MAC before the CPU sees the
+frame, so no software verdict can subtract from it. The practical consequence:
+`/proc/net/dev` is the one packet source that works in every condition, attached
+or not.
+
+### 18.3 `/proc/stat` cannot measure per-packet cost on this box
+
+This is the finding that cost the session. **Do not use `/proc/stat` for this.**
+
+**Measured.** Eight consecutive 40-second windows, two CPUs, so an 80-second
+budget each. Summing every state - user, nice, system, idle, iowait, irq,
+softirq:
+
+    72.04  73.71  70.02  92.54  81.51  73.81  66.71  96.25
+
+67 to 96 against 80. All of the variation sits in the `system` column, which
+ranged from 0.82 to 23.50 seconds across windows that were otherwise identical.
+The windows really were 40 seconds: every one received within 0.5% of the same
+packet count, so the sampler's clock and arithmetic were both sound. On an idle
+box the same sampler closed correctly, 89.8 against a 90-second budget.
+
+**Read.** The kernel's accounting configuration explains why this is expected
+rather than anomalous:
+
+    CONFIG_TICK_CPU_ACCOUNTING=y
+    CONFIG_IRQ_TIME_ACCOUNTING=y
+    CONFIG_NO_HZ_IDLE=y
+    CONFIG_HZ=100
+
+User, system and idle are assigned by **sampling at 100 Hz - one sample per 10 ms
+per CPU** - with precisely-measured irq and softirq time subtracted from each
+tick's allotment, and batches of skipped ticks attributed in a lump when NO_HZ
+restarts the tick.
+
+The decisive part needs no more than those two symbols. At 100k pkt/s the NAPI
+poll runs on the order of 1,500 times a second in bursts of tens of
+microseconds. A sampler with 10 ms resolution that attributes whole ticks cannot
+resolve work at that timescale; over a 40-second window on two CPUs it has 8,000
+samples to characterise 12 million packets. The resulting variance is structural,
+not noise that averages out. Which specific mis-attribution produced the 96.25
+totals is not identified here, and does not need to be.
+
+Four successive attempts at a per-packet figure produced **1,583, then 4,132,
+then 1,870 ns/pkt**. None of them stand. There is no per-packet CPU cost for this
+box in this file. Getting one needs an instrument that does not read
+`/proc/stat`: a fixed-work yardstick timed by wall clock, or a capacity
+measurement built only from exact counters.
+
+Two rig confounders found along the way, neither of them the root cause but both
+capable of ruining a run on their own:
+
+- **`ttyd` spins.** Streaming the results file with `tail -f` through `ttyd` put
+  `ttyd` itself at 30.24 seconds and 100.8% of a core in one 30-second window,
+  and left 15-16 seconds of *user* time in three others. Start the run detached
+  with `setsid` over ssh and read the file afterwards. Never tail it live.
+- **`irqbalance` rewrites IRQ affinity mid-window.** Stop it for the duration.
+  Put it back afterwards - it had arranged a sensible split, RX on CPU0 and TX
+  on CPU1.
+
+### 18.4 The wired receive path is one kernel thread, on a device with no sysfs entry
+
+Per-task CPU sampling - reading `utime` and `stime` from `/proc/<pid>/stat`,
+because busybox `top` and `ps` do not list kernel threads at all - named the
+holder of the receive work as a thread called `napi/mtk_eth-6`. That comes from
+an OpenWrt patch, not upstream:
+
+`target/linux/generic/pending-6.12/702-net-ethernet-mtk_eth_soc-enable-threaded-NAPI.patch`,
+Felix Fietkau, 2022, *"This can improve performance under load by ensuring that
+NAPI processing is not pinned on CPU 0."*
+
+    + eth->dummy_dev->threaded = 1;
+    + strcpy(eth->dummy_dev->name, "mtk_eth");
+      netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
+      netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
+
+The thread name follows from `dev.c:1508`,
+`kthread_run(napi_threaded_poll, n, "napi/%s-%d", n->dev->name, n->napi_id)` -
+hence `napi/mtk_eth-<napi_id>`. Which of the two ids is RX is inferred from the
+registration order above, not read.
+
+Four consequences, and they compound:
+
+**`cat /sys/class/net/eth1/threaded` returns `0` and is not wrong.** It is
+answering about eth1's own NAPI list, which is empty. Both NAPI instances belong
+to `eth->dummy_dev` (`mtk_eth_soc.c:5732-5733`), and a dummy netdev has no sysfs
+directory for the attribute to appear in. There is no runtime switch for
+threading on this path.
+
+**The thread's time lands in two places at once.** `napi_threaded_poll_loop()`
+runs the poll under bh-disabled - `local_bh_disable()` at `dev.c:7014`,
+`__napi_poll()` at `7021`, `local_bh_enable()` at `7033` - so the same
+microseconds appear as `softirq` in `/proc/stat` and as `stime` for the thread.
+They are not additive. Measured, one clean window: per-task sampling attributed
+7.69 s to `napi/mtk_eth-6` over 30 s while `/proc/stat` softirq for the
+overlapping window was 7.28 s. That pair identifies the thread as the holder,
+which is all it is good for; it does not quantify the cost, per 18.3.
+
+**RPS backlog work for the local CPU happens inside that same thread.**
+`dev.c:4919` skips raising `NET_RX_SOFTIRQ` when `sd->in_napi_threaded_poll` is
+set, and `dev.c:7027-7030` dispatches pending RPS IPIs inside the bh-disabled
+region before it ends. So RPS does not cleanly separate into its own accounting
+bucket either.
+
+**Receive is single-threaded.** Exactly two `netif_napi_add` calls in the whole
+driver, one per direction, and no `netif_set_real_num_rx_queues` or
+`num_rx_queues` anywhere in it - so no RSS and no second receive NAPI. RPS is the
+only mechanism that gets CPU1 into this path at all, which makes the
+packet-steering default a load-bearing choice rather than a tuning nicety.
+
+**Pinning the interrupt does not pin the work.** `echo 1 >
+/proc/irq/76/smp_affinity` fixes where the hard IRQ lands; the poll runs in a
+schedulable thread the scheduler is free to migrate, and patch 702 exists
+precisely so that it can. Stabilising where receive work happens means `taskset`
+on the `napi/mtk_eth` thread, not on the IRQ.
+
+So `eth->dummy_dev` is responsible for three separate constraints on this board:
+no ifindex, so every ifindex-based BPF helper fails (16.2, re-verified in 18.7);
+no sysfs, so NAPI threading cannot be controlled at runtime; and it owns the NAPI
+instance the entire wired receive path runs inside.
+
+### 18.5 What this changes, and what it does not
+
+**#101 and #102 are unaffected.** They were decided by 16.2, 16.3 and 17.2, all
+read from kernel source and none dependent on today's numbers. Every link in
+those chains was re-read against 6.12.103 before this section was written - see
+18.7, including one refinement that makes 16.2 stronger than it was.
+
+**#114 closes as bounded by instrumentation**, not as answered.
+
+**What is now better founded is narrower and more defensible than #102 was:
+native XDP on `eth0` for flood absorption.** A static filter needs neither
+`bpf_xdp_flow_lookup()` nor `ctx->ingress_ifindex`, which is exactly why
+`xdp-filter` worked where a flow-aware program structurally cannot. Whether it is
+worth shipping depends on a capacity number this session could not produce.
+
+Sizing it needs a generator that can exceed the box's capacity, and the obvious
+one cannot. **Measured: WSL2 is not a usable packet source for this.** Four
+unpaced worker processes never cleared 150k pkt/s. Paced at 100k it delivered
+99.9k, which says the cap sits between those two figures and nothing more.
+Reasoned, not established: WSL2 traffic crosses a Hyper-V virtual switch with
+NAT, where small-packet rates are known to be poor. Distinguishing the VM
+boundary from Python's own per-packet cost takes one test - run the same unpaced
+flood natively on Windows and see whether it clears 150k.
+
+For whoever picks this up: 64-byte UDP occupies 130 bytes on the wire - a
+106-byte frame, 4 bytes of FCS, and 20 bytes of preamble, SFD and inter-frame gap
+- so gigabit line rate is **961,538 pkt/s** and the 2.5G WAN port is
+**2,403,846 pkt/s**. A sizing run must offer more than the path under test can
+absorb, or it measures the generator.
+
+### 18.6 Operational notes for repeating this
+
+- `xdp-filter` is on the image; no compiler and no object transfer needed.
+  `xdp-filter status` gives exact per-action and per-port counters.
+- **Attaching or detaching a program bounces the link.** `mtk_xdp_setup()` sets
+  `need_update = !!eth->prog != !!prog` and then calls `mtk_stop(dev)` and
+  `mtk_open(dev)` around the swap, so the bounce happens on the zero-to-one and
+  one-to-zero transitions but not on a program replacement. `ip -d link show
+  eth1` caught it as `NO-CARRIER ... state DOWN` immediately after a load. Allow
+  several seconds of settle before opening a window.
+- Use `/proc/net/dev` `rx_packets` for the packet count. ethtool's `rx_xdp_*`
+  counters are cumulative and survive an unload, so a stale non-zero reading
+  looks live while never advancing - which silently produced a window reporting
+  zero packets.
+- Sink the test flow at `type filter hook input priority 10`, or ICMP
+  port-unreachable generation sits in the pass conditions and not the drop ones.
+- Have the runner wait for traffic rather than relying on starting two sides in
+  the right order. One run measured an idle link for four straight windows.
+- Run detached over ssh, stop `irqbalance`, and read the output file only after
+  the run finishes.
+
+### 18.7 Re-verified against 6.12.103 before closing #101 and #102
+
+Both tasks are being closed on source reading rather than measurement, so every
+link was re-read in the build tree rather than trusted from an earlier session.
+
+| Claim | Where | Status |
+|---|---|---|
+| The XDP rxq's dev is the dummy netdev, for both wired ports | `mtk_eth_soc.c:2115` `__xdp_rxq_info_reg(xdp_q, eth->dummy_dev, id, eth->rx_napi.napi_id, PAGE_SIZE)` | confirmed |
+| A dummy netdev has ifindex 0 | `init_dummy_netdev_core()` at `dev.c:10699` sets only `reg_state = NETREG_DUMMY` and never assigns an ifindex; the sole assigners are `register_netdevice()` at `dev.c:10571-10574` and the netns-move path at `11683-11741`, and a dummy goes through neither | confirmed (was reasoned) |
+| `ctx->ingress_ifindex` reads that dev | `filter.c:10246-10255` - `xdp_buff->rxq` then `xdp_rxq_info->dev` then `net_device->ifindex` | confirmed |
+| The flowtable kfunc is keyed on the rxq's dev | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, &tuple, proto)`; `nf_flowtable_by_dev()` at `nf_flow_table_xdp.c:27-33` keys on `unsigned long key = (unsigned long)dev` and matches `iter->net_device_addr` | confirmed, and stronger than 16.2 said |
+| One program covers both wired ports | `mtk_xdp_setup()` does `rcu_replace_pointer(eth->prog, …)` - the pointer is on `struct mtk_eth`, not per-netdev | confirmed |
+| Attach and detach bounce the link | `mtk_xdp_setup()` `mtk_stop(dev)` / `mtk_open(dev)` guarded by `need_update` | confirmed |
+| Generic `XDP_REDIRECT` bypasses the qdisc | `xdp_do_generic_redirect()` at `filter.c:4628`, ifindex path: `skb->dev = fwd; generic_xdp_tx(skb, xdp_prog);` at `4653-4655`. `generic_xdp_tx()` at `dev.c:5242-5263` goes `netdev_core_pick_tx` then `HARD_TX_LOCK` then `netdev_start_xmit` with no qdisc | confirmed for `bpf_redirect()` |
+| ditto for `bpf_redirect_map()` | the devmap case goes to `dev_map_generic_redirect()` at `filter.c:4600`, which lives in `kernel/bpf/devmap.c` | **not re-checked in this tree** |
+| `do_xdp_generic` is exported | `dev.c:5301` `EXPORT_SYMBOL_GPL(do_xdp_generic)` | confirmed |
+
+Two refinements worth carrying forward.
+
+**16.2 is stronger than stated.** The flowtable is selected by the `net_device *`
+**pointer**, not by ifindex. The tuple's own `.iifidx` comes from the
+caller-supplied `fib_tuple->ifindex`, so a program *can* put a correct ifindex in
+the tuple - and it still fails, because the flowtable it would be looked up in is
+chosen from `xdp->rxq->dev`, which is `eth->dummy_dev` and is never inserted into
+any flowtable. There is no way for an XDP program on the wired ports to reach the
+flowtable, not even by hardcoding the right interface.
+
+**17.2 is half re-verified.** The plain `bpf_redirect()` path provably bypasses
+the qdisc in this tree. The `bpf_redirect_map()` path was read in an earlier
+session and not re-read here; its call site is `filter.c:4600`. The conclusion
+17.2 draws - that a wwan0 generic-XDP fastpath cannot be always-on alongside SQM
+- stands on the verified half alone, since a fastpath would use one path or the
+other and one is proven.
