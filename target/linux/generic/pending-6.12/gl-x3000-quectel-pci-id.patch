@@ -1,6 +1,6 @@
 --- a/drivers/bus/mhi/host/pci_generic.c
 +++ b/drivers/bus/mhi/host/pci_generic.c
-@@ -781,6 +781,9 @@ static const struct pci_device_id mhi_pc
+@@ -791,6 +791,9 @@ static const struct pci_device_id mhi_pc
  		.driver_data = (kernel_ulong_t) &mhi_telit_fn980_hw_v1_info },
  	{ PCI_DEVICE(PCI_VENDOR_ID_QCOM, 0x0306),
  		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx55_info },
