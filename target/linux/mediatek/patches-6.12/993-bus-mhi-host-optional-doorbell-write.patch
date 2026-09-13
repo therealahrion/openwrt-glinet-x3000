@@ -44,9 +44,10 @@ Cost when enabled is one MMIO write per queued buffer.
 Out-of-tree patch for the GL-X3000 lean build; independent of 991 and
 992 and can be dropped on its own.
 
+diff -uprN a/drivers/bus/mhi/host/init.c b/drivers/bus/mhi/host/init.c
 --- a/drivers/bus/mhi/host/init.c
 +++ b/drivers/bus/mhi/host/init.c
-@@ -772,6 +772,44 @@
+@@ -772,6 +772,44 @@ error_ev_cfg:
  	return -EINVAL;
  }
  
@@ -91,7 +92,7 @@ Out-of-tree patch for the GL-X3000 lean build; independent of 991 and
  static int parse_ch_cfg(struct mhi_controller *mhi_cntrl,
  			const struct mhi_controller_config *config)
  {
-@@ -871,6 +909,13 @@
+@@ -871,6 +909,13 @@ static int parse_ch_cfg(struct mhi_contr
  			}
  		}
  

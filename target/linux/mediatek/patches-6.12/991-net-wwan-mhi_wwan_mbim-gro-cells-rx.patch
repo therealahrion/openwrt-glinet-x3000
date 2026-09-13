@@ -64,9 +64,10 @@ Details:
 Out-of-tree patch for the GL-X3000 lean build; bench before trusting
 (iperf3 downlink CPU + latency-under-load A/B, gro on vs off).
 
+diff -uprN a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
 --- a/drivers/net/wwan/Kconfig
 +++ b/drivers/net/wwan/Kconfig
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,7 @@ config MHI_WWAN_CTRL
  config MHI_WWAN_MBIM
          tristate "MHI WWAN MBIM network driver for QCOM-based PCIe modems"
          depends on MHI_BUS
@@ -74,6 +75,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
          help
            MHI WWAN MBIM is a WWAN network driver for QCOM-based PCIe modems.
            It implements MBIM over MHI, for IP data aggregation and muxing.
+diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
 @@ -15,6 +15,8 @@
@@ -94,7 +96,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -48,6 +52,7 @@
+@@ -48,6 +52,7 @@ struct mhi_mbim_link {
  	struct mhi_mbim_context *mbim;
  	struct net_device *ndev;
  	unsigned int session;
@@ -102,7 +104,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -252,6 +257,87 @@
+@@ -252,6 +257,87 @@ static int mbim_rx_verify_ndp16(struct s
  	return ret;
  }
  
@@ -190,7 +192,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -345,7 +431,19 @@
+@@ -345,7 +431,19 @@ static void mhi_mbim_rx(struct mhi_mbim_
  			u64_stats_add(&link->rx_bytes, skbn->len);
  			u64_stats_update_end(&link->rx_syncp);
  
@@ -211,7 +213,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  		}
  unlock:
  		rcu_read_unlock();
-@@ -538,7 +636,32 @@
+@@ -538,7 +636,32 @@ static int mhi_mbim_ndo_stop(struct net_
  	return 0;
  }
  
@@ -244,7 +246,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  	.ndo_open = mhi_mbim_ndo_open,
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
-@@ -550,6 +673,7 @@
+@@ -550,6 +673,7 @@ static int mhi_mbim_newlink(void *ctxt,
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  	struct mhi_mbim_context *mbim = ctxt;
@@ -252,7 +254,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  
  	link->mbim = mbim;
  	link->session = mhi_mbim_get_link_mux_id(link->mbim->mdev->mhi_cntrl) + if_id;
-@@ -567,7 +691,13 @@
+@@ -567,7 +691,13 @@ static int mhi_mbim_newlink(void *ctxt,
  	/* Already protected by RTNL lock */
  	hlist_add_head_rcu(&link->hlnode, &mbim->link_list[LINK_HASH(if_id)]);
  
@@ -267,7 +269,7 @@ Out-of-tree patch for the GL-X3000 lean build; bench before trusting
  }
  
  static void mhi_mbim_dellink(void *ctxt, struct net_device *ndev,
-@@ -589,6 +719,8 @@
+@@ -589,6 +719,8 @@ static void mhi_mbim_setup(struct net_de
  	ndev->hard_header_len = 0;
  	ndev->addr_len = 0;
  	ndev->flags = IFF_POINTOPOINT | IFF_NOARP;

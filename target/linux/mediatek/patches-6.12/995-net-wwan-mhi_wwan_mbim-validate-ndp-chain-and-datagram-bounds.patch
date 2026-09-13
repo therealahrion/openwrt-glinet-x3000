@@ -34,7 +34,7 @@ The three error paths now share mhi_mbim_rx_error(), which also replaces
 the open-coded counting on the existing unknown-protocol path.
 
 Provenance, because this matters for how long the patch lives here:
-these are upstream bugs, not mine, and fixes for two of them were posted
+these are upstream bugs, not ours, and fixes for two of them were posted
 to netdev on 2026-09-11 by Guanglei Zhu ("guard against a cyclic NDP
 chain" and "check skb_copy_bits() return value"), both tagged against
 commit aa730a9905b7 and copied to stable, with an earlier bounds-check
@@ -43,7 +43,7 @@ of 2026-09-12 none had been merged, and OpenWrt 25.12 is pinned to
 6.12.103, so the image needs its own copy in the meantime.
 
 That makes this patch a local carry with an expiry date, and it is NOT
-for submission - sending a separate version of a fix already on the list
+for submission - sending our own version of a fix already on the list
 would waste reviewer time. Drop it when the upstream versions reach
 6.12.y. The helper is named mhi_mbim_rx_error() rather than upstream's
 mhi_mbim_rx_drop() so that the collision is loud when that happens.
@@ -59,9 +59,10 @@ pristine source instead.
 
 Out-of-tree patch for the GL-X3000 lean build.
 
+diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
-@@ -441,6 +441,19 @@
+@@ -441,6 +441,19 @@ static int mhi_mbim_ndo_bpf(struct net_d
  	}
  }
  
@@ -81,7 +82,7 @@ Out-of-tree patch for the GL-X3000 lean build.
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -457,7 +470,7 @@
+@@ -457,7 +470,7 @@ static void mhi_mbim_rx(struct mhi_mbim_
  		struct usb_cdc_ncm_ndp16 ndp16;
  		struct usb_cdc_ncm_dpe16 dpe16;
  		struct mhi_mbim_link *link;
@@ -90,7 +91,7 @@ Out-of-tree patch for the GL-X3000 lean build.
  		unsigned int session;
  
  		if (skb_copy_bits(skb, ndpoffset, &ndp16, sizeof(ndp16))) {
-@@ -507,6 +520,18 @@
+@@ -507,6 +520,18 @@ static void mhi_mbim_rx(struct mhi_mbim_
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -109,7 +110,7 @@ Out-of-tree patch for the GL-X3000 lean build.
  			/* XDP programs are entitled to XDP_PACKET_HEADROOM in front
  			 * of the data for bpf_xdp_adjust_head().  Reserving it here
  			 * keeps netif_skb_check_for_xdp() from having to
-@@ -523,7 +548,17 @@
+@@ -523,7 +548,17 @@ static void mhi_mbim_rx(struct mhi_mbim_
  
  			skb_reserve(skbn, headroom);
  			skb_put(skbn, dgram_len);
@@ -128,7 +129,7 @@ Out-of-tree patch for the GL-X3000 lean build.
  
  			if (xdp_prog &&
  			    !mhi_mbim_xdp_rx(link, xdp_prog, &skbn))
-@@ -533,10 +568,7 @@
+@@ -533,10 +568,7 @@ static void mhi_mbim_rx(struct mhi_mbim_
  			if (unlikely(!skbn->protocol)) {
  				net_err_ratelimited("%s: unknown protocol\n",
  						    link->ndev->name);
@@ -140,7 +141,7 @@ Out-of-tree patch for the GL-X3000 lean build.
  				continue;
  			}
  
-@@ -562,10 +594,21 @@
+@@ -562,10 +594,21 @@ static void mhi_mbim_rx(struct mhi_mbim_
  unlock:
  		rcu_read_unlock();
  next_ndp:

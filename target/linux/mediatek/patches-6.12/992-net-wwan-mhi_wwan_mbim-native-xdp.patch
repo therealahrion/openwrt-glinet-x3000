@@ -71,6 +71,7 @@ the zero-copy page-flip fast path XDP has on real NICs.
 
 Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
+diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
 @@ -11,6 +11,7 @@
@@ -89,7 +90,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  /* 3500 allows to optimize skb allocation, the skbs will basically fit in
   * one 4K page. Large MBIM packets will simply be split over several MHI
-@@ -53,6 +55,7 @@
+@@ -53,6 +55,7 @@ struct mhi_mbim_link {
  	struct net_device *ndev;
  	unsigned int session;
  	struct gro_cells gcells;
@@ -97,7 +98,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -338,6 +341,106 @@
+@@ -338,6 +341,106 @@ static void mhi_mbim_set_gro_hash(struct
  	skb_set_hash(skb, jhash_3words(a, b, ports, proto), PKT_HASH_TYPE_NONE);
  }
  
@@ -204,7 +205,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -391,6 +494,8 @@
+@@ -391,6 +494,8 @@ static void mhi_mbim_rx(struct mhi_mbim_
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -213,7 +214,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -402,21 +507,30 @@
+@@ -402,21 +507,30 @@ static void mhi_mbim_rx(struct mhi_mbim_
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -253,12 +254,12 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  				net_err_ratelimited("%s: unknown protocol\n",
  						    link->ndev->name);
  				dev_kfree_skb_any(skbn);
-@@ -656,6 +770,12 @@
+@@ -656,6 +770,12 @@ static void mhi_mbim_ndo_uninit(struct n
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  
 +	/* dev_xdp_uninstall() has normally already detached the program
-+	 * via ndo_bpf by the time this runs; this is belt and braces
++	 * via ndo_bpf by the time we get here; this is belt and braces
 +	 * for any path that has not, and is a no-op when the pointer is
 +	 * already NULL.
 +	 */
@@ -266,7 +267,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  }
  
-@@ -666,6 +786,7 @@
+@@ -666,6 +786,7 @@ static const struct net_device_ops mhi_m
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
@@ -274,7 +275,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -727,6 +848,13 @@
+@@ -727,6 +848,13 @@ static void mhi_mbim_setup(struct net_de
  	ndev->max_mtu = MHI_MAX_BUF_SZ - ndev->needed_headroom;
  	ndev->tx_queue_len = 1000;
  	ndev->needs_free_netdev = true;
