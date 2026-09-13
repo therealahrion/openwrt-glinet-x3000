@@ -184,3 +184,15 @@ v3 fields (`bw_hi[2]`, `bw_lo`, `inflight_hi`/`_lo`, `bw_probe_up_cnt`,
 `ecn_alpha`, `struct tcp_plb_state plb`) are present and v1's are gone
 (`struct minmax bw`, `rtt_cnt`, `lt_*`, `packet_conservation`). Recorded in
 `xdp-methods-tested.md` section 20.2.
+
+Run on 2026-09-13, on the flash carrying the quilt-regenerated patch set, and both
+halves held. `net.ipv4.tcp_congestion_control` read `bbr`, `lsmod` showed `tcp_bbr`
+loaded with 20 references, and the BTF dump listed `undo_bw_lo`,
+`undo_inflight_lo`/`_hi`, `bw_lo`, `bw_hi`, `inflight_lo`/`_hi`, `bw_probe_up_cnt`,
+`ecn_alpha` as a 9-bit bitfield, and `plb`.
+
+The second grep is the half that actually proves it, and the easy one to skip:
+searching the same dump for `lt_bw`, `lt_rtt_cnt`, `packet_conservation` and
+`rtt_cnt` printed nothing. Present-v3-fields alone would not rule out a hybrid; the
+empty result does. Run both, and treat a non-empty second grep as a failure even if
+the first looks right.

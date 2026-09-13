@@ -2074,6 +2074,34 @@ averaging under 1092 bytes to be real, rather than being impossible. It stays
 unquoted until a run with the instrumented `gro_measure()` reports bytes per skb
 alongside it, but the rate-scaling behaviour itself is no longer in doubt.
 
+**2026-09-13 closes the bytes-per-skb condition this section set.** The first
+full-platform run after the patch set was regenerated with quilt reported, from
+`verify-992a.sh` section 4 at an offered load of about 119 Mbit/s: `aggregation=8.11x`
+with `bytes per delivered skb=11606`. That is the instrumented reading 21.3 was
+waiting for, so the arithmetic can now be closed rather than bounded from one side.
+
+A mean datagram of `11606 / 8.11 = 1431` bytes puts the ceiling at
+`65536 / 1431 = 45.8x` on this link. So **24.8x was never arithmetically
+suspect** - it needs datagrams no larger than 2643 bytes and these are 1431 - but
+**the 60x reading withdrawn in 18.5 is not reachable at this datagram size**,
+because 60x would need a mean under 1092 bytes. 18.5 was right to withdraw it, and
+it should stay withdrawn unless a run shows datagrams that small. Three rates now
+line up the way rate-scaling predicts: 2.20x at the low 2026-09-11 rate, 8.11x at
+119 Mbit/s, 24.8x at the 2026-09-09 rate.
+
+The same run reproduced the skb-mode collapse a third time - 1.00x attached in skb
+mode against an 8.11x baseline, recovering to 6.75x on detach - and the driver-mode
+attach held GRO at 7.37x, with `rx_errors` steady at 0 across both. 27 checks
+passed, none failed. Worth recording for what it verifies beyond 992: this was the
+first run against the quilt-regenerated 990/991/992/993/995, so it is also the
+hardware evidence that regenerating those patches changed nothing observable.
+
+One caveat on all three figures: the load generator defaults to
+`https://proof.ovh.net/files/1Gb.dat` and reported only 119 Mbit/s on a 5G WAN, so
+the source is very likely the ceiling rather than the link. Treat 8.11x as a floor
+for that rate, not the achievable maximum - see the work queue item on pointing the
+harness at a faster source.
+
 ### 21.4 Design rules that fall out
 
 1. **Never attach in skb mode on this box.** It costs GRO and LRO everywhere, and
