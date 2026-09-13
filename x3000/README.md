@@ -155,22 +155,6 @@ And adds:
     `telegraf-full`.
   * **procps-ng-ps**: real `ps` replacing busybox's stub, swapped in
     via the OpenWrt alternatives system at `/bin/ps`.
-  * **luci-theme-argon** ([jerrykuku/luci-theme-argon](https://github.com/jerrykuku/luci-theme-argon)
-    v2.4.7 — the 25.12 luci feed carries only bootstrap, footstrap,
-    material, openwrt and openwrt-2020, so it comes from
-    `x3000/custom-feeds.txt`). It is the theme a fresh flash comes up
-    on, and nothing here makes that happen: the package's own
-    `/etc/uci-defaults/30_luci-theme-argon` sets `mediaurlbase` once,
-    guarded on `luci.themes.Argon` being absent, so a theme picked
-    later in LuCI survives the next sysupgrade. `luci-theme-bootstrap`
-    stays in as the fallback, since `luci-base` ships
-    `/etc/config/luci` pointing at it.
-  * **luci-compat**: the pre-JS CBI/Lua form layer. Nothing in the
-    image needs it — on the 25.12 feed only `luci-app-openvpn` does —
-    but most of the Fantastic Packages catalogue is still on the old
-    API, and apk cannot add a missing LuCI runtime after flashing. It
-    pulls `luci-lua-runtime` and six further libs; `luci-base` and
-    `lua` were already in.
 
 ## Hardware
 
@@ -353,11 +337,10 @@ the `prepare.sh` run that composes it into `.config`.
 
 ## Pinning custom packages
 
-Most entries in `x3000/custom-feeds.txt` track `master`, which follows
-fixes — handy during development but not reproducible. The one exception
-is `luci-theme-argon`, pinned to the `v2.4.7` tag: that entry decides
-what the web UI looks like, and a `prepare.sh` run should not change
-that underneath you.
+Entries in `x3000/custom-feeds.txt` mostly track `master`, which follows
+fixes — handy during development but not reproducible. A `<ref>` can be a
+branch, a tag or a commit SHA; the file itself records which entries pin
+something other than a branch, and why.
 
 For production builds, replace each `master` with a commit SHA, e.g.
 

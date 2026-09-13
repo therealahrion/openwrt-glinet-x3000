@@ -53,4 +53,10 @@ fantastic-packages-feeds https://github.com/fantastic-packages/fantastic-package
 # `master`, so the tag is the pin: v2.4.7 rather than a branch, because this
 # one decides what the web UI looks like and a prepare.sh run should not
 # change that underneath you. The Makefile sits at the repo root, hence ".".
+#
+# Do not be alarmed when the box reports luci-theme-argon-2.4.6-r20260731:
+# that is correct. Upstream bumps PKG_VERSION *after* tagging, so the v2.4.7
+# tag (2a28799c) still carries 2.4.6/20260731 in its Makefile and the bump
+# landed on master afterwards (ddefe5f0). The tag is the stable reference;
+# the version string it builds under is one release behind its own name.
 luci-theme-argon        https://github.com/jerrykuku/luci-theme-argon.git           v2.4.7  .

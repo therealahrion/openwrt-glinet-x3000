@@ -403,20 +403,22 @@ and how to read its state on a running router:
                   post-flash click, and most of the Fantastic Packages
                   catalogue becomes genuinely installable instead of
                   failing on a LuCI runtime that apk cannot add later.
-  Impact(s):      luci-compat pulls the whole LuCI Lua runtime - seven
-                  packages on top of luci-base and lua, which were already
-                  in. The theme costs only itself: it is ucode-based, and
-                  both its dependencies are already here - uclient-fetch
-                  provides wget-any, and busybox brings jsonfilter in with
-                  its ntpd applet. Nothing in the image needs luci-compat
-                  today; it is there for what gets installed later.
+  Impact(s):      luci-compat pulls the whole LuCI Lua runtime, eight
+                  packages in all. luci-base and lua were already in, and
+                  so was libubus-lua, which prometheus-node-exporter-lua
+                  already depends on. The theme costs only itself: it is
+                  ucode-based, and both its dependencies are already here -
+                  uclient-fetch provides wget-any, and base-files pulls
+                  jsonfilter unconditionally. Nothing in the image needs
+                  luci-compat today; it is there for what comes later.
   Limitation(s):  The theme is pinned to a tag, so a newer Argon release
                   means bumping custom-feeds.txt. No uci-defaults script
                   of ours sets the theme: the package ships its own, which
                   fires once on a fresh config and afterwards leaves a
                   theme chosen in LuCI alone.
-  Attribution(s): Integration mine. The theme is jerrykuku/luci-theme-argon
-                  (Apache-2.0); luci-compat is from the OpenWrt luci feed.
+  Attribution(s): Mine. The inventory row, and how to read the theme on a
+                  running box:
+                      - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
   </pre>
 
 ---

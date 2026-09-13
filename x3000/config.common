@@ -401,23 +401,27 @@ CONFIG_PACKAGE_luci-app-mwan3=y
 # Packages repo above offers at runtime. Installing one of those later is an
 # apk call on the box, and apk cannot add a LuCI runtime that is missing.
 #
-# Cost, read off the Makefiles rather than guessed: LUCI_DEPENDS is
-# +luci-lua-runtime, whose own LUCI_DEPENDS pulls luci-lib-base,
-# luci-lib-nixio, luci-lib-ip, luci-lib-jsonc, libubus-lua, liblucihttp-lua
-# and ucode-mod-lua. luci-base and lua were already in. Those seven are named
-# explicitly so a defconfig pass cannot quietly drop one.
+# Cost, computed from the dependency closure rather than guessed: LUCI_DEPENDS
+# is +luci-lua-runtime, whose own LUCI_DEPENDS names luci-base, lua,
+# luci-lib-base, luci-lib-nixio, luci-lib-ip, luci-lib-jsonc, libubus-lua,
+# liblucihttp-lua and ucode-mod-lua. Three of those were already here:
+# luci-base and lua directly, and libubus-lua through
+# prometheus-node-exporter-lua, whose DEPENDS carries it. So this adds eight
+# packages, and only those eight are listed - a line that selects what
+# something else already selects only looks like a decision.
 CONFIG_PACKAGE_luci-compat=y
 CONFIG_PACKAGE_luci-lua-runtime=y
 CONFIG_PACKAGE_luci-lib-base=y
 CONFIG_PACKAGE_luci-lib-nixio=y
 CONFIG_PACKAGE_luci-lib-ip=y
 CONFIG_PACKAGE_luci-lib-jsonc=y
-CONFIG_PACKAGE_libubus-lua=y
 CONFIG_PACKAGE_liblucihttp-lua=y
 CONFIG_PACKAGE_ucode-mod-lua=y
 
 # luci-theme-argon is not in the 25.12 luci feed, so it comes from
-# jerrykuku/luci-theme-argon via x3000/custom-feeds.txt, pinned to v2.4.7.
+# jerrykuku/luci-theme-argon via x3000/custom-feeds.txt, pinned to the v2.4.7
+# tag - which builds as 2.4.6-r20260731, because upstream bumps PKG_VERSION
+# after tagging; see the note in custom-feeds.txt before chasing that.
 # It is ucode-based with no luasrc/, and luci.mk only appends
 # +luci-lua-runtime when a package has luasrc/*, so the theme does not carry
 # any of the Lua cost above — that belongs to luci-compat alone.
@@ -425,10 +429,10 @@ CONFIG_PACKAGE_ucode-mod-lua=y
 # Its DEPENDS are "+USE_APK:wget-any +!USE_APK:wget +jsonfilter", and both
 # are already here, so the theme adds no package but itself. USE_APK is
 # default y in config/Config-build.in and uclient-fetch out of
-# DEFAULT_PACKAGES carries PROVIDES:=@wget-any; jsonfilter arrives with
-# busybox, whose DEPENDS include +BUSYBOX_CONFIG_NTPD:jsonfilter and whose
-# BUSYBOX_DEFAULT_NTPD is default y. Neither is restated below: a line that
-# selects what something else already selects only looks like a decision.
+# DEFAULT_PACKAGES carries PROVIDES:=@wget-any; jsonfilter is pulled
+# unconditionally by base-files, whose DEPENDS block starts
+# "+netifd +libc +jsonfilter", so it is in every OpenWrt image. Neither is
+# restated below, for the same reason as the block above.
 #
 # No uci-defaults script of ours sets the theme, and adding one would
 # duplicate what the package already does: it ships

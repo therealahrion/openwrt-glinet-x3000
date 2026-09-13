@@ -252,8 +252,8 @@ buys nothing over A. **Not recommended.**
 Source, v6.12:
 
 ```
-net/core/dev.c:4080   sch_ret = tcx_run(entry, skb, true);    /* ingress: pushes skb->mac_len */
-net/core/dev.c:4139   sch_ret = tcx_run(entry, skb, false);   /* egress:  no push */
+net/core/dev.c:4198   sch_ret = tcx_run(entry, skb, true);    /* ingress: pushes skb->mac_len */
+net/core/dev.c:4257   sch_ret = tcx_run(entry, skb, false);   /* egress:  no push */
 net/sched/cls_bpf.c:99  __skb_push(skb, skb->mac_len);        /* legacy cls_bpf, same */
 ```
 
