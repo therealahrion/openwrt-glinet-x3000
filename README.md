@@ -388,6 +388,37 @@ and how to read its state on a running router:
                       - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
   </pre>
 
+* **Web interface theme and compatibility layer**
+  `x3000/config.common`, `x3000/custom-feeds.txt`
+
+  <pre>
+  Description:    luci-theme-argon is the theme a fresh flash comes up on,
+                  pinned to v2.4.7 from jerrykuku/luci-theme-argon because
+                  the 25.12 luci feed carries only bootstrap, footstrap,
+                  material, openwrt and openwrt-2020. luci-compat adds the
+                  pre-JS CBI/Lua form layer so third-party LuCI apps that
+                  still use the old API can be installed on the box after
+                  flashing. luci-theme-bootstrap stays in as the fallback.
+  Benefit(s):     The router arrives on the intended theme with no
+                  post-flash click, and most of the Fantastic Packages
+                  catalogue becomes genuinely installable instead of
+                  failing on a LuCI runtime that apk cannot add later.
+  Impact(s):      luci-compat pulls the whole LuCI Lua runtime - seven
+                  packages on top of luci-base and lua, which were already
+                  in. The theme costs only itself: it is ucode-based, and
+                  both its dependencies are already here - uclient-fetch
+                  provides wget-any, and busybox brings jsonfilter in with
+                  its ntpd applet. Nothing in the image needs luci-compat
+                  today; it is there for what gets installed later.
+  Limitation(s):  The theme is pinned to a tag, so a newer Argon release
+                  means bumping custom-feeds.txt. No uci-defaults script
+                  of ours sets the theme: the package ships its own, which
+                  fires once on a fresh config and afterwards leaves a
+                  theme chosen in LuCI alone.
+  Attribution(s): Integration mine. The theme is jerrykuku/luci-theme-argon
+                  (Apache-2.0); luci-compat is from the OpenWrt luci feed.
+  </pre>
+
 ---
 
 OpenWrt Project is a Linux operating system targeting embedded devices. Instead

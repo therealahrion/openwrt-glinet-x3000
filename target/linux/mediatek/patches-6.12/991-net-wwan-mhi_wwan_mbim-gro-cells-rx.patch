@@ -64,7 +64,6 @@ Details:
 Out-of-tree patch for the GL-X3000 lean build; bench before trusting
 (iperf3 downlink CPU + latency-under-load A/B, gro on vs off).
 
-diff -uprN a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
 --- a/drivers/net/wwan/Kconfig
 +++ b/drivers/net/wwan/Kconfig
 @@ -52,6 +52,7 @@ config MHI_WWAN_CTRL
@@ -75,7 +74,6 @@ diff -uprN a/drivers/net/wwan/Kconfig b/drivers/net/wwan/Kconfig
          help
            MHI WWAN MBIM is a WWAN network driver for QCOM-based PCIe modems.
            It implements MBIM over MHI, for IP data aggregation and muxing.
-diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
 @@ -15,6 +15,8 @@

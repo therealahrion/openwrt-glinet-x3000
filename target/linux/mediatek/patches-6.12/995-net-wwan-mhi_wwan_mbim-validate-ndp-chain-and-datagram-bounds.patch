@@ -59,7 +59,6 @@ pristine source instead.
 
 Out-of-tree patch for the GL-X3000 lean build.
 
-diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
 @@ -441,6 +441,19 @@ static int mhi_mbim_ndo_bpf(struct net_d

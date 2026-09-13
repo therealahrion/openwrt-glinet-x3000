@@ -46,3 +46,11 @@ wifi-dethrash-collector https://github.com/vjt/openwrt-dethrash.git             
 # binary repo once these two are in the image.
 fantastic-keyring        https://github.com/fantastic-packages/fantastic-keyring.git         master  .
 fantastic-packages-feeds https://github.com/fantastic-packages/fantastic-packages-feeds.git  master  .
+
+# Argon LuCI theme. Not in the OpenWrt 25.12 luci feed, which carries only
+# bootstrap, footstrap, material, openwrt and openwrt-2020 — checked against
+# themes/ on the openwrt-25.12 branch, not assumed. Upstream maintains only
+# `master`, so the tag is the pin: v2.4.7 rather than a branch, because this
+# one decides what the web UI looks like and a prepare.sh run should not
+# change that underneath you. The Makefile sits at the repo root, hence ".".
+luci-theme-argon        https://github.com/jerrykuku/luci-theme-argon.git           v2.4.7  .

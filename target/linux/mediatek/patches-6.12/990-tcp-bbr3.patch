@@ -23,7 +23,6 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  net/ipv4/tcp_timer.c               |    1 +
  16 files changed, 1940 insertions(+), 553 deletions(-)
 
-diff -uprN a/include/linux/tcp.h b/include/linux/tcp.h
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -369,7 +369,9 @@ struct tcp_sock {
@@ -37,7 +36,6 @@ diff -uprN a/include/linux/tcp.h b/include/linux/tcp.h
  	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
  		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
  		fastopen_no_cookie:1, /* Allow send/recv SYN+data without a cookie */
-diff -uprN a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
 --- a/include/net/inet_connection_sock.h
 +++ b/include/net/inet_connection_sock.h
 @@ -138,8 +138,8 @@ struct inet_connection_sock {
@@ -51,7 +49,6 @@ diff -uprN a/include/net/inet_connection_sock.h b/include/net/inet_connection_so
  };
  
  #define ICSK_TIME_RETRANS	1	/* Retransmit timer */
-diff -uprN a/include/net/tcp.h b/include/net/tcp.h
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -377,6 +377,8 @@ static inline void tcp_dec_quickack_mode
@@ -222,7 +219,6 @@ diff -uprN a/include/net/tcp.h b/include/net/tcp.h
  
  static inline void tcp_plb_init(const struct sock *sk,
  				struct tcp_plb_state *plb)
-diff -uprN a/include/uapi/linux/inet_diag.h b/include/uapi/linux/inet_diag.h
 --- a/include/uapi/linux/inet_diag.h
 +++ b/include/uapi/linux/inet_diag.h
 @@ -229,6 +229,29 @@ struct tcp_bbr_info {
@@ -255,7 +251,6 @@ diff -uprN a/include/uapi/linux/inet_diag.h b/include/uapi/linux/inet_diag.h
  };
  
  union tcp_cc_info {
-diff -uprN a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
 --- a/include/uapi/linux/rtnetlink.h
 +++ b/include/uapi/linux/rtnetlink.h
 @@ -510,12 +510,14 @@ enum {
@@ -274,7 +269,6 @@ diff -uprN a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
  
  struct rta_session {
  	__u8	proto;
-diff -uprN a/include/uapi/linux/tcp.h b/include/uapi/linux/tcp.h
 --- a/include/uapi/linux/tcp.h
 +++ b/include/uapi/linux/tcp.h
 @@ -178,6 +178,7 @@ enum tcp_fastopen_client_fail {
@@ -285,7 +279,6 @@ diff -uprN a/include/uapi/linux/tcp.h b/include/uapi/linux/tcp.h
  
  /*
   * Sender's congestion state indicating normal or abnormal situations
-diff -uprN a/net/ipv4/Kconfig b/net/ipv4/Kconfig
 --- a/net/ipv4/Kconfig
 +++ b/net/ipv4/Kconfig
 @@ -670,15 +670,18 @@ config TCP_CONG_BBR
@@ -316,7 +309,6 @@ diff -uprN a/net/ipv4/Kconfig b/net/ipv4/Kconfig
  
  choice
  	prompt "Default TCP congestion control"
-diff -uprN a/net/ipv4/bpf_tcp_ca.c b/net/ipv4/bpf_tcp_ca.c
 --- a/net/ipv4/bpf_tcp_ca.c
 +++ b/net/ipv4/bpf_tcp_ca.c
 @@ -280,11 +280,15 @@ static void bpf_tcp_ca_pkts_acked(struct
@@ -346,7 +338,6 @@ diff -uprN a/net/ipv4/bpf_tcp_ca.c b/net/ipv4/bpf_tcp_ca.c
  	.cong_control = bpf_tcp_ca_cong_control,
  	.undo_cwnd = bpf_tcp_ca_undo_cwnd,
  	.sndbuf_expand = bpf_tcp_ca_sndbuf_expand,
-diff -uprN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
 @@ -3406,6 +3406,7 @@ int tcp_disconnect(struct sock *sk, int
@@ -366,7 +357,6 @@ diff -uprN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
  	if (tp->syn_data_acked)
  		info->tcpi_options |= TCPI_OPT_SYN_DATA;
  	if (tp->tcp_usec_ts)
-diff -uprN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
 --- a/net/ipv4/tcp_bbr.c
 +++ b/net/ipv4/tcp_bbr.c
 @@ -1,18 +1,19 @@
@@ -2973,7 +2963,6 @@ diff -uprN a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
  MODULE_LICENSE("Dual BSD/GPL");
  MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
 +MODULE_VERSION(__stringify(BBR_VERSION));
-diff -uprN a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
 --- a/net/ipv4/tcp_cong.c
 +++ b/net/ipv4/tcp_cong.c
 @@ -237,6 +237,7 @@ void tcp_init_congestion_control(struct
@@ -2984,7 +2973,6 @@ diff -uprN a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
  	if (icsk->icsk_ca_ops->init)
  		icsk->icsk_ca_ops->init(sk);
  	if (tcp_ca_needs_ecn(sk))
-diff -uprN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -375,7 +375,7 @@ static void __tcp_ecn_check_ce(struct so
@@ -3117,7 +3105,6 @@ diff -uprN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
-diff -uprN a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
 --- a/net/ipv4/tcp_minisocks.c
 +++ b/net/ipv4/tcp_minisocks.c
 @@ -461,6 +461,8 @@ void tcp_ca_openreq_child(struct sock *s
@@ -3129,7 +3116,6 @@ diff -uprN a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
  	if (ca_key != TCP_CA_UNSPEC) {
  		const struct tcp_congestion_ops *ca;
  
-diff -uprN a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
 --- a/net/ipv4/tcp_output.c
 +++ b/net/ipv4/tcp_output.c
 @@ -339,10 +339,9 @@ static void tcp_ecn_send_syn(struct sock
@@ -3239,7 +3225,6 @@ diff -uprN a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
  	if (__tcp_retransmit_skb(sk, skb, 1))
  		goto rearm_timer;
  
-diff -uprN a/net/ipv4/tcp_rate.c b/net/ipv4/tcp_rate.c
 --- a/net/ipv4/tcp_rate.c
 +++ b/net/ipv4/tcp_rate.c
 @@ -34,6 +34,24 @@
@@ -3318,7 +3303,6 @@ diff -uprN a/net/ipv4/tcp_rate.c b/net/ipv4/tcp_rate.c
  				    rs->prior_mstamp); /* ack phase */
  	rs->interval_us = max(snd_us, ack_us);
  
-diff -uprN a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
 --- a/net/ipv4/tcp_timer.c
 +++ b/net/ipv4/tcp_timer.c
 @@ -691,6 +691,7 @@ void tcp_write_timer_handler(struct sock

@@ -391,6 +391,61 @@ CONFIG_PACKAGE_fantastic-packages-feeds=y
 CONFIG_PACKAGE_mwan3=y
 CONFIG_PACKAGE_luci-app-mwan3=y
 
+# --- LuCI compatibility layer + Argon theme -------------------------------
+# Added 2026-09-13 on request.
+#
+# luci-compat is the pre-JS CBI/Lua form layer. Nothing already in this image
+# needs it — on the 25.12 luci feed the only package that depends on it is
+# luci-app-openvpn, which is not here — so it is baked in for third-party
+# LuCI apps that still use the old API, which is most of what the Fantastic
+# Packages repo above offers at runtime. Installing one of those later is an
+# apk call on the box, and apk cannot add a LuCI runtime that is missing.
+#
+# Cost, read off the Makefiles rather than guessed: LUCI_DEPENDS is
+# +luci-lua-runtime, whose own LUCI_DEPENDS pulls luci-lib-base,
+# luci-lib-nixio, luci-lib-ip, luci-lib-jsonc, libubus-lua, liblucihttp-lua
+# and ucode-mod-lua. luci-base and lua were already in. Those seven are named
+# explicitly so a defconfig pass cannot quietly drop one.
+CONFIG_PACKAGE_luci-compat=y
+CONFIG_PACKAGE_luci-lua-runtime=y
+CONFIG_PACKAGE_luci-lib-base=y
+CONFIG_PACKAGE_luci-lib-nixio=y
+CONFIG_PACKAGE_luci-lib-ip=y
+CONFIG_PACKAGE_luci-lib-jsonc=y
+CONFIG_PACKAGE_libubus-lua=y
+CONFIG_PACKAGE_liblucihttp-lua=y
+CONFIG_PACKAGE_ucode-mod-lua=y
+
+# luci-theme-argon is not in the 25.12 luci feed, so it comes from
+# jerrykuku/luci-theme-argon via x3000/custom-feeds.txt, pinned to v2.4.7.
+# It is ucode-based with no luasrc/, and luci.mk only appends
+# +luci-lua-runtime when a package has luasrc/*, so the theme does not carry
+# any of the Lua cost above — that belongs to luci-compat alone.
+#
+# Its DEPENDS are "+USE_APK:wget-any +!USE_APK:wget +jsonfilter", and both
+# are already here, so the theme adds no package but itself. USE_APK is
+# default y in config/Config-build.in and uclient-fetch out of
+# DEFAULT_PACKAGES carries PROVIDES:=@wget-any; jsonfilter arrives with
+# busybox, whose DEPENDS include +BUSYBOX_CONFIG_NTPD:jsonfilter and whose
+# BUSYBOX_DEFAULT_NTPD is default y. Neither is restated below: a line that
+# selects what something else already selects only looks like a decision.
+#
+# No uci-defaults script of ours sets the theme, and adding one would
+# duplicate what the package already does: it ships
+# /etc/uci-defaults/30_luci-theme-argon, which sets luci.main.mediaurlbase
+# exactly once, guarded on luci.themes.Argon being absent. On first boot it
+# sorts ahead of 30_luci-theme-bootstrap, whose own mediaurlbase set fires
+# only when that option is unset — and by then Argon has set it — so Argon
+# wins. Afterwards neither script touches the theme again, and /etc/config/
+# luci is a conffile that survives sysupgrade, so a theme picked later in
+# LuCI is what stays. Same persistence the markers in /lib/x3000/defaults.sh
+# give the other first-boot settings, but earned by the package's own guard.
+#
+# luci-theme-bootstrap stays in as the fallback: luci-base ships
+# /etc/config/luci pointing at it, and a theme that fails to render leaves no
+# way back through the UI.
+CONFIG_PACKAGE_luci-theme-argon=y
+
 # --- Explicitly OUT of the lean image (guards; last line wins) ------------
 # CONFIG_PACKAGE_qosify is not set
 # CONFIG_PACKAGE_sqm-scripts is not set

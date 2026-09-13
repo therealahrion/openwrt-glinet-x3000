@@ -30,6 +30,7 @@ so the zero-reject BBRv3 verification carries over intact.
 | irqbalance (2026-09-11) | `irqbalance` + `luci-app-irqbalance`. No kernel symbols — it only writes `/proc/irq/*/smp_affinity`. Inert as packaged: `/etc/config/irqbalance` ships `enabled '0'` and the init returns early, so `93-irqbalance` flips it. Can pull against packet steering, which moves NAPI threads and `rps_cpus` on the same two cores | `x3000/config.common`, `x3000/files-common/etc/uci-defaults/93-irqbalance` |
 | packet steering (2026-09-11) | `network.globals.packet_steering='2'` (LuCI "Enabled (all CPUs)") + `steering_flows='128'` ("Suggested: 128"). Set only when unset, so a LuCI choice survives. Not a measured win — see `xdp-methods-tested.md` 14.3/14.4 | `x3000/files-common/etc/uci-defaults/94-packet-steering` |
 | Fantastic Packages feed (2026-09-11) | `fantastic-keyring` + `fantastic-packages-feeds` — key into `/etc/apk/keys/`, repo lines into `/etc/apk/repositories.d/customfeeds.list`, written at image build time. Makes the catalogue installable with `apk add`; nothing from it is built in. No "allow untrusted" needed, because the keyring is present | `x3000/config.common`, `x3000/custom-feeds.txt` |
+| LuCI theme + compat layer (2026-09-13) | `luci-theme-argon` from `jerrykuku/luci-theme-argon` pinned to `v2.4.7` — the 25.12 luci feed carries only bootstrap, footstrap, material, openwrt and openwrt-2020, checked against `themes/` on that branch rather than assumed. **Nothing here sets the theme**: the package ships `/etc/uci-defaults/30_luci-theme-argon`, which writes `luci.main.mediaurlbase` once, guarded on `luci.themes.Argon` being absent, and sorts ahead of `30_luci-theme-bootstrap`, whose own write fires only when that option is unset — so Argon wins a fresh config, and afterwards neither script touches it, which is why a theme picked in LuCI survives the next sysupgrade. Same persistence the markers in `defaults.sh` give the rows above, but earned by the package's own guard, so adding a script of ours would be a duplicate. `luci-theme-bootstrap` stays in as the fallback, since `luci-base` ships `/etc/config/luci` pointing at it and a theme that fails to render leaves no way back through the UI. `luci-compat` is the pre-JS CBI/Lua form layer: nothing in the image needs it — on this feed only `luci-app-openvpn` depends on it — but most of the Fantastic catalogue above is still on the old API, and apk cannot add a missing LuCI runtime after flashing. Cost read off the Makefiles: `+luci-lua-runtime` pulls `luci-lib-base`, `-nixio`, `-ip`, `-jsonc`, `libubus-lua`, `liblucihttp-lua` and `ucode-mod-lua`. The theme is ucode-based with no `luasrc/`, so `luci.mk` attaches none of that to it, and it costs only itself — both its deps are already in the image: `USE_APK` is default y and `uclient-fetch` carries `PROVIDES:=@wget-any`, while `jsonfilter` comes with busybox, whose DEPENDS include `+BUSYBOX_CONFIG_NTPD:jsonfilter` against a `BUSYBOX_DEFAULT_NTPD` of `default y` | `x3000/config.common`, `x3000/custom-feeds.txt` |
 | eBPF userland | `tc-bpf` (tc-tiny unset), `libbpf`, `bpftool-full`, `xdp-loader`, `xdpdump` | `x3000/config.common` |
 | cake-autorate prereqs | `bash`, `fping` (the script itself is dropped in post-flash) | `x3000/config.common` |
 | WireGuard | `kmod-wireguard`, `wireguard-tools`, `luci-proto-wireguard` — inert until a wg interface exists | `x3000/config.common` |
@@ -119,6 +120,7 @@ forwarded flows in `OFFLOAD` state. Read the board, do not trust the row.
 | MHI doorbell (993) | on, via `modules.d` | `cat /sys/module/mhi/parameters/force_db_brst_disable` |
 | GRO on `wwan0` (991) | on | `ethtool -k wwan0 \| grep '^generic-receive-offload'` |
 | `netdev_max_backlog` | 1000 | `cat /proc/sys/net/core/netdev_max_backlog` |
+| LuCI theme | Argon | `uci -q get luci.main.mediaurlbase` — `/luci-static/argon` unless changed |
 
 ## Work queue, easiest to hardest
 
@@ -144,8 +146,8 @@ Build the **public** variant — vjt's `private` variant is his fleet image
 # fresh WSL clone of THIS branch — keep the qmodem build tree separate
 git clone -b lean <fork url> ~/x3000-lean && cd ~/x3000-lean
 ./x3000/prepare.sh public
-# gate before spending hours in make — expect 15, then 0, then 4:
-grep -c '^CONFIG_PACKAGE_\(kmod-sched-cake\|tc-bpf\|xdp-loader\|fping\|kmod-wireguard\|luci-proto-wireguard\|quectel-5g-tools\|modemmanager\|kmod-nft-offload\|kmod-zram\|zram-swap\|irqbalance\|luci-app-irqbalance\|fantastic-keyring\|fantastic-packages-feeds\)=y' .config
+# gate before spending hours in make — expect 17, then 0, then 4:
+grep -c '^CONFIG_PACKAGE_\(kmod-sched-cake\|tc-bpf\|xdp-loader\|fping\|kmod-wireguard\|luci-proto-wireguard\|quectel-5g-tools\|modemmanager\|kmod-nft-offload\|kmod-zram\|zram-swap\|irqbalance\|luci-app-irqbalance\|fantastic-keyring\|fantastic-packages-feeds\|luci-compat\|luci-theme-argon\)=y' .config
 grep -c '^CONFIG_PACKAGE_\(qosify\|sqm-scripts\|luci-app-sqm\|tc-tiny\)=y' .config
 grep -c '^CONFIG_KERNEL_ZRAM_\(BACKEND_LZO\|BACKEND_LZ4\|BACKEND_ZSTD\|DEF_COMP_LZORLE\)=y' .config
 make -j$(nproc)            # or ./x3000/build.sh public → bin-x3000-public/

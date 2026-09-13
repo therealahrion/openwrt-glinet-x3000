@@ -71,7 +71,6 @@ the zero-copy page-flip fast path XDP has on real NICs.
 
 Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 
-diff -uprN a/drivers/net/wwan/mhi_wwan_mbim.c b/drivers/net/wwan/mhi_wwan_mbim.c
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c
 @@ -11,6 +11,7 @@
