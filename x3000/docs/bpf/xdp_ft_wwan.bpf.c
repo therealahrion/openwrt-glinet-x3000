@@ -347,7 +347,7 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 
 	/* TCP teardown must reach conntrack, so hand FIN and RST to the stack.
 	 * nf_flow_state_check() does the same and additionally tears the flow
-	 * down; we cannot, so the stack's copy of this check is what retires it.
+	 * down; this program cannot, so the stack's copy of the check is what retires it.
 	 */
 	if (p.iph->protocol == IPPROTO_TCP) {
 		__u8 *flagsb = (__u8 *)p.ports + 13;
@@ -389,7 +389,7 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 	other = &flow->tuplehash[dir ? FLOW_OFFLOAD_DIR_ORIGINAL
 				    : FLOW_OFFLOAD_DIR_REPLY];
 
-	/* Egress. Only the direct form carries the addresses we need; NEIGH
+	/* Egress. Only the direct form carries the addresses required; NEIGH
 	 * would require a neighbour lookup this program cannot do, so those
 	 * flows stay on the stack's fast path where dst_cache handles them.
 	 */

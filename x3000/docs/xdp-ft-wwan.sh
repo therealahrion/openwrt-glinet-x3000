@@ -9,7 +9,7 @@
 #   xdp-ft-wwan.sh off            detach and unpin
 #
 # Run `check` first. Every gate it tests is one the program silently depends on,
-# so a failure here names the reason instead of leaving you with a program that
+# so a failure here names the reason rather than leaving a program that
 # loads and never hits.
 
 set -eu
@@ -53,7 +53,7 @@ check() {
 	need bpftool || true
 	need nft || true
 
-	# 1. The interface exists and is the raw-IP device we think it is.
+	# 1. The interface exists and is the raw-IP device the parser assumes.
 	if "$IP" link show "$IFACE" >/dev/null 2>&1; then
 		LT=$("$IP" link show "$IFACE" | sed -n 's|.*link/\([a-z]*\).*|\1|p' | head -1)
 		case "$LT" in
