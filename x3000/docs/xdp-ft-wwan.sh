@@ -25,6 +25,23 @@ ok()   { printf '  ok    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILED=1; }
 warn() { printf '  note  %s\n' "$*"; }
 
+# Busybox provides an `ip` that does not understand xdp, so the binary has to
+# be chosen by capability rather than by name. Same pick() and same candidate
+# list as verify-992a.sh.
+pick() {
+	for c in "$@"; do
+		[ -x "$c" ] || continue
+		"$c" link help 2>&1 | grep -qi xdp && { echo "$c"; return; }
+	done
+	echo ""
+}
+IP=$(pick /usr/libexec/ip-full /sbin/ip /usr/sbin/ip /bin/ip)
+if [ -z "$IP" ]; then
+	echo "FATAL: no iproute2 'ip' that understands xdp." >&2
+	echo "       install ip-full (CONFIG_PACKAGE_ip-full=y) and re-run." >&2
+	exit 1
+fi
+
 need() {
 	command -v "$1" >/dev/null 2>&1 || { bad "$1 not installed"; return 1; }
 }
@@ -37,8 +54,8 @@ check() {
 	need nft || true
 
 	# 1. The interface exists and is the raw-IP device we think it is.
-	if ip link show "$IFACE" >/dev/null 2>&1; then
-		if ip link show "$IFACE" | grep -q 'link/none'; then
+	if "$IP" link show "$IFACE" >/dev/null 2>&1; then
+		if "$IP" link show "$IFACE" | grep -q 'link/none'; then
 			ok "$IFACE is ARPHRD_NONE (raw IP, no L2 header) - as the program assumes"
 		else
 			bad "$IFACE is not link/none; this program parses IP at offset 0"
@@ -48,11 +65,11 @@ check() {
 	fi
 
 	# 2. 992 is loaded, so the attach lands in the driver hook and not generic.
-	if ip -d link show "$IFACE" 2>/dev/null | grep -q 'xdp'; then
+	if "$IP" -d link show "$IFACE" 2>/dev/null | grep -q 'xdp'; then
 		warn "$IFACE already has a program attached; 'off' first"
 	fi
-	if ip -d link show "$IFACE" 2>/dev/null | grep -qi 'xdp-features'; then
-		ip -d link show "$IFACE" | tr ' ' '\n' | grep -i 'xdp' | sed 's/^/        /'
+	if "$IP" -d link show "$IFACE" 2>/dev/null | grep -qi 'xdp-features'; then
+		"$IP" -d link show "$IFACE" | tr ' ' '\n' | grep -i 'xdp' | sed 's/^/        /'
 	fi
 
 	# 3. BTF, without which the kfunc object was never compiled.
@@ -94,7 +111,7 @@ check() {
 	# 6. A legal redirect target. Only devices advertising ndo_xmit qualify;
 	#    devmap refuses the rest, and neither wwan0 nor an AP netdev has it.
 	for t in eth0 eth1; do
-		if ip -d link show "$t" 2>/dev/null | grep -q 'ndo-xmit'; then
+		if "$IP" -d link show "$t" 2>/dev/null | grep -q 'ndo-xmit'; then
 			ok "$t advertises ndo-xmit and is a legal redirect target"
 		fi
 	done
@@ -109,7 +126,7 @@ load() {
 	fetch_obj
 	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 	bpftool prog loadall "$OBJ" "$PINDIR" pinmaps "$MAPDIR"
-	ip link set dev "$IFACE" xdp pinned "$PINDIR/$prog"
+	"$IP" link set dev "$IFACE" xdp pinned "$PINDIR/$prog"
 	say "attached $prog to $IFACE"
 }
 
@@ -177,7 +194,7 @@ fastpath) check && load xdp_ft_fastpath && say "" &&
           say "Attached. Watch for trouble: a client losing connectivity means the" &&
           say "rewrite is wrong - run 'off' immediately." && dump ;;
 status)   dump ;;
-off)      ip link set dev "$IFACE" xdp off 2>/dev/null || true
+off)      "$IP" link set dev "$IFACE" xdp off 2>/dev/null || true
           rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
           say "detached and unpinned" ;;
 *)        sed -n '2,12p' "$0" ;;
