@@ -3,6 +3,9 @@
 #
 #   xdp-ft-wwan.sh check          preflight only, changes nothing
 #   xdp-ft-wwan.sh probe [secs]   attach the counting program, sample, detach
+#   xdp-ft-wwan.sh dryrun [secs]  attach the fastpath's decision half, sample,
+#                                 detach - counts what the rewrite would have
+#                                 done without writing a byte to any packet
 #   xdp-ft-wwan.sh status         dump counters without touching the attach
 #   xdp-ft-wwan.sh off            detach and unpin
 #
@@ -20,10 +23,26 @@ set -eu
 
 IFACE=${IFACE:-wwan0}
 D=${D:-/tmp/xdp-ft-wwan}
-OBJ="$D/xdp_ft_probe.bpf"
 PINDIR=/sys/fs/bpf/xdp_ft
 MAPDIR=/sys/fs/bpf/xdp_ft_maps
 SECS=${2:-30}
+
+# Which object, which program in it, and what its counter slots mean. The
+# probe and the dry run share every mechanism here and differ only in these
+# three lines, so a fix to the harness reaches both.
+case "${1:-check}" in
+dryrun)
+	OBJNAME=xdp_ft_wwan.bpf
+	PROGNAME=xdp_ft_dryrun
+	SLOTS="seen parse_skip miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+	;;
+*)
+	OBJNAME=xdp_ft_probe.bpf
+	PROGNAME=xdp_ft_probe
+	SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err"
+	;;
+esac
+OBJ="$D/$OBJNAME"
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  ok    %s\n' "$*"; }
@@ -57,15 +76,15 @@ BPF_DIR=${BPF_DIR:-$_here/bpf}
 fetch_obj() {
 	mkdir -p "$D"
 	[ -s "$OBJ" ] && return 0
-	if [ -s "$BPF_DIR/xdp_ft_probe.bpf" ]; then
-		cat "$BPF_DIR/xdp_ft_probe.bpf" > "$OBJ"
+	if [ -s "$BPF_DIR/$OBJNAME" ]; then
+		cat "$BPF_DIR/$OBJNAME" > "$OBJ"
 	elif command -v curl >/dev/null 2>&1; then
-		curl -fsSL -o "$OBJ" "$BPF_URL/xdp_ft_probe.bpf" || true
+		curl -fsSL -o "$OBJ" "$BPF_URL/$OBJNAME" || true
 	elif command -v wget >/dev/null 2>&1; then
-		wget -q -O "$OBJ" "$BPF_URL/xdp_ft_probe.bpf" || true
+		wget -q -O "$OBJ" "$BPF_URL/$OBJNAME" || true
 	fi
 	[ -s "$OBJ" ] || {
-		say "no object: put xdp_ft_probe.bpf in $BPF_DIR, or let the router reach"
+		say "no object: put $OBJNAME in $BPF_DIR, or let the router reach"
 		say "$BPF_URL"
 		exit 1
 	}
@@ -155,7 +174,7 @@ load() {
 		say "load failed - nothing reached the kernel and nothing is attached"
 		return 1
 	fi
-	if ! "$IP" link set dev "$IFACE" xdp pinned "$PINDIR/xdp_ft_probe" 2>"$D/err"; then
+	if ! "$IP" link set dev "$IFACE" xdp pinned "$PINDIR/$PROGNAME" 2>"$D/err"; then
 		say "attach failed - the program loaded but is not on $IFACE"
 		sed -n '1,2p' "$D/err" | sed 's/^/        /'
 		rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
@@ -172,18 +191,66 @@ load() {
 	fi
 }
 
+legend() {
+	say ""
+	case "$PROGNAME" in
+	xdp_ft_dryrun)
+		say "  seen            packets the program looked at"
+		say "  parse_skip      not IPv4, fragmented, optioned, not TCP/UDP, short,"
+		say "                  or a TCP FIN/RST that has to reach conntrack"
+		say "  miss            the flowtable did not know the flow"
+		say "  hit             it did"
+		say "  bad_dir         tuple.dir outside 0..1, which should never happen"
+		say "  torn_down       the flow is being retired"
+		say "  not_direct      xmit_type is not DIRECT - NEIGH needs a lookup this"
+		say "                  program cannot do, so those stay on the stack"
+		say "  no_out_ifidx    DIRECT but no egress ifindex recorded"
+		say "  read_err        a probe read of the flow failed"
+		say "  would_redirect  everything checked out; the rewrite would have run"
+		say "  no_headroom     unused in a dry run"
+		say "  redirect        unused in a dry run"
+		say ""
+		say "  would_redirect over seen is the number that decides whether the"
+		say "  rewrite is worth attaching at all."
+		;;
+	*)
+		say "  seen          packets the program looked at"
+		say "  not_ipv4      version nibble was not 4"
+		say "  frag_or_opts  fragmented, or IP options present - the flowtable declines both"
+		say "  not_tcp_udp   another L4 protocol"
+		say "  short         truncated before the ports"
+		say "  miss          looked up, no such flow"
+		say "  hit           the flowtable knew the flow"
+		say "  lookup_err    the kfunc returned NULL. Note that an ordinary miss sets"
+		say "                opts.error too (nf_flow_table_bpf.c:47), so this counts"
+		say "                misses as well as refusals and the miss slot stays 0"
+		;;
+	esac
+	say ""
+}
+
+# `status` has no way of knowing which program left the map behind, and naming
+# twelve slots with the probe's eight labels would print confident nonsense. The
+# map itself says which: the probe declares eight entries, the dry run twelve.
+adopt_slots_from_map() {
+	ents=$(bpftool map show pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null \
+	       | sed -n 's/.*max_entries \([0-9][0-9]*\).*/\1/p' | head -1)
+	case "${ents:-}" in
+	12)
+		PROGNAME=xdp_ft_dryrun
+		SLOTS="seen parse_skip miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+		;;
+	8)
+		PROGNAME=xdp_ft_probe
+		SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err"
+		;;
+	esac
+}
+
 dump() {
 	[ -e "$MAPDIR/xdp_ft_stats" ] || { say "not loaded"; return 1; }
-	say ""
-	say "  seen          packets the program looked at"
-	say "  not_ipv4      version nibble was not 4"
-	say "  frag_or_opts  fragmented, or IP options present - the flowtable declines both"
-	say "  not_tcp_udp   another L4 protocol"
-	say "  short         truncated before the ports"
-	say "  miss          looked up, no such flow"
-	say "  hit           the flowtable knew the flow"
-	say "  lookup_err    the kfunc refused the request, opts.error set"
-	say ""
+	adopt_slots_from_map
+	legend
 	# Ask for JSON explicitly rather than taking whatever this build's bpftool
 	# prints by default. A bpftool too old for -j fails here, leaves raw empty
 	# and the plain dump is parsed instead.
@@ -213,7 +280,7 @@ dump() {
 	# line: bpftool without -p emits the whole map on one line, and a
 	# line-oriented rule reading that collapses every digit in the map into
 	# one number.
-	out=$(printf '%s\n' "$raw" | awk '
+	out=$(printf '%s\n' "$raw" | awk -v slots="$SLOTS" '
 	function h2d(x,   i, d, v) {
 		v = 0; x = tolower(x)
 		for (i = 1; i <= length(x); i++) {
@@ -274,7 +341,7 @@ dump() {
 		return out
 	}
 	BEGIN {
-		split("seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err", n, " ")
+		nslot = split(slots, n, " ")
 		k = -1; want_key = 0; json = 0
 	}
 	# Once a JSON token has been seen every later line belongs to the buffer,
@@ -311,7 +378,7 @@ dump() {
 				p = (gp > np) ? gp : np
 			}
 		}
-		for (i = 0; i <= 7; i++) printf "  %-13s %d\n", n[i+1], tot[i] + 0
+		for (i = 0; i < nslot; i++) printf "  %-15s %d\n", n[i+1], tot[i] + 0
 	}
 	')
 	printf '%s\n' "$out"
@@ -344,7 +411,7 @@ trap 'echo; echo "interrupted - reverting"; detach; exit 130' INT TERM
 
 case "${1:-check}" in
 check)  check ;;
-probe)
+probe|dryrun)
 	check || exit 1
 	load  || exit 1
 	say "sampling ${SECS}s - put traffic through $IFACE now"

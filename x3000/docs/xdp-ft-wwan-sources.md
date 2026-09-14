@@ -53,7 +53,7 @@ sha256 of the committed objects:
 
 ```
 c4371b7a76baf9e6eb99bad111cdbb64b416bbcf701f71eaf30fb61bbc276602  bpf/xdp_ft_probe.bpf
-bedfb95a2f92db2bb84f105cf522368e186e93fea71313589b4a9a0acd73edf1  bpf/xdp_ft_wwan.bpf
+6b725e40f94f42c240c9ffce522951f314d15e3f5f2d1f73de3d91dd8f2f3a7e  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the two programs do
@@ -68,8 +68,25 @@ It declares the kfunc's return type opaque, exactly as the in-tree selftest
 the returned tuplehash, only tested for NULL, so it carries no relocation against
 `struct flow_offload` at all.
 
+`xdp_ft_dryrun` runs the fastpath's whole decision path — lookup, direction,
+container walk, flags, teardown, `xmit_type`, egress ifindex, and the NAT values
+themselves — counts what it would have done, and returns `XDP_PASS` without
+writing a byte. It exists because `would_redirect / seen` is the number that
+decides whether the rewrite is worth attaching at all, and getting it should not
+require risking a connection.
+
 `xdp_ft_fastpath` adds the NAT rewrite, the TTL decrement, an Ethernet header via
 `bpf_xdp_adjust_head()` and `XDP_REDIRECT` to a wired port.
+
+The two share one `decide()` function rather than two copies of the same logic,
+and the counters are bumped inside it, so the dry run and the real path cannot
+drift into measuring different things.
+
+**Reads are gathered before anything is written.** Every read through the flow is
+a probe read of a computed address and can fail. `decide()` reads all of them,
+including both translated addresses and ports, before `commit()` touches the
+packet — a read that failed midway through a rewrite would put a half-translated
+packet on the stack, which is worse than not accelerating the flow.
 
 ## The relocation that blocked the fastpath, and why it is gone
 
@@ -179,8 +196,29 @@ was copied from.
   `nf_flow_dnat_ip()` in `net/netfilter/nf_flow_table_ip.c`.
 - Only `FLOW_OFFLOAD_XMIT_DIRECT` flows are handled. `NEIGH` needs a neighbour
   lookup the program cannot do, and those get `XDP_PASS`.
-- The redirect target must advertise `NETDEV_XDP_ACT_NDO_XMIT` (`devmap.c:488`).
-  The mtk netdevs do; `wwan0` and the AP netdevs do not.
+- **Corrected:** the redirect target does *not* need `NETDEV_XDP_ACT_NDO_XMIT`
+  here. That gate is `devmap.c:488`, on the native and devmap paths. This program
+  runs in generic mode, where `bpf_redirect()` by ifindex goes through
+  `xdp_do_generic_redirect()` (`filter.c:4554`), and the only test applied is
+  `xdp_ok_fwd_dev()` — `IFF_UP` and the MTU. So an AP netdev is a legal target
+  too, which an earlier version of this file wrongly ruled out.
+- **`generic_xdp_tx()` bypasses the qdisc.** It calls `netdev_start_xmit()`
+  directly rather than `dev_queue_xmit()`, so anything shaped on the target
+  interface is skipped for redirected packets. This is a real behavioural change,
+  not a detail.
+- **The skb's metadata is left inconsistent by the head adjustment.** After
+  `bpf_xdp_adjust_head(-14)`, `bpf_prog_run_generic_xdp()` pushes the 14 bytes
+  back onto the skb and fixes `mac_header`, then calls
+  `skb_reset_network_header()` — which points the network header at the new
+  Ethernet header rather than the IP header. It then tests whether the program
+  changed the Ethernet header by comparing the *original* `h_proto`, which on a
+  raw-IP interface was read from offset 12 of the IP header, the first two octets
+  of the source address. That will essentially never equal `0x0800`, so the
+  branch always fires: `__skb_push(skb, ETH_HLEN)` then `eth_type_trans()`. Push
+  fourteen, pull fourteen, so `skb->data` and `skb->len` come out right and the
+  bytes on the wire are correct — but `skb->mac_header` ends up fourteen bytes
+  before the header, in headroom, and `skb->protocol` is set from whatever is
+  there. Not yet established whether the mtk transmit path cares.
 - Keep the firewall on **software** flow offloading. Hardware offload sends
   `nf_flow_table_offload_setup()` down the other branch
   (`nf_flow_table_offload.c:1258`) and the device is never inserted into the XDP
@@ -216,11 +254,20 @@ refusals. The other two error codes the kfunc can set — `-EINVAL` for a bad
 depend on the packet, so 25619 hits rules both out; the program should record the
 error value rather than leaving that as an inference.
 
-**The fastpath compiles, relocates and clears the two failures found so far;
-it has never been loaded successfully or run.** The relocation ambiguity is
-resolved and the pointer arithmetic the verifier rejected is gone, both verified
-by reading the object rather than by loading it. Whether the verifier accepts
-the rest is still untested — it had never got past instruction 175 before. The NAT rewrite in
+**The fastpath loads.** `bpftool prog loadall` accepts the object on the box:
+relocation and the verifier both pass, for the first time since the program was
+written. It has still never been attached, so the rewrite has never executed.
+
+**The four-BTF hypothesis is confirmed by measurement, not inferred from the
+error.** `struct flow_offload` is defined in four loaded BTFs here —
+`nf_flow_table`, `nf_flow_table_inet`, `nf_tables` and `nft_flow_offload`. So
+libbpf was choosing among four candidate type ids; 90056 and 90242 were simply
+the first pair it compared. `struct flow_offload_tuple_rhash` measures 88 bytes
+in the kernel's own BTF, which is what the local mirror computes, so the old
+`sizeof()` was right — it is now relocated rather than merely lucky.
+
+**Next is the dry run, not the rewrite.** `xdp-ft-wwan.sh dryrun` attaches
+`xdp_ft_dryrun`, which decides everything and writes nothing. The NAT rewrite in
 particular has been through a compiler and nothing else. A wrong checksum shows
 up as clients losing connectivity, so `probe` comes first and `off` stays to
 hand.
