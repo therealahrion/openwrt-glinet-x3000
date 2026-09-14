@@ -112,6 +112,7 @@
 
 #define FLOW_OFFLOAD_DIR_ORIGINAL	0
 #define FLOW_OFFLOAD_DIR_REPLY		1
+#define FLOW_OFFLOAD_XMIT_NEIGH		1
 #define FLOW_OFFLOAD_XMIT_DIRECT	3
 
 /* enum nf_flow_flags bit positions, include/net/netfilter/nf_flow_table.h */
@@ -319,6 +320,32 @@ enum stat_slot {
 	ST_IIF_BAD,
 	ST_BADDIR_XMIT_DIRECT,
 	ST_BADDIR_XMIT_OTHER,
+
+	/* The same two fields, extracted by hand from an eight-byte read of the
+	 * same relocated address, using the same patched shifts.
+	 *
+	 * This exists because the run of 2026-09-14 contradicted itself. The
+	 * byte histogram put every one of 267510 hits in one bucket, value 5 -
+	 * dir 1, xmit_type 1, NEIGH - and the raw eight bytes decoded to
+	 * mtu 1500 at tuple+52, which cannot land there by accident. Applying
+	 * the patched shifts to 5 by hand gives dir 1 and xmit NEIGH. Yet
+	 * BPF_CORE_READ_BITFIELD_PROBED reported dir outside 0..1 on 136122 of
+	 * those packets and DIRECT on 131209 of them. Deterministic arithmetic
+	 * on a constant input cannot do that, so one of the two readings is not
+	 * reading what it says it is.
+	 *
+	 * Computing it here settles which. The only deliberate difference is
+	 * that the upper 56 bits are provably zero: raw is masked to its low
+	 * byte before the shifts, where the macro reads one byte into a u64 and
+	 * trusts the rest of that u64 to be the zero it initialised. If these
+	 * counters and the macro's disagree, that assumption is the difference.
+	 */
+	ST_MYDIR_0,
+	ST_MYDIR_1,
+	ST_MYDIR_OTHER,
+	ST_MYXMIT_NEIGH,
+	ST_MYXMIT_DIRECT,
+	ST_MYXMIT_OTHER,
 	ST__MAX,
 };
 
@@ -875,9 +902,32 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 		 * else entirely.
 		 */
 		if (!bpf_core_read(&raw, sizeof(raw), (char *)th + off)) {
+			/* Shift amounts come from the relocations, so they are
+			 * immediates once patched; masked to 0..63 anyway,
+			 * because a BPF shift past the word size is undefined
+			 * and the verifier is entitled to refuse it.
+			 */
+			__u32 dl = __builtin_preserve_field_info(th->tuple.dir,
+					BPF_FIELD_LSHIFT_U64) & 63;
+			__u32 dr = __builtin_preserve_field_info(th->tuple.dir,
+					BPF_FIELD_RSHIFT_U64) & 63;
+			__u32 xl = __builtin_preserve_field_info(th->tuple.xmit_type,
+					BPF_FIELD_LSHIFT_U64) & 63;
+			__u32 xr = __builtin_preserve_field_info(th->tuple.xmit_type,
+					BPF_FIELD_RSHIFT_U64) & 63;
+			__u64 v8 = raw & 0xff;	/* upper bits provably zero */
+			__u32 mydir = (__u32)((v8 << dl) >> dr);
+			__u32 myxmit = (__u32)((v8 << xl) >> xr);
+
 			relo_set(RL_RAW_LO, raw & 0xffffffff);
 			relo_set(RL_RAW_HI, raw >> 32);
 			bump_byte((__u32)(raw & 0xff));
+
+			bump(mydir == 0 ? ST_MYDIR_0
+			   : mydir == 1 ? ST_MYDIR_1 : ST_MYDIR_OTHER);
+			bump(myxmit == FLOW_OFFLOAD_XMIT_NEIGH ? ST_MYXMIT_NEIGH
+			   : myxmit == FLOW_OFFLOAD_XMIT_DIRECT ? ST_MYXMIT_DIRECT
+			   : ST_MYXMIT_OTHER);
 		}
 	}
 

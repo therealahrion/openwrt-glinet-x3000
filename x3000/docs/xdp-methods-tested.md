@@ -3099,6 +3099,16 @@ them. The next build reports those four patched constants and the raw byte, so
 the arithmetic can be checked against the kernel's real layout instead of
 inferred from the local mirror's.
 
+#### 23.14 is itself partly wrong - see 23.15
+
+> The relocation dump of the same evening contradicts the reading above. The
+> byte the `dir` bits live in is **5 on every one of 267510 hits**, which is
+> `dir` 1 and `xmit_type` NEIGH - so `would_redirect` should have been zero,
+> and calling it "a floor, not a figure" was still too generous. 23.15 has the
+> decode. What survives from this section is the part that was measured rather
+> than inferred: `th` is sound, the plain-field relocations are sound, and the
+> wrong value is a constant rather than a race.
+
 #### The measurement that settled it, as a method
 
 Worth keeping separately from the result. The question was "is `th` wrong or is
@@ -3108,3 +3118,88 @@ kernel matched on is a free self-check: if it comes back different from what
 was asked for, the answer is not about the question. That works for any kfunc
 or map lookup that takes a key, costs two probe reads, and needs no knowledge
 of the bug being chased.
+
+### 23.15 The relocation dump, and a fourth thing I got wrong - 2026-09-14
+
+The build that reports what CO-RE actually patched in ran. It settles the
+layout completely and it contradicts 23.14's conclusion.
+
+```
+  dir_off  58    dir_sz  1    dir_lshift  62    dir_rshift  62
+  xmit_off 58    xmit_sz 1    xmit_lshift 59    xmit_rshift 61
+  l3_off   48    iif_off 44   tuple_off   8     rhash_sz    88
+  raw_lo   98304005   raw_hi  2147483647
+```
+
+and the byte histogram had exactly one non-zero bucket:
+
+```
+  b5              267510          <- equal to hit, to the packet
+```
+
+#### The layout is confirmed, beyond argument
+
+`tuple_off` 8 plus `l3_off` 48 puts `l3proto` at tuple+40 and `iifidx` at
+tuple+36, which is where they are. Decoding `raw_lo`/`raw_hi` as the eight
+bytes at `th+58`:
+
+| address | value | |
+|---|---|---|
+| tuple+50 | `0x05` | the bitfield byte |
+| tuple+51 | `0x00` | `in_vlan_ingress` |
+| tuple+52..53 | `0x05dc` | **mtu = 1500** |
+
+An mtu of exactly 1500 at exactly tuple+52 is not something that lands there by
+accident. The offsets are right, the pointer is right, and `dir_off` 58 is the
+bitfield byte and not the union beyond it - which was the mechanism 23.13
+proposed and can now be discarded outright.
+
+#### And the byte says NEIGH
+
+Byte 5 is `0b101`: `dir` = bits 0-1 = **1** (REPLY), `xmit_type` = bits 2-4 =
+**1** (`FLOW_OFFLOAD_XMIT_NEIGH`), `encap_num` = 0. Applying the patched shifts
+to it by hand - `(5 << 62) >> 62` and `(5 << 59) >> 61` - gives 1 and 1.
+
+Every hit in the window had that byte. So:
+
+- `dir3` = 136122 should be **0**. The byte says `dir` is 1.
+- `would_redirect` = 131209 should be **0**. The byte says `xmit_type` is
+  NEIGH, so nothing in that window was ever a redirect candidate.
+
+**23.3's original claim stands and my retraction of it in 23.13 was wrong.**
+Every flow on this box is `FLOW_OFFLOAD_XMIT_NEIGH` after all. That is the
+fourth claim of mine this day to be overturned by a better measurement, and it
+is the one I most wanted to be true - `would_redirect` going non-zero for the
+first time was the result the whole of W0038 had been waiting for. Wanting it
+is exactly why it needed the harder check, and it did not get one until now.
+
+#### What is now the open question
+
+Deterministic arithmetic on a constant byte cannot produce two different
+answers, and the two instruments in the same window did. One of them is not
+reading what it says it is reading, and the decode says which one to trust: the
+eight-byte read produced mtu 1500 at the right offset, which the other cannot
+match as evidence.
+
+So the suspect is `BPF_CORE_READ_BITFIELD_PROBED` itself, not the relocations
+it is given. The next build settles that too, and settles it as a fix rather
+than only a diagnosis: `mydir_*` and `myxmit_*` extract the same two fields by
+hand from the eight-byte read, with the same patched shift amounts, differing
+only in that the upper 56 bits are provably zero where the macro reads one byte
+into a `u64` and trusts the rest of that word to be the zero it initialised.
+
+- If `mydir_1` and `myxmit_neigh` account for every hit while `dir3` and
+  `would_redirect` stay where they are, the macro is the fault, the hand
+  extraction is the fix, and it goes in permanently.
+- If both agree, then the byte changes between the two reads, and the question
+  becomes what writes it.
+
+#### A note on how this went wrong
+
+Three rounds of this were spent proposing mechanisms from the local struct
+mirror's layout. The mirror is not what the program runs against - CO-RE
+replaces every offset from the kernel's own BTF at load - so every one of those
+mechanisms was reasoning about a layout that does not exist on the box. The
+instrument that settled it in one window was four `__builtin_preserve_field_info`
+calls reporting what the loader actually wrote. **Where a value is patched at
+load time, print the patched value before theorising about it.**

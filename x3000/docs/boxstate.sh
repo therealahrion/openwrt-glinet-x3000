@@ -134,6 +134,36 @@ bs_rps() {
   echo "${m# }"
 }
 
+# RFS is not RPS. rps_cpus says which CPUs a queue may steer to; rps_flow_cnt
+# and the global rps_sock_flow_entries say whether flows are additionally
+# pinned to the CPU their socket last ran on. A box can have RPS on and RFS
+# entirely off, which is the usual OpenWrt default, and the two answer
+# different questions about where a packet is processed.
+bs_rfs_global() { cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true; }
+bs_rfs() {
+  m=""
+  for q in /sys/class/net/$1/queues/rx-*/rps_flow_cnt; do
+    [ -r "$q" ] && m="$m $(cat "$q")"
+  done
+  echo "${m# }"
+}
+bs_xps() {
+  m=""
+  for q in /sys/class/net/$1/queues/tx-*/xps_cpus; do
+    [ -r "$q" ] && m="$m $(cat "$q")"
+  done
+  echo "${m# }"
+}
+
+# TCP congestion control. It decides the shape of every throughput and latency
+# number this tree records, and nothing was reading it: cubic and bbr fill a
+# bottleneck queue quite differently, so a bufferbloat measurement that does
+# not say which one was running is not comparable to one that does.
+bs_tcp_cc()       { cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true; }
+bs_tcp_cc_avail() { cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true; }
+bs_tcp_ecn()      { cat /proc/sys/net/ipv4/tcp_ecn 2>/dev/null || true; }
+bs_tcp_sack()     { cat /proc/sys/net/ipv4/tcp_sack 2>/dev/null || true; }
+
 # NAPI exhausting its poll budget. A count, not a time - which is why 18.3
 # says to use it rather than /proc/stat, whose time does not conserve on this
 # box. Non-zero across a window means the receive path ran out of budget.
@@ -365,6 +395,16 @@ bs_require_flowtable() {
   fi
 }
 
+# One line of the settings that change how a number reads, for callers that run
+# the gates without the full report. xdp-ft-wwan.sh dryrun printed its gates and
+# nothing else, so a window could be read without knowing the congestion control
+# or whether steering was on - which is the whole thing this file exists to stop.
+bs_state_line() {
+  bs_say "  state: cc=$(bs_tcp_cc) ecn=$(bs_tcp_ecn) steering=$(bs_steering)" \
+         "rps[$1]=$(bs_rps "$1") rfs=$(bs_rfs_global) gro=$(bs_gro "$1")" \
+         "threaded=$(bs_threaded "$1") backlog=$(bs_backlog) squeeze=$(bs_squeeze)"
+}
+
 # A bridge master in the list satisfies hook registration but cannot answer
 # which device a packet physically leaves on (nft_flow_offload.c:202), so a
 # missing bridge port means XMIT_DIRECT is discarded for every client behind
@@ -471,13 +511,28 @@ fi
   say "        packet, and XMIT_DIRECT becomes reachable. The two are exclusive."
 }
 
-hdr "packet steering and RPS"
+hdr "packet steering, RPS and RFS"
 bs_have uci && kv "network.globals.packet_steering" "$(bs_steering)"
 for i in $(bs_ifaces); do
-  m=$(bs_rps "$i")
-  [ -n "$m" ] && kv "rps_cpus $i" "$m"
+  m=$(bs_rps "$i");  [ -n "$m" ] && kv "rps_cpus $i" "$m"
+  f=$(bs_rfs "$i");  [ -n "$f" ] && kv "rps_flow_cnt $i" "$f"
+  x=$(bs_xps "$i");  [ -n "$x" ] && kv "xps_cpus $i" "$x"
 done
+kv "rps_sock_flow_entries" "$(bs_rfs_global)"
 kv "netdev_max_backlog" "$(bs_backlog)"
+say "  rps_cpus says which CPUs a queue may steer to; rps_flow_cnt and"
+say "  rps_sock_flow_entries say whether flows are additionally pinned to the"
+say "  CPU their socket last ran on. Both zero with rps_cpus set means RPS"
+say "  without RFS, which is the usual default here."
+
+hdr "TCP"
+kv "congestion control" "$(bs_tcp_cc)"
+kv "available" "$(bs_tcp_cc_avail)"
+kv "ecn" "$(bs_tcp_ecn)"
+kv "sack" "$(bs_tcp_sack)"
+say "  cubic and bbr fill a bottleneck queue differently, so every throughput"
+say "  and bufferbloat number in this tree is only comparable to another taken"
+say "  under the same one. ecn: 0 off, 1 request and accept, 2 accept only."
 
 hdr "NAPI, GRO and offloads"
 for i in $(bs_ifaces); do

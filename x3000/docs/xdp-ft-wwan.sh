@@ -44,7 +44,7 @@ case "${1:-check}" in
 dryrun)
 	OBJNAME=xdp_ft_wwan.bpf
 	PROGNAME=xdp_ft_dryrun
-	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other"
+	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other mydir_0 mydir_1 mydir_other myxmit_neigh myxmit_direct myxmit_other"
 	;;
 *)
 	OBJNAME=xdp_ft_probe.bpf
@@ -118,7 +118,7 @@ BPF_DIR=${BPF_DIR:-$_here/bpf}
 # are the same values and are updated together.
 case "$OBJNAME" in
 xdp_ft_wwan.bpf)
-	WANT_SHA=e0be6afa2703f6385d5dc1ec110c211586ddee4aaf4f00767bc36caaa992ceb4 ;;
+	WANT_SHA=6fdce11f67ef6e6d42812e0e95ff535abf82d9426e59766b4d6be0250a14b3e2 ;;
 xdp_ft_probe.bpf)
 	WANT_SHA=99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c ;;
 *)	WANT_SHA= ;;
@@ -211,6 +211,10 @@ check() {
 " the qdisc anyway, but the baseline latency is unshaped (17.2)"
 	pgrep irqbalance >/dev/null 2>&1 && warn "irqbalance is running - it can move"\
 " IRQ masks mid-window"
+
+	# The settings that change how the numbers read, on one line, because a
+	# gates-only run would otherwise print a window with no state beside it.
+	bs_state_line "$IFACE"
 	FAILED=$((FAILED + BS_FAILED))
 
 	if [ "${FAILED:-0}" -eq 0 ]; then
@@ -294,6 +298,12 @@ legend() {
 		say "                  would_redirect included"
 		say "  baddir_xmit_*   xmit_type read from the SAME byte as the bad dir."
 		say "                  Still reading DIRECT means the byte is intact"
+		say "  mydir_*         dir, extracted by hand from an 8-byte read of the"
+		say "  myxmit_*        same address with the same patched shifts, the only"
+		say "                  difference being that the upper 56 bits are"
+		say "                  provably zero. Where these disagree with dir2/dir3"
+		say "                  and would_redirect, the macro is reading something"
+		say "                  the byte at that address does not say"
 		say ""
 		say "  v4, v6, nat66 and the diagnostics are observations, not exits. They describe the"
 		say "  window rather than accounting for it, and they do not sum with"
@@ -328,16 +338,16 @@ legend() {
 }
 
 # `status` has no way of knowing which program left the map behind, and naming
-# twenty-seven slots with the probe's ten labels would print confident nonsense.
+# thirty-three slots with the probe's ten labels would print confident nonsense.
 # The map itself says which: the probe declares ten entries, the dry run
-# twenty-seven.
+# thirty-three.
 adopt_slots_from_map() {
 	ents=$(bpftool map show pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null \
 	       | sed -n 's/.*max_entries \([0-9][0-9]*\).*/\1/p' | head -1)
 	case "${ents:-}" in
-	27)
+	33)
 		PROGNAME=xdp_ft_dryrun
-		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other"
+		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other mydir_0 mydir_1 mydir_other myxmit_neigh myxmit_direct myxmit_other"
 		;;
 	10)
 		PROGNAME=xdp_ft_probe
