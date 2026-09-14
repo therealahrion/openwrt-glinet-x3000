@@ -176,12 +176,6 @@ struct flow_offload_tuple_rhash___local *
 bpf_xdp_flow_lookup(struct xdp_md *, struct bpf_fib_lookup *,
 		    struct bpf_flowtable_opts___local *, __u32) __ksym;
 
-/* kernel/bpf/helpers.c - turns a computed address back into something the
- * verifier will let us read. Needed because container_of() on the returned
- * tuplehash produces a pointer the verifier no longer trusts.
- */
-extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym;
-
 enum stat_slot {
 	ST_SEEN = 0,
 	ST_PARSE_SKIP,
@@ -191,6 +185,7 @@ enum stat_slot {
 	ST_TORN_DOWN,
 	ST_NO_HEADROOM,
 	ST_REDIRECT,
+	ST_READ_ERR,
 	ST__MAX,
 };
 
@@ -373,14 +368,39 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 
 	/* tuplehash[] is the first member of struct flow_offload, so the flow is
 	 * the matched hash minus dir entries. container_of, by hand.
+	 *
+	 * There is deliberately no bpf_rdonly_cast() here. The cast existed to
+	 * make this computed pointer trusted enough to dereference, but nothing
+	 * below dereferences it: every read goes through bpf_core_read(), which
+	 * is bpf_probe_read_kernel() and takes an arbitrary kernel address.
+	 * probe_read_kernel is reachable from XDP under CAP_PERFMON
+	 * (kernel/bpf/helpers.c, bpf_base_func_proto), which root has.
+	 *
+	 * The cast needed bpf_core_type_id_kernel(), and that TYPE_ID_TARGET
+	 * relocation was the single relocation libbpf could not resolve on this
+	 * kernel:
+	 *
+	 *   libbpf: relo #7: relocation decision ambiguity: success 90056 != success 90242
+	 *
+	 * struct flow_offload appears in more than one loaded BTF. The
+	 * definitions agree on field offsets, so every FIELD_* relocation
+	 * resolves and libbpf's bit_offset check (relo_core.c:1361) passes - but
+	 * type IDs are per-BTF and necessarily differ, so the type-id relocation
+	 * hits the ambiguity check at relo_core.c:1369 and the whole object is
+	 * rejected. Dropping the cast removes the object's only TYPE_ID_TARGET
+	 * relocation; the other 27 are unaffected.
 	 */
 	flow = (struct flow_offload___local *)
 		((char *)th - (__u64)dir * sizeof(struct flow_offload_tuple_rhash___local));
-	flow = bpf_rdonly_cast(flow, bpf_core_type_id_kernel(struct flow_offload___local));
-	if (!flow)
-		return XDP_PASS;
 
-	flags = BPF_CORE_READ(flow, flags);
+	/* Checked, unlike the reads further down: flags is what decides whether
+	 * NAT happens at all, so a silent zero here would redirect the packet
+	 * with no translation applied and break the flow it meant to accelerate.
+	 */
+	if (bpf_core_read(&flags, sizeof(flags), &flow->flags)) {
+		bump(ST_READ_ERR);
+		return XDP_PASS;
+	}
 	if (flags & (1UL << NF_FLOW_TEARDOWN)) {
 		bump(ST_TORN_DOWN);
 		return XDP_PASS;
@@ -481,9 +501,9 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 	}
 
 	/* Grow an Ethernet header in front. XDP_PACKET_HEADROOM is 256 and
-	 * do_xdp_generic() guarantees it before running us, so this should not
-	 * fail - but a failure here would send a headerless frame out a wired
-	 * port, so it is checked rather than assumed.
+	 * do_xdp_generic() guarantees it before running the program, so this
+	 * should not fail - but a failure here would send a headerless frame out
+	 * a wired port, so it is checked rather than assumed.
 	 */
 	if (bpf_xdp_adjust_head(ctx, -(int)sizeof(struct ethhdr_))) {
 		bump(ST_NO_HEADROOM);

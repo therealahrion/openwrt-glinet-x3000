@@ -14,21 +14,24 @@ reproducible.
 | `bpf/xdp_ft_wwan.bpf.c` | the fastpath source |
 | `xdp-ft-wwan.sh` | preflight, fetch, attach, sample, detach |
 
-Two objects rather than one, and the split is not cosmetic. The fastpath reads
-fields out of `struct flow_offload_tuple`, which needs CO-RE relocations this
-kernel's BTF resolves ambiguously, and `bpftool prog loadall` fails the whole
-object when any single program in it fails to relocate. With both programs in one
-file the relocation failure took the probe down with it, so the measurement could
-never run. Apart, the probe loads.
+Two objects rather than one, and the split is not cosmetic. `bpftool prog
+loadall` fails the whole object when any single program in it fails to relocate,
+so while the fastpath could not relocate it took the probe down with it and the
+measurement could never run. Apart, the probe loads regardless of the fastpath's
+state.
 
 Kept as separate `.c` files rather than inlined here: the fastpath is roughly 400
 lines, where the three objects in `verify-992a-sources.md` are a dozen each.
 
-Build command (clang 18, any host — eBPF bytecode is architecture-neutral):
+## Build
+
+clang 18, any host — eBPF bytecode is architecture-neutral. Run from
+`x3000/docs/`:
 
 ```sh
 for o in xdp_ft_probe xdp_ft_wwan; do
 	clang -O2 -g -Wall -Wextra -target bpf -mcpu=v3 \
+	      -fdebug-compilation-dir=. \
 	      -idirafter /usr/include/$(uname -m)-linux-gnu \
 	      -c bpf/$o.bpf.c -o bpf/$o.bpf
 	llvm-strip -g bpf/$o.bpf
@@ -40,11 +43,17 @@ done
 An object stripped the wrong way loads and then misreads every field, which
 looks like a kernel bug rather than a build mistake.
 
+`-fdebug-compilation-dir=.` is what makes the checksums below mean anything.
+Without it clang records the absolute source path in `.BTF`, which survives
+`llvm-strip -g`, so the same source built in two directories produces two
+different files — identical bytecode, different sha256. With it the embedded
+path is `./bpf/<name>.bpf.c` and the build reproduces byte for byte anywhere.
+
 sha256 of the committed objects:
 
 ```
-5f09be7526a53b16184d84b3c61bad3655fde27d3d0ce7675730d16abfe564e5  bpf/xdp_ft_probe.bpf
-19774db2d8dea3ae1f2265f845588514804bb2e9bd75b127ad3d35bda334212d  bpf/xdp_ft_wwan.bpf
+c4371b7a76baf9e6eb99bad111cdbb64b416bbcf701f71eaf30fb61bbc276602  bpf/xdp_ft_probe.bpf
+44f6b93a217d0be4277980670925dac6fcafead89e31834503bfa38f0cfdebab  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the two programs do
@@ -56,12 +65,56 @@ had tested: whether the kfunc actually hits on `wwan0`.
 
 It declares the kfunc's return type opaque, exactly as the in-tree selftest
 `tools/testing/selftests/bpf/progs/xdp_flowtable.c` does. Nothing is read out of
-the returned tuplehash, only tested for NULL, so there is nothing to relocate and
-nothing to be ambiguous about. That is the whole reason the probe loads and the
-fastpath does not.
+the returned tuplehash, only tested for NULL, so it carries no relocation against
+`struct flow_offload` at all.
 
 `xdp_ft_fastpath` adds the NAT rewrite, the TTL decrement, an Ethernet header via
 `bpf_xdp_adjust_head()` and `XDP_REDIRECT` to a wired port.
+
+## The relocation that blocked the fastpath, and why it is gone
+
+The fastpath was rejected at load for months of work with:
+
+```
+libbpf: relo #7: relocation decision ambiguity: success 90056 != success 90242
+```
+
+That message comes from `relo_core.c:1369`, where libbpf finds more than one
+candidate type matching a relocation and the candidates disagree on the result.
+`struct flow_offload` appears in more than one loaded BTF on this box, so there
+are two candidates.
+
+The split between what survives that and what does not is the useful part:
+
+- **Field relocations resolve.** libbpf compares candidates on `bit_offset`
+  first (`relo_core.c:1361`). The two definitions come from the same header, so
+  every field sits at the same offset and every `FIELD_*` relocation agrees.
+- **Type-id relocations cannot.** A BTF type ID is an index into one particular
+  BTF, so two BTFs give two different IDs for the same struct by construction.
+  There is nothing for libbpf to reconcile and it refuses to guess.
+
+Dumping the object's `.BTF.ext` showed 28 CO-RE relocations, of which exactly one
+was a type-id relocation, and it was relo #7:
+
+```
+relo #7   insn 300   TYPE_ID_TARGET   type_id 60   access '0'
+```
+
+That was `bpf_core_type_id_kernel(struct flow_offload___local)`, the second
+argument to `bpf_rdonly_cast()`. The cast was there to make the hand-written
+`container_of()` result trusted enough to dereference — but nothing in the
+program dereferences it. Every read goes through `bpf_core_read()`, which is
+`bpf_probe_read_kernel()` and takes an arbitrary kernel address, so the pointer
+never needed to be trusted. `bpf_probe_read_kernel` is reachable from XDP under
+`CAP_PERFMON` (`kernel/bpf/helpers.c`, `bpf_base_func_proto`), which root has.
+
+Removing the cast removes the object's only `TYPE_ID_TARGET` relocation. The
+remaining 27 are all `FIELD_*` and resolve unchanged.
+
+The general rule worth keeping: **a program that reads kernel structs through
+`bpf_core_read()` can be relocated against a type that appears in several BTFs;
+a program that takes that type's BTF id cannot.** Where both are options, the
+probe read is the portable one.
 
 ## Things the source depends on, each read from v6.12.103
 
@@ -77,8 +130,6 @@ fastpath does not.
   source address as an EtherType.
 - NAT direction handling is copied case by case from `nf_flow_snat_ip()` and
   `nf_flow_dnat_ip()` in `net/netfilter/nf_flow_table_ip.c`.
-- `container_of()` on the returned tuplehash produces a pointer the verifier no
-  longer trusts, so it goes through `bpf_rdonly_cast()` (`helpers.c:2771`).
 - Only `FLOW_OFFLOAD_XMIT_DIRECT` flows are handled. `NEIGH` needs a neighbour
   lookup the program cannot do, and those get `XDP_PASS`.
 - The redirect target must advertise `NETDEV_XDP_ACT_NDO_XMIT` (`devmap.c:488`).
@@ -92,35 +143,42 @@ fastpath does not.
 
 ## State
 
-**The probe runs.** Measured on the box, one 30-second sample with traffic
-crossing `wwan0`:
+**The probe runs, and the kfunc hits.** Measured on the box, one 30-second
+sample with a download in flight:
 
-| what | value | how |
+| counter | value | share |
 |---|---|---|
-| `rx_packets` delta on `wwan0` | 61773 | `/sys/class/net/wwan0/statistics/rx_packets`, before and after |
-| `seen` | 61820 | 61191 on cpu0 plus 629 on cpu1 |
-| `not_ipv4`, cpu0 alone | 60871 | the other CPU's share was not read |
+| `seen` | 26043 | equal to the `rx_packets` delta, exactly |
+| `hit` | 25619 | 98.37% |
+| `lookup_err` | 423 | 1.62% |
+| `not_ipv4` | 1 | |
+| everything else | 0 | |
 
-`seen` tracking `rx_packets` to within 0.1% is the result that matters: the
-program is on the interface, in the receive path, and looking at essentially
-every packet. The attach is generic-mode — `bpftool net show` reports
-`xdp generic`, which is authoritative where `ip -d link show` printing `prog/xdp`
-is not.
+25619 + 423 + 1 = 26043, so every packet is accounted for. `seen` matching the
+driver's own counter exactly means the program sits in front of the whole receive
+path rather than a sample of it. This is the measurement section 16.5 asked for:
+`bpf_xdp_flow_lookup()` works on a raw-IP modem interface.
 
-The rest of the distribution is not recorded yet, because the sampler's counter
-parser was reading a format this bpftool does not emit and printed zeros over
-live data for several runs. That is fixed in `xdp-ft-wwan.sh`; the numbers above
-are the ones read by hand from the raw dump, so they stand. `not_ipv4` dominating
-suggests the modem path is IPv6-primary and the probe is IPv4-only by choice, but
-that is reasoning, not a measurement, and a re-run settles it.
+**One correction to the probe's own counters.** The split between `miss` and
+`lookup_err` is wrong. `bpf_xdp_flow_tuple_lookup()` returns `ERR_PTR(-ENOENT)`
+when `flow_offload_lookup()` finds nothing (`nf_flow_table_bpf.c:47-48`), and the
+caller then sets `opts->error` from it (`:94-97`), so an ordinary miss sets the
+error too. `ST_MISS` is unreachable, and the 423 are flow misses, not kfunc
+refusals. The other two error codes the kfunc can set — `-EINVAL` for a bad
+`opts_len`, `-EAFNOSUPPORT` for a family that is neither v4 nor v6 — do not
+depend on the packet, so 25619 hits rules both out; the program should record the
+error value rather than leaving that as an inference.
 
-**The fastpath does not load.** `bpftool prog loadall` rejects it:
+**The fastpath compiles and relocates; it has never been loaded or run.** The
+ambiguity above is resolved and the object carries no type-id relocation, but
+passing the verifier is a separate question and is untested. The NAT rewrite in
+particular has been through a compiler and nothing else. A wrong checksum shows
+up as clients losing connectivity, so `probe` comes first and `off` stays to
+hand.
 
-```
-libbpf: relo #7: relocation decision ambiguity: success 90056 != success 90242
-```
-
-Two candidate types for `struct flow_offload_tuple` in the running kernel's BTF,
-two different field offsets, and libbpf refuses to guess. So the fastpath rewrite
-has been through a compiler and nothing else. A wrong checksum shows up as
-clients losing connectivity, so `probe` comes first and `off` stays to hand.
+Known and deliberately not yet fixed, because one change at a time: the reads
+that feed the packet rewrite are unchecked. `flags` is checked, since a silent
+zero there would redirect with no translation at all, but the address and port
+reads are not, and a failed probe read would write a zero into the packet. The
+fix is to gather every value before mutating anything, and it is worth doing
+before the program is ever left attached.
