@@ -3476,3 +3476,162 @@ wrong tree until it is checked against backports.
   redirect bypasses the qdisc (17.2). W0038 now optimises a resource the box has
   spare, for the wired half of its clients, at the cost of the resource it does
   not have. It works. That is not the same as being worth attaching.
+
+### 23.18 Why a Wi-Fi client never reaches XMIT_DIRECT - 2026-09-14
+
+23.17 measured that the bridge port decides it and proposed a mechanism. The
+mechanism had a hole: it assumed the AP vifs use `ieee80211_dataif_8023_ops`,
+and nothing had checked. If they used the plain ops there would be no callback
+at all, the walk would fall through to `DEV_PATH_ETHERNET`, and Wi-Fi would have
+worked - so the assumption was load-bearing and unverified. A second cause fit
+the same symptoms just as well: if `br_fill_forward_path()` fails to resolve the
+port from the bridge FDB, the walk dies at the bridge and mac80211 is never
+reached.
+
+Both are now settled, one by reading and one by prediction.
+
+#### The vifs do use the 802.3 ops, by construction
+
+`ieee80211_set_vif_encap_ops()` assigns `ieee80211_dataif_8023_ops` when encap
+offload is enabled, and `ieee80211_set_sdata_offload_flags()` enables it unless
+one of three things fails:
+
+1. the driver does not set `SUPPORTS_TX_ENCAP_OFFLOAD`,
+2. the driver lacks `SUPPORTS_TX_FRAG` while a fragmentation threshold is set,
+3. `local->virt_monitors` is non-zero.
+
+mt7915 sets **all three** relevant flags at `mt7915/init.c:410-414` -
+`SUPPORTS_TX_ENCAP_OFFLOAD`, `SUPPORTS_RX_DECAP_OFFLOAD` and `SUPPORTS_TX_FRAG`.
+That third one disarms disqualifier 2 outright, whatever the fragmentation
+threshold is. With no monitor interface up, disqualifier 3 is inert too. So
+encap offload is on, the vif carries `.ndo_fill_forward_path`, and the callback
+is reached on every walk.
+
+#### The prediction, and the window that confirmed it
+
+Disqualifier 3 is a lever. `ieee80211_do_open()`'s `NL80211_IFTYPE_MONITOR` case
+increments `virt_monitors` for any monitor that is not `MONITOR_FLAG_ACTIVE` on
+any driver that does not set `NO_VIRTUAL_MONITOR` - mt7915 sets neither - and
+calls `ieee80211_recalc_offload()` immediately after. So a plain monitor
+interface should strip the callback from the AP netdev and make Wi-Fi clients
+redirectable.
+
+Measured, with the bridge ports in the flowtable and a monitor on each phy,
+driven from the phone over IPv6 - the exact combination that had produced zero
+three times:
+
+| reading | value |
+|---|---|
+| `seen` | 154390 |
+| `v6` | 154213 (99.9%) |
+| `hit` | 153085 |
+| `not_direct` | **0** |
+| `would_redirect` | **153085 - every hit** |
+| byte histogram | `b13` only; `b5` absent entirely |
+
+20 + 63 + 1222 + 153085 = 154390, so the accounting closes exactly, and
+`b13` equals `hit`. **0% to 100% on one variable.**
+
+That confirms the chain end to end and kills the bridge-FDB alternative at the
+same time: with the callback gone the walk runs straight through the bridge to
+`DEV_PATH_ETHERNET`, so `br_fill_forward_path()` was resolving the Wi-Fi port
+correctly all along. It also closes the version caveat 23.17 carried - the
+prediction only holds if backports-6.18.39's `iface.c` behaves as v6.18's does,
+and it did.
+
+#### Whose defect this is
+
+**Not OpenWrt.** The nineteen patches in `package/kernel/mac80211/patches/subsys`
+are minstrel, DFS, AQL and MLO; none touches `iface.c` or the forward path. mt76
+is pinned to an unmodified upstream commit.
+
+**Not mt76.** `mt7915_net_fill_forward_path()` returns `-ENODEV` when WED is
+inactive, which is the correct answer: it is asked to describe a hardware
+forwarding path and there is not one. It writes nothing to `path` before
+declining.
+
+**Not mac80211.** It returns `-EOPNOTSUPP` at `iface.c:951` as its ordinary
+"the driver does not implement this" answer, also before touching `path`.
+
+**The kernel core.** `dev_fill_forward_path()` treats every callback error as
+fatal to the whole walk:
+
+```c
+ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
+if (ret < 0)
+        return -1;
+...
+if (!ctx.dev)
+        return ret;
+path->type = DEV_PATH_ETHERNET;   /* reached only when NO callback exists */
+```
+
+A device with no callback gets `DEV_PATH_ETHERNET` and works. The same device
+declining by return code kills the walk. Those two are the same statement, and
+`-EOPNOTSUPP` in particular means exactly what a missing callback means. The
+fix is three lines - W0040:
+
+```c
+ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
+if (ret == -EOPNOTSUPP)
+        break;                    /* no special path; use DEV_PATH_ETHERNET */
+if (ret < 0)
+        return -1;
+```
+
+This is worth posting upstream. It is not specific to this board: any bridged
+Wi-Fi client on any driver without WED-equivalent support hits it, and the
+symptom is silent - flow offload simply never reaches `XMIT_DIRECT` and nothing
+reports why.
+
+### 23.19 What disabling encap offload costs: nothing measurable - 2026-09-14
+
+The monitor lever is a diagnostic, but it is also the only way to get Wi-Fi
+coverage for W0038 without a kernel patch, so its cost matters. Before the
+measurement I argued it would "plausibly cost more than an XDP redirect buys".
+**That was wrong and is withdrawn.**
+
+The test has to be LAN-side. A download over this WAN tops out near 280 Mbit/s,
+far below the radio, so the Wi-Fi TX path would never be the bottleneck and
+every condition would read the same. `wifiload.py` serves an endless stream from
+the wired PC to a page on the phone that discards each chunk as it arrives -
+no client storage, no restart gaps.
+
+Conditions alternate under one continuous transfer rather than running one block
+then the other, so client rate adaptation shows up as cycle-to-cycle spread
+instead of as a fake result.
+
+| cycle | ON Mbit/s | OFF Mbit/s | ON-OFF | ON ret/1k | OFF ret/1k |
+|---|---|---|---|---|---|
+| 1 | 989 | 956 | +33 | 10 | 13 |
+| 2 | 980 | 976 | +4 | 10 | 10 |
+| 3 | 589 | 607 | -18 | 15 | 15 |
+| 4 | 942 | 1005 | -63 | 4 | 1 |
+
+Means: ON 875, OFF 886. **The differences change sign** - +33, +4, -18, -63 -
+and the largest is 63 against a within-condition spread of 400 (589 to 989 on ON
+alone). The effect is well under the noise floor. Retries per 1000 frames are
+identical at 9.75 either way, so throughput is not being propped up by
+retransmissions. Both counters agree to within 1 Mbit/s and `time_squeeze`
+stayed 0 throughout, so the router never became the bottleneck.
+
+**Cycle 3 is the justification for the design.** Both conditions collapsed to
+~600 together, which makes it external - interference, rate adaptation, thermal.
+On a single before/after it would have landed inside one condition and read as a
+real effect.
+
+**The ceiling is the wire, and it bounds the claim.** The sustained rate sat at
+~989 Mbit/s while the client negotiated 2401.9 Mbit/s, and `ethtool eth1` reports
+**1000Mb/s**. The wired source was the limit, not the radio, so the honest
+statement is **no measurable cost up to ~1 Gbit/s** - not "no cost at the radio's
+limit". Above that, untested.
+
+For the decision that bound does not bite: this WAN delivers around 280 Mbit/s,
+so if software encap is free at 950 it is free by a wide margin at 280.
+
+**What it changes.** Wi-Fi coverage for W0038 is available at no cost worth
+measuring - but through W0040 rather than this lever, because the kernel fix
+needs no encap sacrifice at all and survives a reboot. What it does not change
+is whether W0038 is worth attaching: 14.3 and 18 still say this box is not
+cycles-bound, 17.2 still says a generic-mode redirect bypasses the qdisc, and
+latency is still the only poor number here.

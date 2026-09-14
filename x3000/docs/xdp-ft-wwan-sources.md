@@ -665,8 +665,18 @@ vif on the 802.3 data path has one, it delegates to mt76, and mt76 returns
 
 Enabling WED does not fix it either: the callback then returns
 `DEV_PATH_MTK_WDMA`, and `nft_dev_path_info()` has no case for that type, so
-`info->indev` stays NULL regardless. The full chain is in
-`xdp-methods-tested.md` 23.17.
+`info->indev` stays NULL regardless.
+
+**The defect is in the kernel core, and Wi-Fi is recoverable.**
+`dev_fill_forward_path()` treats any callback error as fatal to the whole walk,
+while a device with *no* callback falls through to `DEV_PATH_ETHERNET` and
+works — and `-EOPNOTSUPP` means exactly what a missing callback means. Proved by
+prediction: a plain monitor interface strips the callback from the AP netdev
+(`ieee80211_set_sdata_offload_flags()` clears encap offload when
+`local->virt_monitors` is non-zero), and a Wi-Fi client over IPv6 then went from
+0 to **153085 of 153085 hits DIRECT**. Measured cost of running that way: none
+resolvable up to ~1 Gbit/s. The full chain, the A/B and the three-line fix are
+in `xdp-methods-tested.md` 23.18 and 23.19.
 
 ### What would make it fire
 

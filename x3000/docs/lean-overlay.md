@@ -151,6 +151,8 @@ same readers.
 | `verify-992a.sh` | the 992 XDP hook verifier, eleven steps, PASS/FAIL tally |
 | `gro-backlog-ab.sh` | GRO and `netdev_max_backlog` A/B, with `--baseline` for one window that changes nothing |
 | `flowtable-ports.sh` | puts the bridge ports into the flowtable so a forwarded flow can reach `XMIT_DIRECT`, and attributes offloaded flows to the port their client is on. In-memory only; `fw4 restart` undoes it |
+| `wifi-encap.sh` | toggles 802.3 encap offload on the Wi-Fi vifs via a monitor interface, which is what decides whether a Wi-Fi client can reach `XMIT_DIRECT`, and A/Bs what that costs. Diagnostic lever; the real fix is W0040 |
+| `wifiload.py` | runs on a *wired* PC, not the router. Serves an endless stream plus a page that discards it, so a Wi-Fi client can be saturated without the WAN as the bottleneck and without writing to its storage |
 
 Three rules the library exists to enforce, each of which was a bug before it was
 a rule:
