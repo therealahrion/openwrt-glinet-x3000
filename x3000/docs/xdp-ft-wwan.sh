@@ -155,8 +155,9 @@ load() {
 		say "load failed - nothing reached the kernel and nothing is attached"
 		return 1
 	fi
-	if ! "$IP" link set dev "$IFACE" xdp pinned "$PINDIR/xdp_ft_probe"; then
+	if ! "$IP" link set dev "$IFACE" xdp pinned "$PINDIR/xdp_ft_probe" 2>"$D/err"; then
 		say "attach failed - the program loaded but is not on $IFACE"
+		sed -n '1,2p' "$D/err" | sed 's/^/        /'
 		rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 		return 1
 	fi
@@ -220,10 +221,17 @@ dump() {
 }
 
 detach() {
+	# Both modes: a program attached in skb mode is not cleared by `xdp off`
+	# alone. Same pair cleanup() in verify-992a.sh removes.
 	"$IP" link set dev "$IFACE" xdp off 2>/dev/null || true
+	"$IP" link set dev "$IFACE" xdpgeneric off 2>/dev/null || true
 	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 	say "detached and unpinned"
 }
+
+# An interrupt during the sample would otherwise leave a program attached to
+# the WAN interface. verify-992a.sh traps for the same reason.
+trap 'echo; echo "interrupted - reverting"; detach; exit 130' INT TERM
 
 case "${1:-check}" in
 check)  check ;;
@@ -231,8 +239,21 @@ probe)
 	check || exit 1
 	load  || exit 1
 	say "sampling ${SECS}s - put traffic through $IFACE now"
+	RX0=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
 	sleep "$SECS"
+	RX1=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
 	dump
+	# A window with no traffic produces zeros that look like a result. The
+	# driver counter is independent of the program, so it says whether the
+	# sample is worth reading at all.
+	RXD=$((RX1 - RX0))
+	say ""
+	if [ "$RXD" -lt 500 ]; then
+		say "only $RXD packets crossed $IFACE during the window - too little to"
+		say "conclude anything. Re-run with a download or speedtest in flight."
+	else
+		say "$RXD packets crossed $IFACE during the window"
+	fi
 	detach
 	;;
 status) dump ;;
