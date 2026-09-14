@@ -184,11 +184,36 @@ dump() {
 	say "  hit           the flowtable knew the flow"
 	say "  lookup_err    the kfunc refused the request, opts.error set"
 	say ""
+	# Ask for JSON explicitly rather than taking whatever this build's bpftool
+	# prints by default. A bpftool too old for -j fails here, leaves raw empty
+	# and the plain dump is parsed instead.
+	raw=$(bpftool -j map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null) || raw=
+	[ -n "$raw" ] || raw=$(bpftool map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null) || raw=
+	if [ -z "$raw" ]; then
+		say "  bpftool printed nothing for $MAPDIR/xdp_ft_stats"
+		return 1
+	fi
+
 	# Sum the per-CPU values with awk. Not python3, which a lean image may
 	# lack, and no strtonum, which is a gawk extension busybox does not have.
-	# bpftool's key and value layout varies between versions, so both the
-	# inline and split-line forms are handled.
-	bpftool map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null | awk '
+	#
+	# Three output shapes have to be handled, because which one appears
+	# depends on the bpftool build and on whether the map carries BTF:
+	#
+	#   text     key: 00 00 00 00  value (CPU 00): 27 f1 00 ...
+	#   json     {"key":["0x00",...],"values":[{"cpu":0,"value":["0x27",...]}]}
+	#   json+btf the same, with a "formatted" object repeating the entry in
+	#            decimal (tools/bpf/bpftool/map.c:161-186, v6.12)
+	#
+	# The third shape carries every counter twice, so when "formatted" is
+	# present only those objects are parsed and the hex arrays are dropped.
+	# Counting both is a silent doubling, which is worse than a parse error.
+	#
+	# The JSON scan walks the buffer as a token stream rather than line by
+	# line: bpftool without -p emits the whole map on one line, and a
+	# line-oriented rule reading that collapses every digit in the map into
+	# one number.
+	out=$(printf '%s\n' "$raw" | awk '
 	function h2d(x,   i, d, v) {
 		v = 0; x = tolower(x)
 		for (i = 1; i <= length(x); i++) {
@@ -203,10 +228,58 @@ dump() {
 		for (i = m; i >= 1; i--) if (b[i] ~ /^[0-9a-fA-F][0-9a-fA-F]$/) v = v * 256 + h2d(b[i])
 		tot[k] += v
 	}
+	# Read the number after a JSON name, either a bare decimal or a
+	# little-endian array of "0xNN" bytes. Leaves the position just past it
+	# in gp so the caller can carry on from there.
+	function jnum(s, p,   c, e, t, m, i, v) {
+		while (p <= length(s)) {
+			c = substr(s, p, 1)
+			if (c == ":" || c == " " || c == "\t") { p++; continue }
+			break
+		}
+		if (substr(s, p, 1) == "[") {
+			e = index(substr(s, p), "]")
+			if (e == 0) { gp = length(s) + 1; return 0 }
+			t = substr(s, p + 1, e - 2)
+			gp = p + e
+			m = split(t, b, ","); v = 0
+			for (i = m; i >= 1; i--) v = v * 256 + h2d(b[i])
+			return v
+		}
+		v = 0
+		while (p <= length(s)) {
+			c = substr(s, p, 1)
+			if (c >= "0" && c <= "9") { v = v * 10 + (c + 0); p++ } else break
+		}
+		gp = p
+		return v
+	}
+	# Keep only the balanced object after each "formatted" name. Safe here
+	# because the map key and value are integers, so no string in the dump
+	# can carry an unbalanced brace.
+	function fmtonly(s,   out, p, q, d, c, st, L) {
+		out = ""; p = 1; L = length(s)
+		while ((q = index(substr(s, p), "\"formatted\"")) > 0) {
+			p = p + q + 10
+			while (p <= L && substr(s, p, 1) != "{") p++
+			st = p; d = 0
+			while (p <= L) {
+				c = substr(s, p, 1)
+				if (c == "{") d++
+				else if (c == "}") { d--; if (d == 0) { p++; break } }
+				p++
+			}
+			out = out substr(s, st, p - st) " "
+		}
+		return out
+	}
 	BEGIN {
 		split("seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err", n, " ")
-		k = -1; want_key = 0
+		k = -1; want_key = 0; json = 0
 	}
+	# Once a JSON token has been seen every later line belongs to the buffer,
+	# including continuation lines carrying neither name.
+	json || /"key"|"values"/ { json = 1; buf = buf $0 " "; next }
 	/key:/ {
 		line = $0; sub(/.*key:[ \t]*/, "", line)
 		if (line ~ /^[0-9a-fA-F][0-9a-fA-F]/) { split(line, a, " "); k = h2d(a[1]) } else want_key = 1
@@ -216,8 +289,44 @@ dump() {
 	want_key && /^[ \t]*[0-9a-fA-F][0-9a-fA-F]/ { split($0, a, " "); k = h2d(a[1]); want_key = 0; next }
 	/value/ { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); if (v ~ /[0-9a-fA-F]/) acc(v); next }
 	/^[ \t]*[0-9a-fA-F][0-9a-fA-F]([ \t]+[0-9a-fA-F][0-9a-fA-F])*[ \t]*$/ { acc($0) }
-	END { for (i = 0; i <= 7; i++) printf "  %-13s %d\n", n[i+1], tot[i] + 0 }
-	'
+	END {
+		if (json) {
+			if (index(buf, "\"formatted\"")) buf = fmtonly(buf)
+			k = -1; p = 1; L = length(buf)
+			while (p <= L) {
+				s = substr(buf, p)
+				kp = index(s, "\"key\"")
+				vp = index(s, "\"value\"")
+				if (kp == 0 && vp == 0) break
+				if (kp != 0 && (vp == 0 || kp < vp)) {
+					np = p + kp + 4
+					k = jnum(buf, np)
+				} else {
+					np = p + vp + 6
+					v = jnum(buf, np)
+					if (k >= 0) tot[k] += v
+				}
+				# Always move past the token just read, even when no
+				# number followed it, or this loop never terminates.
+				p = (gp > np) ? gp : np
+			}
+		}
+		for (i = 0; i <= 7; i++) printf "  %-13s %d\n", n[i+1], tot[i] + 0
+	}
+	')
+	printf '%s\n' "$out"
+
+	# Eight zeros against a pinned map means the parser is the likelier
+	# suspect, not the program. Reading zeros off live counters cost a whole
+	# debugging round once, so show what bpftool actually printed instead of
+	# leaving the next reader to discover the format the hard way.
+	if ! printf '%s\n' "$out" | grep -qv ' 0$'; then
+		say ""
+		say "  every slot reads zero. If traffic did cross $IFACE while the"
+		say "  program was attached, suspect this parser before the program."
+		say "  bpftool printed:"
+		printf '%s\n' "$raw" | cut -c1-200 | head -4 | sed 's/^/    /'
+	fi
 }
 
 detach() {
@@ -242,7 +351,9 @@ probe)
 	RX0=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
 	sleep "$SECS"
 	RX1=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
-	dump
+	# Never let a failed read abort the branch: set -e would take the script
+	# out before detach, leaving a program attached to the WAN interface.
+	dump || true
 	# A window with no traffic produces zeros that look like a result. The
 	# driver counter is independent of the program, so it says whether the
 	# sample is worth reading at all.
