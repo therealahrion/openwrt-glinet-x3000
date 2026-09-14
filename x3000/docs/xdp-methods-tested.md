@@ -3636,17 +3636,28 @@ is whether W0038 is worth attaching: 14.3 and 18 still say this box is not
 cycles-bound, 17.2 still says a generic-mode redirect bypasses the qdisc, and
 latency is still the only poor number here.
 
-### 23.20 Threaded NAPI took the WAN down, and gro_cells says why - 2026-09-14
+### 23.20 Threaded NAPI took the WAN down, twice, and the mechanism is not established - 2026-09-14
 
-**Do not run `gro-backlog-ab.sh --napi` or `--threaded` without reading this.**
-Both are gated behind `NAPI_I_ACCEPT_A_REBOOT=1` now.
+**Do not run `gro-backlog-ab.sh --napi` or `--threaded`.** Both are gated behind
+`NAPI_I_ACCEPT_A_REBOOT=1`. Two runs, two dead WANs, two reboots, and no
+mechanism to show for it.
 
-W0002 asks whether threading the gro_cells NAPI helps. The test toggled
-`/sys/class/net/wwan0/threaded` under a LAN-driven download. The first
-transition killed the downlink. It did not recover when `threaded` went back to
-0, five subsequent windows measured a dead link, and the box needed a reboot.
+W0002 asks whether threading the gro_cells NAPI on `wwan0` reduces latency under
+load. The test toggles `/sys/class/net/wwan0/threaded` and measures throughput,
+`rx_dropped` and rtt in alternating windows.
 
-#### What the windows showed
+#### What reproduced (E1, twice)
+
+Both runs behave identically in the four ways that matter:
+
+1. The downlink stops within seconds of the first write to `threaded`.
+2. Setting `threaded` back to 0 does not bring it back.
+3. The box needs a reboot. Nothing short of one was tried in run 1; run 2 was
+   rebooted before the ladder ran.
+4. `logread` carries nothing about it in either run - no warning, no reset, no
+   MHI message. The kernel is silent while the link is dead.
+
+Run 1, all six windows:
 
 | window | throughput | rx_dropped | rtt |
 |---|---|---|---|
@@ -3657,70 +3668,133 @@ transition killed the downlink. It did not recover when `threaded` went back to
 | thread #2 | 0.0 | 48 | 100% loss |
 | thread-pin #2 | 0.0 | 44 | 100% loss |
 
-`softirq #2` is the important row: `threaded` was back at 0 and the link was
-still dead. Whatever broke was not the mode.
+Run 2, the part that survived: `rx_dropped` read 0, 0, 27, 52, 52 across the
+dead windows, modem delivery fell to 5-7 datagrams per second, and both NAPI
+kthreads were found on CPU 1. The full window table was not kept off the box
+before the reboot; only these figures are recorded, and I am not reconstructing
+the rest.
 
-#### The mechanism, read from source
+`softirq #2` in run 1 remains the important row: `threaded` was back at 0 and
+the link was still dead. Whatever breaks is not the mode.
 
-`gro_cells_receive()` schedules its NAPI **only on the 0 to 1 queue
-transition**:
+#### Retraction: the gro_cells backlog wedge
 
-```c
-__skb_queue_tail(&cell->napi_skbs, skb);
-if (skb_queue_len(&cell->napi_skbs) == 1)
-        napi_schedule(&cell->napi);
-```
+The previous revision of this section named a mechanism: `gro_cells_receive()`
+schedules its NAPI only on the 0-to-1 queue transition, so a single missed poll
+never re-arms, the queue passes `max_backlog`, and every later packet is dropped
+at `dev_core_stats_rx_dropped_inc()`. **That reading is withdrawn.** The source
+reading is correct - the edge-triggered re-arm is real, at
+`net/core/gro_cells.c:32` - but it does not fit the counters.
 
-So **a single missed poll is permanent.** The queue stays non-empty, the edge
-never recurs, nothing re-arms it, and once the queue passes `max_backlog` every
-later packet is dropped at:
+The arithmetic kills it. Run 1's live window carried 14069 datagrams per second.
+If the queue were full and discarding a stream still arriving at that rate,
+`rx_dropped` would climb by roughly fourteen thousand per second - order 170,000
+across a twelve-second window. It moved by 88. Run 2 moved it by 0 across the
+first two dead windows. Both are three to four orders of magnitude below what
+the mechanism predicts. A counter ticking at five to seven per second is a
+trickle arriving at a host with nowhere to put it, not a full queue shedding a
+live stream.
 
-```c
-if (skb_queue_len(&cell->napi_skbs) > READ_ONCE(net_hotdata.max_backlog)) {
-drop:
-        dev_core_stats_rx_dropped_inc(dev);
-```
+The same arithmetic removes the argument I built on top of it. I wrote that
+`rx_dropped` moving proved the radio was still up, because a dead modem delivers
+nothing to drop. Run 2 recorded 0 in two dead windows, which is exactly what a
+modem delivering nothing looks like. **That argument is withdrawn too.** Nothing
+in either run distinguishes a host-side stall from a modem-side one.
 
-That is exactly the observed signature - `rx_dropped` climbing while throughput
-is zero - and it is why putting `threaded` back did nothing: the wedge is the
-missing re-arm, not the mode.
+This is the second mechanism I have proposed and withdrawn for this failure. The
+first was that `dev_set_threaded()` disables and re-enables NAPI; it does
+neither - it creates the kthreads, writes `dev->threaded`, and flips
+`NAPI_STATE_THREADED` on each instance, carrying an upstream comment that the
+switch "should not cause hiccups/stalls to the live traffic". Two withdrawn
+explanations for one unexplained failure is a signal to stop proposing them.
 
-**The fragility is in `gro_cells` itself, not in 991.** Any missed poll wedges
-it the same way, for every driver that uses it.
+#### The confound that invalidates both runs: irqbalance was running
+
+`irqbalance` was active for the whole of both runs. It moves IRQ affinity masks
+on its own schedule, and the entire subject of W0002 is which CPU the receive
+work lands on. Neither run measured a controlled configuration.
+
+This is my error, and a specific one rather than an oversight. The script's
+preflight warns about irqbalance; the revision that actually stops it - and
+restores it afterwards - exists, is 22024 bytes, and was written at 21:52 UTC on
+2026-09-14. It never reached the box. The copy in the tree and the copy served
+from GitHub are both 20627 bytes and contain the string `irqbalance` zero times.
+I had already been told irqbalance was on, acknowledged it, put the fix in a file
+that did not ship, and then ran the test twice.
+
+Run 2 found both NAPI kthreads on CPU 1. Whether the script's own pinning put
+them there or irqbalance did is not determinable after the fact, which is what
+an uncontrolled variable costs.
+
+#### A separate correction: the tree was not stale, my commit was wrong
+
+I attributed the missing script revision to GitHub's CDN serving a cached copy,
+and then to `curl`'s quiet flags. **Both were wrong.** Measured 2026-09-14
+22:10 UTC: the bytes GitHub serves for `gro-backlog-ab.sh` and the bytes on disk
+in the checkout have the same length and the same MD5. GitHub publishes exactly
+what is committed to it; the commit carried the wrong content. `curl -fsSL` has
+nothing to do with it either - `-s` suppresses the progress meter and `-f` makes
+an HTTP error a non-zero exit instead of a saved error page, and neither touches
+caching.
+
+The failure signature worth remembering: the file on disk carries an mtime of
+21:52:12 UTC, the newest of the fourteen files in that directory, while holding
+the older content. A write landed and wrote stale bytes. The remaining thirteen
+files match my working copies byte for byte, so this was one bad commit rather
+than a broken pipeline.
+
+**A commit is not verified until the bytes on disk are read back and hashed.**
+Size alone was what I checked before, and size alone is what let this through.
 
 #### What is NOT established
 
-Why the poll was missed during the transition. `dev_set_threaded()` does **not**
-disable NAPI - it creates the kthreads, sets `dev->threaded`, and flips
-`NAPI_STATE_THREADED` on each instance - and it carries an explicit upstream
-comment that the switch "should not cause hiccups/stalls to the live traffic".
-So either that does not hold for the per-CPU gro_cells NAPIs, or something else
-swallowed the poll. **My first explanation for this was that `dev_set_threaded()`
-disables and re-enables NAPI. It does not. That was wrong and is withdrawn.**
+Where the downlink stops. The candidates are a host-side stall in the receive
+path, something in the MHI or modem path, and the radio itself. Nothing measured
+separates them:
 
-The evidence that would settle it is gone: `logread` is a ring buffer and the
-reboot cleared it. **Capture `logread` before rebooting next time.**
+- The kernel logs nothing in either run, so no host-side fault announced itself.
+- `rx_dropped` is too small in both runs to identify a queue overflow, and reads
+  0 in run 2's first dead windows.
+- Nothing sampled the radio during a failure window. A reading taken after run
+  1's reboot showed `rsrp=-107 dBm`, one bar. That describes the radio in
+  general, **not** the failure, and it is context rather than evidence.
 
-One confound worth naming rather than burying: this radio runs marginal - a
-reading taken after the reboot showed `rsrp=-107 dBm`, one bar - and a marginal
-link can drop on its own. That reading describes the radio in general and **not**
-the failure window, which nothing measured; it is context, not evidence.
+The correlation with the `threaded` write is strong - twice, within seconds,
+from a healthy 157 Mbit/s - and the lack of recovery on `threaded=0` says the
+write is a trigger rather than a state. That is as far as the evidence goes.
 
-What does argue against a radio outage is `rx_dropped`. Had the modem lost the
-link, no packets would have arrived and `rx_dropped` could not have moved. It
-moved in all five dead windows. Packets arriving and being dropped by the host
-queue is the wedge signature, not a dead radio.
+#### What would settle it, at what cost
+
+Ordered by what each costs to run:
+
+1. **Toggle `threaded` on an idle link, with irqbalance stopped, capturing
+   `logread -f` to a file throughout.** If the link dies with no traffic in
+   flight, the load is not involved and the trigger is the write itself. This is
+   the cheapest discriminator and it is what the 22024-byte revision does.
+2. **Sample the modem during the failure** - `dlwatch` is already in the image at
+   `/usr/bin/dlwatch` and `kptr_restrict=1` ships, so the `dl_qd` / `dl_free`
+   ring state is readable. `dl_qd=127` with `dl_free=0` is the host-not-draining
+   signature `downlink-stall.md` records; healthy ring counters with no traffic
+   points the other way, at the modem or the radio.
+3. **Sample `rsrp` inside the failure window**, not after the reboot, to retire
+   the radio as a candidate rather than arguing about it.
+
+Until at least the first of those runs on a box with irqbalance stopped, W0002
+has no measurement and this section has no mechanism.
 
 #### What this changes
 
-- **W0002 is unmeasured and now expensive to measure.** Any attempt costs a
-  reboot if it wedges again, on the box that is also the house router.
+- **W0002 is unmeasured, and both attempts at measuring it were invalid.** Not
+  inconclusive - invalid, because irqbalance was moving the variable under test.
+- **The cost of the next attempt is a reboot of the house router**, so it is
+  worth running only with the logging and the idle-link staging in place.
 - **The pre-existing `--threaded` mode's warning was probably wrong.** It said
   the throughput collapse it produced was the on-box `curl` starving the NAPI
-  kthread of CPU. The same collapse just happened with nothing competing on the
+  kthread of CPU. The same collapse happened twice with nothing competing on the
   box. A symptom attributed to contention may have been this all along.
-- **It may bear on the 993 downlink stall.** A wedged gro_cells queue stops
-  draining, the MHI ring fills, and the modem stalls - which is the
-  `dl_qd=127` / `dl_free=0` signature `downlink-stall.md` records. Whether the
-  stall 993 works around is ever this rather than a doorbell problem is
-  untested, and worth knowing before 993 is offered upstream as a modem fix.
+- **The link to the 993 downlink stall is now a question, not a claim.** I wrote
+  that a wedged gro_cells queue stops draining, the MHI ring fills, and the modem
+  stalls - the `dl_qd=127` / `dl_free=0` signature. With the wedge withdrawn,
+  what remains is that both failures look like a downlink that stops while the
+  box stays up. Whether they share a cause is untested, and step 2 above is the
+  cheap way to find out.

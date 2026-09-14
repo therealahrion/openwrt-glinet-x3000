@@ -284,99 +284,159 @@ meas() {
 # not short of poll budget: the queues fill between polls. That is a scheduling
 # latency problem, which is exactly what moving the work to a pinned kthread
 # addresses - and why rtt under load, not throughput, is the number to read.
-if [ "$1" = --napi ]; then
-	say "REFUSED - this mode took the WAN down and needed a reboot."
+# Recovery ladder, cheapest first. The 2026-09-14 run went straight to a reboot,
+# so which of these would have sufficed is unknown - worth knowing, since a
+# reboot of the house router is the most expensive possible answer.
+napi_recover() {
 	say ""
-	say "Run 2026-09-14: toggling /sys/class/net/$WANIF/threaded under sustained"
-	say "load killed the downlink on the first transition. It did not recover"
-	say "when threaded went back to 0, and it did not recover with ifdown/ifup."
-	say "The box needed a reboot. Five subsequent windows measured a dead link."
+	say "--- recovery, cheapest first ---"
+	say "  kernel log is at $LOG - READ IT BEFORE REBOOTING"
 	say ""
-	say "The mechanism, read from source. gro_cells_receive() schedules its"
-	say "NAPI ONLY on the 0->1 queue transition:"
-	say ""
-	say "    __skb_queue_tail(&cell->napi_skbs, skb);"
-	say "    if (skb_queue_len(&cell->napi_skbs) == 1)"
-	say "            napi_schedule(&cell->napi);"
-	say ""
-	say "So a single missed poll is PERMANENT: the queue stays non-empty, the"
-	say "edge never recurs, nothing re-arms it, and every later packet is"
-	say "dropped once the queue passes max_backlog. That is the rx_dropped"
-	say "climbing at 0.0 Mbit/s that was observed, and it is why setting"
-	say "threaded back to 0 did not recover - the wedge is the missing re-arm,"
-	say "not the mode."
-	say ""
-	say "What is NOT established is why the poll was missed during the"
-	say "transition. dev_set_threaded() does not disable NAPI and carries an"
-	say "explicit comment that the switch should not stall live traffic, so"
-	say "either that does not hold for the gro_cells NAPIs or something else"
-	say "swallowed the poll. Establish that before re-enabling this."
-	say ""
-	say "The fragility is in gro_cells itself rather than in 991: any missed"
-	say "poll wedges it the same way, for every driver that uses it."
-	say ""
-	say "Set NAPI_I_ACCEPT_A_REBOOT=1 to run it anyway."
-	[ "${NAPI_I_ACCEPT_A_REBOOT:-0}" = 1 ] || exit 1
-	say "W0002: threaded NAPI on $WANIF, load driven from a LAN client"
-	say ""
+	bs_set_sysfs /sys/class/net/$WANIF/threaded 0
+	sleep 3
+	ping -q -c2 -W2 "$PINGTGT" >/dev/null 2>&1 && { bs_ok "threaded=0 was enough"; return 0; }
+	say "  threaded=0 did not recover it"
 
-	# Refuse to measure nothing. Eight windows of zeros once read as a result.
-	_t0=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
-	sleep 5
-	_t1=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
-	_pps=$(( (_t1 - _t0) / 5 ))
-	say "  $WANIF rx over 5s: ${_pps} pkt/s"
-	if [ "$_pps" -lt 2000 ]; then
-		bs_bad "not a saturating download - nothing to measure"
-		say "        Start a large sustained download ON A LAN CLIENT, not here."
-		say "        A download pulled by this router competes with the NAPI"
-		say "        kthread for the same two cores and measures the harness."
+	ip link set "$WANIF" down 2>/dev/null; sleep 2
+	ip link set "$WANIF" up 2>/dev/null; sleep 5
+	ping -q -c2 -W2 "$PINGTGT" >/dev/null 2>&1 && { bs_ok "link down/up was enough"; return 0; }
+	say "  link down/up did not recover it. One thing a link cycle cannot reach:"
+	say "  gro_cells_init() runs at netdev creation rather than at link up, so"
+	say "  the queue and its length survive the cycle. Whether that is what is"
+	say "  stuck here is not established - see 23.20."
+
+	ifdown wwan 2>/dev/null; sleep 3; ifup wwan 2>/dev/null; sleep 10
+	ping -q -c2 -W2 "$PINGTGT" >/dev/null 2>&1 && { bs_ok "ifdown/ifup wwan was enough"; return 0; }
+	say "  ifdown/ifup did not recover it"
+
+	say ""
+	say "  Left: reload the driver, which destroys and recreates the netdev and"
+	say "  with it the gro_cells queues. NOT done automatically - it can strand"
+	say "  the MHI binding and leave no WAN at all until a reboot:"
+	say "      rmmod mhi_wwan_mbim && modprobe mhi_wwan_mbim"
+	say "  If that fails, reboot - but save $LOG off the box first."
+	return 1
+}
+
+# Staged by risk, after two 2026-09-14 runs took the WAN down and cost two
+# reboots. Four things those runs did not do, each of which cost something:
+#
+#   1. They toggled under load. Nobody would DEPLOY W0002 that way - the flag
+#      would be set at boot - so toggling under load was never the
+#      configuration worth testing. The idle toggle is, and it is safer.
+#   2. They captured no kernel log, and logread is a ring buffer, so each
+#      reboot destroyed the only account of what happened.
+#   3. Run 1 kept measuring for five windows after the link was already dead.
+#   4. They left irqbalance running while testing NAPI placement - which moves
+#      IRQ affinity underneath the one variable the test is about. The preflight
+#      warns about it; this revision stops it for the run and restores it after.
+#      Neither earlier run measured a controlled configuration.
+#
+# This still risks the link. It no longer risks it blind.
+if [ "$1" = --napi ]; then
+	say "W0002: threaded NAPI on $WANIF - staged by risk"
+	say ""
+	say "Two 2026-09-14 attempts killed the downlink and each needed a reboot."
+	say "This toggles on an IDLE link first, stops irqbalance, captures logread"
+	say "throughout, and stops the moment the link stops instead of measuring"
+	say "five dead windows."
+	say ""
+	say "It can still take the link down, and WHY it does is not established."
+	say "23.20 records both runs and two withdrawn explanations; the point of"
+	say "this revision is to collect the evidence those runs did not."
+	say ""
+	if [ "${NAPI_I_ACCEPT_A_REBOOT:-0}" != 1 ]; then
+		say "Set NAPI_I_ACCEPT_A_REBOOT=1 to proceed."
 		exit 1
 	fi
+
+	# Evidence first: logread is a ring buffer and a reboot empties it.
+	LOG=/tmp/napi-logread.txt
+	: > "$LOG"
+	logread -f >> "$LOG" 2>&1 &
+	LOGPID=$!
+	say "capturing logread to $LOG (pid $LOGPID)"
+
+	# irqbalance moves IRQ masks underneath a placement test.
+	IRQB=0
+	if /etc/init.d/irqbalance running >/dev/null 2>&1; then
+		IRQB=1
+		/etc/init.d/irqbalance stop >/dev/null 2>&1
+		say "irqbalance stopped for the run"
+	fi
+	napi_cleanup() {
+		kill "$LOGPID" 2>/dev/null
+		[ "$IRQB" = 1 ] && /etc/init.d/irqbalance start >/dev/null 2>&1
+		cleanup
+	}
+	trap 'say ""; say "interrupted"; napi_cleanup; exit 130' INT TERM
+
+	link_ok() { ping -q -c2 -W2 "$PINGTGT" >/dev/null 2>&1; }
+
 	say ""
+	say "--- phase 1: link healthy before anything ---"
+	if link_ok; then
+		bs_ok "link is up"
+	else
+		bs_bad "link already down - nothing to test"
+		napi_cleanup; exit 1
+	fi
 
-	_cyc=${CYCLES:-2}
-	_n=1
-	while [ "$_n" -le "$_cyc" ]; do
+	say ""
+	say "--- phase 2: toggle threaded=1 on an IDLE link ---"
+	say "  Stop any download now. Waiting 10s for the link to go quiet."
+	sleep 10
+	_d0=$(cat /sys/class/net/$WANIF/statistics/rx_dropped)
+	bs_set_sysfs /sys/class/net/$WANIF/threaded 1
+	sleep 5
+	_d1=$(cat /sys/class/net/$WANIF/statistics/rx_dropped)
+	say "  rx_dropped across the idle toggle: $((_d1-_d0))"
+	if link_ok; then
+		bs_ok "the link survived an idle toggle"
+	else
+		bs_bad "THE IDLE TOGGLE ALONE KILLED THE LINK"
+		say "        Decisive: threaded NAPI is unsafe on this driver at any"
+		say "        load, not only under one."
+		napi_recover
+		napi_cleanup
+		exit 1
+	fi
+
+	say ""
+	say "--- phase 3: start the LAN-side load, then measure ---"
+	say "  The download must be pulled by a LAN CLIENT, not by this router."
+	sleep 15
+	_p0=$(cat /sys/class/net/$WANIF/statistics/rx_packets); sleep 5
+	_p1=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
+	_pps=$(( (_p1 - _p0) / 5 ))
+	say "  $WANIF rx: ${_pps} pkt/s"
+	if [ "$_pps" -lt 2000 ]; then
+		bs_bad "no saturating load - not measuring"
 		bs_set_sysfs /sys/class/net/$WANIF/threaded 0
-		sleep 2; meas "softirq #$_n"
+		napi_cleanup; exit 1
+	fi
+	meas "thread"
+	if ! link_ok; then
+		bs_bad "the link died under load with threaded=1"
+		napi_recover; napi_cleanup; exit 1
+	fi
 
-		bs_set_sysfs /sys/class/net/$WANIF/threaded 1
-		sleep 2
-		# Report what actually exists rather than assuming the write took.
-		_pids=""
-		for _c in /proc/[0-9]*/comm; do
-			grep -q "^napi/$WANIF" "$_c" 2>/dev/null && _pids="$_pids ${_c%/comm}"
-		done
-		_pids=$(echo $_pids | tr ' ' '\n' | sed 's|/proc/||' | tr '\n' ' ')
-		say "  napi kthreads: ${_pids:-none - the threaded write did not take}"
-		meas "thread  #$_n"
+	say ""
+	say "--- phase 4: back to softirq, same load ---"
+	bs_set_sysfs /sys/class/net/$WANIF/threaded 0
+	sleep 5
+	if ! link_ok; then
+		bs_bad "the link died toggling back"
+		napi_recover; napi_cleanup; exit 1
+	fi
+	meas "softirq"
 
-		# Pin off CPU0, which is where every MHI vector lands (W0001). Field 39
-		# of /proc/<pid>/stat is the CPU the task last ran on - M07, which 18.4
-		# rates for placement and not for time.
-		for _p in $_pids; do
-			taskset -pc 1 "$_p" >/dev/null 2>&1
-		done
-		sleep 2
-		for _p in $_pids; do
-			_cpu=$(awk '{print $39}' "/proc/$_p/stat" 2>/dev/null)
-			say "  pid $_p last ran on CPU ${_cpu:-?}"
-		done
-		meas "thread-pin #$_n"
-		_n=$((_n+1))
-	done
-
-	cleanup
-	say "Read it this way:"
-	say "  rtt under load is the number. time_squeeze has never moved here, so"
-	say "  this is not about poll budget - it is about how long a datagram waits"
-	say "  between the IRQ and the poll that picks it up."
-	say "  Compare conditions WITHIN a cycle. If the spread between cycles is"
-	say "  bigger than the gap between conditions, the effect is below what this"
-	say "  rig resolves."
-	say "  rx_dropped falling with rtt flat is the win worth baking. rtt rising"
-	say "  is the trade, and on this box latency is the constrained axis."
+	napi_cleanup
+	say ""
+	say "Both conditions ran and the link survived. Compare rtt, not throughput;"
+	say "time_squeeze has never moved here, so this is about how long a datagram"
+	say "waits between the IRQ and the poll, not about poll budget."
+	say "Kernel log for the run: $LOG"
 	exit 0
 fi
 
