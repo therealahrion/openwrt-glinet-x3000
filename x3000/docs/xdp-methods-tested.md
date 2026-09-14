@@ -2059,9 +2059,9 @@ Each of these is a claim the build currently rests on without evidence.
 |---|---|---|---|
 | software nft flow offload | cake | that offloaded flows still traverse the egress qdisc, so cake keeps shaping. `lean-overlay.md` says in as many words to verify this before trusting it | bufferbloat run with `flow_offloading` on and off, latency under load |
 | BBRv3 | cake / `fq_codel` | that BBR's internal pacing and the qdisc's do not fight | throughput and latency A/B against `cubic` at the same shaper settings |
-| flowtable kfunc | XDP on `wwan0` | that it *should* work here, unlike the wired ports: generic XDP takes its rxq from `netif_get_rxqueue(skb)` (`dev.c:5039`, called 5084), the real netdev, and `wwan0` is in the fw4 flowtable (#112) | a program that actually calls the kfunc on `wwan0` and reports hit or `-ENOENT` |
+| ~~flowtable kfunc~~ | ~~XDP on `wwan0`~~ | **Settled - 23.1.** The assumption held: generic XDP takes its rxq from `netif_get_rxqueue(skb)` (`dev.c:5039`, called 5084), the real netdev, and `wwan0` is in the fw4 flowtable | **Done.** `xdp-ft-wwan.sh probe` calls the kfunc on `wwan0`. 98.8% to 99.0% hit across seven windows, both families, and `l3proto` and `iifidx` read back from the returned tuple agree with the packet on every lookup |
 | AF_XDP | native XDP on `eth0`/`eth1` | that XSK redirect works on the wired path as it does on `wwan0` | bind a socket, check for pstore records as verify-992a section 11 does |
-| aggregation | arrival rate | that `gro_cells` aggregation scales with load. A 60x reading was withdrawn because it implies an 84 KB skb against a 65536 ceiling, but it is possible if those datagrams were under 1092 bytes, which was never measured | one run at a fast link with the fixed `gro_measure()`, which now reports bytes per skb and `rx_dropped` |
+| aggregation | arrival rate | that `gro_cells` aggregation scales with load. A 60x reading was withdrawn because it implies an 84 KB skb against a 65536 ceiling, but it is possible if those datagrams were under 1092 bytes, which was never measured | one run at a fast link with the fixed `gro_measure()`, which now reports bytes per skb and `rx_dropped`. **Partly read, 23.11:** a 63x window implies a mean datagram near 1040 bytes, which is consistent with the ceiling and small for a speedtest. Still unexplained, and it belongs to the GRO work rather than to section 23 |
 
 ### 21.3 Two things this table clarified
 
@@ -2544,6 +2544,16 @@ kernel patch or the `bpf_fib_lookup()` rewrite. It would also mean the patch
 that put `wwan0` into the list is what took the physical ports out, which is a
 regression this tree owns.
 
+> **Answered, and only half right - 2026-09-14.** 23.9 read the list and the
+> three bridge ports were indeed absent, so the first half holds. The second
+> half does not: the ports were then **added live** and seven subsequent
+> windows, on fresh flows from both a wired and a Wi-Fi client, still read
+> `XMIT_NEIGH` on 100% of hits. A device-list change is therefore necessary and
+> **not sufficient** in its live form. 23.16 carries the measurement and the
+> two untested candidates for why. What is left is the `fw4` template, which
+> creates the flowtable with the ports already in it so no flow can predate
+> them.
+
 ### 23.9 The device list, read - and three windows that measured nothing
 
 **Answered, and the hypothesis holds.** The flowtable device list was:
@@ -2689,11 +2699,13 @@ it bears on the GRO work rather than on this section.
 
 0. ~~Should the program be made IPv6-capable before anything else?~~ **Answered
    and done - 23.12.** Both programs now parse both families.
-1. Does adding the three bridge ports produce `XMIT_DIRECT` on a forwarded
-   download? This no longer needs manufactured IPv4 traffic: with the v6 arm
-   built, an ordinary download measures it. The device list now reads
-   `br-lan, eth0, eth1, phy0-ap0, phy1-ap0, wwan0`; the window needs a LAN
-   client, not this router.
+1. ~~Does adding the three bridge ports produce `XMIT_DIRECT` on a forwarded
+   download?~~ **Answered - no.** The device list was changed live and reads
+   `br-lan, eth0, eth1, phy0-ap0, phy1-ap0, wwan0`. Seven windows since, from a
+   wired LAN client and a Wi-Fi client, read `XMIT_NEIGH` on 100% of hits -
+   `myxmit_direct` is zero in every one. The live addition is not sufficient;
+   see 23.16. The remaining form of the question is whether putting the ports
+   in the **fw4 template** changes it, which is the only live lead left.
 2. Why is cake not running on `wwan0`, and what does
    `qos-latency-research.md` already conclude about it? This is the only
    genuinely poor measurement on the box and it is not an XDP question.
@@ -2806,9 +2818,9 @@ resolve against, and the local mirror declaring one would not change the target.
 The fix is to relocate only as far as the enclosing field and read the bytes:
 `bpf_core_read(dst, 16, &other->tuple.src_v6)` needs the offset of `src_v6`,
 which exists, and nothing inside `struct in6_addr`, which does not. The general
-rule: **CO-RE relocates BTF field names, and a macro is not one** - if the
-kernel header defines the name you are reaching for, check it is a member and
-not a `#define` before assuming a relocation exists.
+rule: **CO-RE relocates BTF field names, and a macro is not one** - where a
+kernel header defines the name being reached for, check it is a member and not
+a `#define` before assuming a relocation exists.
 
 **Two families cannot share a typed header pointer across the branch.** Holding
 `struct iphdr *` and `struct ipv6hdr *` in one `struct parsed` and setting the
@@ -3285,8 +3297,22 @@ window, both families, with `l3proto` and `iifidx` agreeing with the packet on
 every single lookup. The redirect half has never fired and, on this box as
 configured, cannot: `XMIT_DIRECT` needs either hardware offload on - which
 empties the XDP hashtable and makes every lookup miss - or a forward-path walk
-that lands on a device in the flowtable's own hook list, and the three bridge
-ports are still missing from that list.
+that lands on a device in the flowtable's own hook list.
 
-That last one is the only live lead left, and it is a `fw4` template change
-rather than anything in this program.
+**The bridge ports are in that list and it did not help.** `eth1`, `phy0-ap0`
+and `phy1-ap0` were added live after 23.9 read them absent, the list read back
+with all six devices, and every window since has still been 100% `XMIT_NEIGH`.
+So the live addition is necessary-at-best, and why it is not sufficient is not
+established. Two candidates, neither tested:
+
+- `nft` adding a device to an **existing** flowtable may not register the hook
+  that `nft_flowtable_find_dev()` searches at `nft_flow_offload.c:202`, in which
+  case the walk still finds nothing to match and discards `XMIT_DIRECT`.
+- The flows measured in those windows may have been matched against state built
+  before the change. The forward path is computed once, at flow creation, so a
+  flow created earlier keeps the decision made earlier.
+
+The `fw4` template removes both doubts at once - the flowtable is created with
+the ports in it, so no flow can predate them and no live `add` is involved. That
+is the only live lead left, and it is a firewall4 change rather than anything in
+this program.

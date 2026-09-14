@@ -788,12 +788,18 @@ old UI; SMS UI is native in -next), `-hc` (foreign SIM-switch
 hardware), `rmnet-nss` (Qualcomm-only), legacy `sms-forwarder`
 (superseded), `qmodem-seal` (telemetry — privacy).
 
-**#3 — default_qdisc=fq baked (2026-09-05, user request).**
-`files-common/etc/sysctl.d/11-default-qdisc.conf` sets
-`net.core.default_qdisc=fq` — the pacing qdisc BBR pairs with. Scope:
-only interfaces without an explicit qdisc; the WAN under cake/SQM
-overrides it, LAN isn't the bottleneck — so it's a clean win for
-router-originated (bbr) TCP with no downside on the shaped paths.
+**#3 — default_qdisc pinned (2026-09-05, user request; corrected here
+2026-09-14).** This entry said the file sets `net.core.default_qdisc=fq`,
+the pacing qdisc BBR pairs with. **It is `fq_codel`, and has been since
+the same day this entry was written.** The file's own comment records the
+revert: `fq` was the earlier revision, and `fq_codel` is both the pin and
+the kernel's compiled default (`CONFIG_DEFAULT_FQ_CODEL=y`), which makes
+`files-common/etc/sysctl.d/11-default-qdisc.conf` an explicit no-op-safe
+pin rather than a change. The reasoning behind the revert is that
+`fq_codel` is the better general default for a forwarding router's AQM,
+and the path that actually matters — the WAN under cake — overrides the
+default anyway. Scope is unchanged: only interfaces without an explicit
+qdisc.
 
 **#4 — AT MTU question CLOSED empirically (2026-09-05).** Full
 `AT+QMAP=?` / `AT+QCFG=?` enumeration from the live RM520N shows NO MTU
@@ -816,6 +822,28 @@ version=` reveals the MODULE_VERSION the patch sets (`version=3`). The
 canonical proof remains build-time: tcp_bbr.c = 2407 lines +
 `fast_ack_mode` in tcp.h, and the flashed .ko was compiled from that
 tree.
+
+**#5 — the unshaped baseline, measured (2026-09-14).** The number this
+document exists to motivate, and until now it lived only in
+`xdp-methods-tested.md`. One saturating window on `wwan0` with no shaper
+running: **103.8 Mbit/s, latency under load 32.6 min / 66.1 avg / 156.9
+max ms, zero loss.** That is **33.5 ms of queueing on average and 124 ms
+at the tail** against the idle floor. Read with `gro-backlog-ab.sh
+--baseline`, which changes nothing.
+
+Two things it settles. **The no-shaper condition `cake-wan.init` tells the
+reader to baseline under is real on the running box** — `boxstate.sh`
+reports no shaper on the WAN, so this is the honest before-figure its
+header asks for. And **the box has the headroom to run one**: the same
+window read `time_squeeze` 0, `rx_dropped` 0, `softnet_dropped` 0 and cpu
+busy 23%, so the cost of a shaper is not the constraint.
+
+It also reorders the work. This box is **not** cycles-bound at the rates
+measured, so per-packet CPU savings buy nothing here; latency is the only
+poor number on it. Any XDP or offload work that bypasses the egress qdisc
+makes the one bad metric worse — which is why W0038's redirect half was
+rated low payoff even before it was shown not to fire. See
+`xdp-methods-tested.md` 23.11.
 
 ## Platform-ready batch (2026-09-05) — baked, dormant unless noted
 

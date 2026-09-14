@@ -99,22 +99,67 @@ drift into measuring different things.
 revision pooled six parse failures into one `parse_skip` slot. A window then
 returned 145880 of 146062 in that slot and it took a full cycle to work out the
 traffic had been IPv6 — a family counter would have said so on sight. The parser
-now returns the slot that rejected the packet and the caller bumps it, so twenty
-slots account for every packet and any window that measured the wrong thing says
+now returns the slot that rejected the packet and the caller bumps it, so the
+exits account for every packet and any window that measured the wrong thing says
 which wrong thing it measured.
 
-Three of the twenty — `v4`, `v6` and `nat66` — are **observations rather than
-exits**. They describe the window instead of accounting for it and do not sum
-with the rest: a packet counted in `v6` is counted again in whichever exit it
-took. `v4` and `v6` exist so that the family split, which on this link changes
-hour to hour and decides whether a window means anything, is readable in the
-same dump as the result rather than from a separate run of `boxstate.sh mix`.
+There are twenty-five slots and they are not all the same kind of thing.
+
+**Twelve are exits** — `not_ip`, `frag_or_opts`, `not_tcp_udp`, `short`,
+`low_ttl`, `tcp_teardown`, `miss`, `bad_dir`, `torn_down`, `not_direct`,
+`no_out_ifidx` and `read_err`. Together with whichever terminal the program
+reaches — `would_redirect` for the dry run, `redirect` or `no_headroom` for the
+fastpath — they sum to `seen`. **That sum is the check that a window is
+complete**, and it is worth doing every time: if it does not close, the dump is
+not describing all the traffic and no ratio taken from it means anything.
+
+**Nine are observations** — `v4`, `v6`, `hit`, `nat44`, `nat66`, `l3_ok`,
+`l3_bad`, `iif_ok` and `iif_bad`. They describe the window instead of accounting
+for it and do not sum with the rest: a packet counted in `v6` is counted again
+in whichever exit it took. `v4` and `v6` exist so that the family split, which
+on this link changes hour to hour and decides whether a window means anything,
+is readable in the same dump as the result rather than from a separate run of
+`boxstate.sh mix`. `nat44` and `nat66` say which translation the matched flow
+carries — see *Why there is no nat64 slot* below. The last four are the tuple
+invariants described under *The two invariants that make a lookup self-checking*.
 
 **Reads are gathered before anything is written.** Every read through the flow is
 a probe read of a computed address and can fail. `decide()` reads all of them,
 including both translated addresses and ports, before `commit()` touches the
 packet — a read that failed midway through a rewrite would put a half-translated
 packet on the stack, which is worse than not accelerating the flow.
+
+## The three maps, and why one of them is not per-CPU
+
+| map | type | entries | holds |
+|---|---|---|---|
+| `xdp_ft_stats` | `PERCPU_ARRAY` | 25 | the counters above |
+| `xdp_ft_relo` | `ARRAY` | 14 | the CO-RE constants the loader patched in |
+| `xdp_ft_dirbyte` | `PERCPU_ARRAY` | 256 | a histogram of the raw byte holding `dir` |
+
+`xdp_ft_stats` is per-CPU because counters are written on every packet and a
+shared map would serialise the whole program on one cache line; the reader sums
+across CPUs.
+
+**`xdp_ft_relo` is deliberately *not* per-CPU, and that is not an oversight.**
+It holds constants — field offsets, type sizes, shift amounts — that the loader
+patches into the instruction stream at load time and that are therefore
+identical on every CPU. Written into a per-CPU map and summed by the reader they
+would come back multiplied by the number of CPUs, which is a wrong number that
+looks like a plausible one. A plain array is written by whichever CPU gets there
+first and read back as itself.
+
+The map exists for one reason, and it is the method finding of this whole
+exercise: **where a value is patched in at load time, print the patched value
+before theorising about it.** Four `__builtin_preserve_field_info()` calls
+dumped into this map settled in a single window what three rounds of reasoning
+from the local struct mirror could not — because the local mirror is not what
+runs on the box.
+
+`xdp_ft_dirbyte` is the same idea one level lower: it histograms the raw byte
+the bitfield is extracted from, so the input to an extraction can be compared
+against the extraction's output. It is what proved the byte was constant while
+the macro reading it was not.
 
 ## The relocation that blocked the fastpath, and why it is gone
 
@@ -169,6 +214,84 @@ exactly the same reason the field relocations are: its value comes from the
 layout, which every candidate agrees on, rather than from an index into one
 particular BTF. The object now carries two `TYPE_SIZE` relocations and no
 type-id relocation at all.
+
+## `BPF_CORE_READ_BITFIELD_PROBED` is broken on this kernel
+
+This is the largest single finding in the program's history and it invalidated
+three rounds of measurement before it was caught.
+
+`struct flow_offload_tuple` stores `dir` and `xmit_type` as bitfields packed
+into one byte. The obvious way to read them is libbpf's
+`BPF_CORE_READ_BITFIELD_PROBED()`, which is what the program used. It produced
+`dir` values outside `0..1` — impossible for a two-bit field — and a
+`would_redirect` count that moved window to window on traffic that did not.
+
+The instrument was wrong, not the kernel. Run beside a hand extraction on the
+same packets, one window of 363290 packets:
+
+| reading | value |
+|---|---|
+| `hit` | **354468** |
+| `mydir_1` (hand) | **354468** |
+| `myxmit_neigh` (hand) | **354468** |
+| byte histogram `b5` | **354468** |
+| `dir3` (macro) | 197509 |
+| `would_redirect` (macro's `xmit_type`) | 156892 |
+
+**The macro split a constant input 55.7% / 44.3% between two answers.**
+Deterministic arithmetic on a fixed byte cannot do that, so its result depends
+on something that varies between packets. Four independent readings — the hand
+extraction of `dir`, the hand extraction of `xmit_type`, the raw byte, and
+`hit` itself — agree to the packet, and the macro disagrees with all four.
+
+### What replaced it
+
+`read_bits()` does the extraction by hand from the relocation constants clang
+supplies, which are ordinary compile-time integers with no runtime behaviour of
+their own:
+
+```c
+__u32 doff = bpf_core_field_offset(th->tuple.dir);
+__u32 dl = __builtin_preserve_field_info(th->tuple.dir, BPF_FIELD_LSHIFT_U64) & 63;
+__u32 dr = __builtin_preserve_field_info(th->tuple.dir, BPF_FIELD_RSHIFT_U64) & 63;
+__u64 raw = 0;
+
+if (bpf_core_read(&raw, sizeof(raw), (char *)th + doff))
+	return -1;
+v8 = raw & 0xff;
+b->dir = (__u32)((v8 << dl) >> dr);
+```
+
+Three details are load-bearing:
+
+- **One read, not two.** `dir` and `xmit_type` share a byte. The code checks
+  `xoff != doff` rather than assuming it, and reuses the byte when they match,
+  so the two values can never come from two different reads of a field that
+  changed in between.
+- **The shifts are masked with `& 63`.** A shift count at or above the operand
+  width is undefined in C, and the verifier will not save a program from it.
+- **`FIELD_SIGNED` relocations are gone from the object**, because the macro was
+  their only user. What remains is 50 `FIELD_BYTE_OFFSET`, 4 `TYPE_SIZE` and
+  4 each of the shift and size relocations — and still no `TYPE_ID`.
+
+### The two invariants that make a lookup self-checking
+
+Added at the same time, and cheap enough to keep permanently. `l3proto` and
+`iifidx` are both part of the lookup key, so a tuplehash that comes back
+disagreeing with either is not the one that was asked for, and everything read
+through it would be void:
+
+```c
+bpf_core_read(&l3, sizeof(l3), &th->tuple.l3proto);
+bump(l3 == p->family ? ST_L3_OK : ST_L3_BAD);
+bpf_core_read(&iif, sizeof(iif), &th->tuple.iifidx);
+bump(iif == ctx->ingress_ifindex ? ST_IIF_OK : ST_IIF_BAD);
+```
+
+They cost two probe reads and they are why a bad pointer could be ruled out in
+one window instead of argued about. **The general form is worth reusing: on any
+keyed lookup, reading back a field that is part of the key is a free
+self-check.** Across every window since, `l3_bad` and `iif_bad` have been zero.
 
 ## The verifier rejection behind it, and why it is gone
 
@@ -305,13 +428,33 @@ in the kernel's own BTF, which is what the local mirror computes, so the old
 | `seen` | 236046 | equal to the `rx_packets` delta |
 | `hit` | 233120 | 98.8% |
 | `miss` | 2784 | |
-| `parse_skip` | 142 | |
+| `parse_skip` (as the slot was then named) | 142 | |
 | `torn_down` | 27 | |
 | `not_direct` | 233093 | **every hit that was not torn down** |
 | `would_redirect` | **0** | |
 
 142 + 2784 + 27 + 233093 = 236046, so every packet is accounted for. Every flow
 on this box is `FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
+
+### Where it settled, after seven windows
+
+That first window was IPv4-only and its `would_redirect` was right for the wrong
+reason. Three later windows produced *non-zero* `would_redirect` figures, and
+those were the broken bitfield macro, not a change in the traffic. With the
+macro replaced by `read_bits()`, the position across seven windows on both
+families, LAN and Wi-Fi clients, up to 456861 packets in a window:
+
+| reading | across every window |
+|---|---|
+| `hit` / `seen` | **98.8% to 99.0%** |
+| `l3_bad`, `iif_bad` | **0** — every returned tuple is the one asked for |
+| hand-read `xmit_type` | **`FLOW_OFFLOAD_XMIT_NEIGH` on 100% of hits** |
+| `would_redirect` | **0** |
+
+**The lookup half is proven and reusable. The redirect half has never fired and,
+on this box as configured, cannot.** Any future program that wants NAT state for
+a modem flow can have it; any program that wants the flowtable to hand it an
+egress device and a MAC cannot, for the structural reason below.
 
 ### The scope was wrong for this link, and the fix was the easier program
 
@@ -368,6 +511,40 @@ routed prefix, but measured rather than assumed.
 
 What survives of the original claim is the narrower and still useful version:
 **the v6 rewrite is the simpler one, not the absent one.**
+
+### Why there is no nat64 slot
+
+The asymmetry looks like an oversight on a 464XLAT link and is not one:
+**no NAT64 state exists in this kernel to count.** 464XLAT puts the two halves
+of the translation at opposite ends of the path and neither end is this box.
+
+- The **CLAT** — IPv4 to IPv6 — is inside the RM520N modem. `wwan0` carries the
+  RFC 7335 service-continuity address `192.0.0.2/27` and Linux hands native
+  IPv4 to `192.0.0.1`.
+- The **NAT64** — IPv6 back to IPv4 — is in the carrier's network, behind the
+  prefix the DNS64 resolver synthesizes.
+
+So a flow in this flowtable is one of exactly two things: native IPv4, which
+carries ordinary **NAT44** because the LAN prefix is translated to the
+`192.0.0.2` CLAT address, or native IPv6, which on a routed prefix carries no
+NAT at all. A `nat64` counter would read zero permanently for a reason that has
+nothing to do with this program.
+
+What the question did expose was a real gap: **`nat44` was not counted either.**
+`nat66` existed and its v4 counterpart did not, so the translation that actually
+fires on this box was the invisible one. Both are counted now, off the same
+flags read, selected by family:
+
+```c
+if (d->flags & ((1UL << NF_FLOW_SNAT) | (1UL << NF_FLOW_DNAT)))
+	bump(p->family == AF_INET6 ? ST_NAT66 : ST_NAT44);
+```
+
+The one change that would invalidate this is moving the CLAT onto the router —
+OpenWrt's `464xlat` package and a `nat46` device. Translated flows would then be
+in this flowtable and every assumption above about what a tuple means would need
+re-reading. `boxstate.sh` detects that device, which is why it enumerates
+interfaces rather than listing the ones it expects.
 
 ### A defect the v6 work turned up in the v4 rewrite
 
@@ -447,6 +624,31 @@ The upload direction cannot reach the first route either: the walk starts at
 `ARPHRD_ETHER`, with no `ETH_ALEN` address. That direction is not what this
 program handles, but it explains why nothing in the table is ever direct.
 
+**The obvious fix was tried and did not work.** The download direction egresses
+through `br-lan`, so the walk should reach `DEV_PATH_BRIDGE` and set
+`XMIT_DIRECT` at `:154` — unless `nft_dev_forward_path()` discards it at `:202`
+because the bridge port it landed on is not in the flowtable's hook list. The
+three ports `eth1`, `phy0-ap0` and `phy1-ap0` were absent, so they were added
+live:
+
+```sh
+nft list ruleset | sed -n '/flowtable/,/}/p'   # before: br-lan, eth0, wwan0
+# ports added, list re-read: br-lan, eth0, eth1, phy0-ap0, phy1-ap0, wwan0
+```
+
+The list read back with all six. **Seven windows since, on fresh flows from both
+a wired LAN client and a Wi-Fi client, still read `XMIT_NEIGH` on 100% of
+hits.** Adding the devices to a live flowtable is therefore not sufficient, and
+why it is not is *not established* — the candidates are that `nft` adding a
+device to an existing flowtable does not register the hook
+`nft_flowtable_find_dev()` searches, or that the flows in those windows were
+matched against state built before the change. Neither has been tested.
+
+What has not been tried is the form that removes both doubts at once: putting
+the ports in the **fw4 template**, so the flowtable is created with them and no
+flow can predate them. That is the only live lead left on this workstream, and
+it is a firewall4 change rather than anything in this program.
+
 ### What would make it fire
 
 `bpf_fib_lookup()` is available to XDP (`xdp_func_proto`,
@@ -459,6 +661,16 @@ for the one thing only it can provide, the NAT translation, and `bpf_fib_lookup(
 for the egress device and the MAC addresses. The lookup has to run on the
 *translated* addresses, so the order is flow lookup, NAT, FIB lookup, build L2,
 redirect.
+
+**Whether it is worth building is now argued against by a measurement, not just
+by the dry run.** One saturating window on `wwan0` read `time_squeeze` 0,
+`rx_dropped` 0 and cpu busy 23% — this receive path is not cycles-bound, so
+there is no throughput to buy back. The number that *is* poor is latency, 32.6 /
+66.1 / 156.9 ms under load, and `generic_xdp_tx()` bypasses the qdisc, so a
+redirect would route packets around whatever shapes them. It optimises a
+resource this box has spare and harms the one it does not. The rest of this
+paragraph is the earlier argument, kept because the trade it describes is still
+the right one to weigh if the premise ever changes:
 
 **Whether it is worth building is a separate question, and the dry run argues
 both ways.** A 98.8% flowtable hit rate means the software flow offload is

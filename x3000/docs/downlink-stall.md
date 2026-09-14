@@ -466,5 +466,9 @@ stands still, the host is posting buffers the modem is never told about. If
 `dl_db` tracks `dl_wp`, the modem has been told and is ignoring it. `dl_qd=127`
 with `dl_free=0` is the deadlock signature.
 
-Reading those pointer columns needs `sysctl -w kernel.kptr_restrict=1` first;
-without it the driver's own `rp`/`wp` print as hashed values.
+Reading those pointer columns needs `kernel.kptr_restrict=1`; without it the
+driver's own `rp`/`wp` print as hashed values. **The image ships it**, in
+`/etc/sysctl.d/40-kptr-restrict.conf`, so on a current flash there is nothing to
+set - `sysctl -w kernel.kptr_restrict=1` is only needed on a box that predates
+that fragment. `wan-stall-runbook.md` section 5 carries the same note for the
+recorders.

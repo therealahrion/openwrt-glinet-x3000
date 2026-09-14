@@ -361,6 +361,19 @@ other and aggregation held flat at 2.11-2.15x across them.
     Attach, detach, XDP_PASS, XDP_DROP and AF_XDP all exercised; rx_errors
     stayed at zero throughout and no crash records appeared in pstore.
 
+    Since exercised by a non-trivial program rather than a no-op: an XDP
+    object carrying three per-CPU maps, twenty-seven CO-RE field
+    relocations against kernel BTF, and a bpf_xdp_flow_lookup() kfunc call
+    per packet, run over seven windows across both address families at up
+    to 456861 packets in a window. Two results bear on this patch. The
+    kfunc resolved 98.8% to 99.0% of packets, which it can only do because
+    the hook hands it the real netdev's rxq - so the rxq this patch
+    registers is correct for the helpers that read it. And the program's
+    own packet count matched the driver's rx_packets delta to within 0.01%
+    in every window, which places the hook in front of the entire receive
+    path rather than a sample of it. Detail in x3000/docs/
+    xdp-methods-tested.md section 23.
+
 ## 6. What reviewers will push back on the driver series
 
 Worth having answers ready rather than discovering these on-list.

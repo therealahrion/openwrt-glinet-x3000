@@ -30,11 +30,11 @@ so the zero-reject BBRv3 verification carries over intact.
 | irqbalance (2026-09-11) | `irqbalance` + `luci-app-irqbalance`. No kernel symbols — it only writes `/proc/irq/*/smp_affinity`. Inert as packaged: `/etc/config/irqbalance` ships `enabled '0'` and the init returns early, so `93-irqbalance` flips it. Can pull against packet steering, which moves NAPI threads and `rps_cpus` on the same two cores | `x3000/config.common`, `x3000/files-common/etc/uci-defaults/93-irqbalance` |
 | packet steering (2026-09-11) | `network.globals.packet_steering='2'` (LuCI "Enabled (all CPUs)") + `steering_flows='128'` ("Suggested: 128"). Set only when unset, so a LuCI choice survives. Not a measured win — see `xdp-methods-tested.md` 14.3/14.4 | `x3000/files-common/etc/uci-defaults/94-packet-steering` |
 | Fantastic Packages feed (2026-09-11) | `fantastic-keyring` + `fantastic-packages-feeds` — key into `/etc/apk/keys/`, repo lines into `/etc/apk/repositories.d/customfeeds.list`, written at image build time. Makes the catalogue installable with `apk add`; nothing from it is built in. No "allow untrusted" needed, because the keyring is present | `x3000/config.common`, `x3000/custom-feeds.txt` |
-| LuCI theme + compat layer (2026-09-13) | `luci-theme-argon` from `jerrykuku/luci-theme-argon` pinned to `v2.4.7` — the 25.12 luci feed carries only bootstrap, footstrap, material, openwrt and openwrt-2020, checked against `themes/` on that branch rather than assumed. **Nothing here sets the theme**: the package ships `/etc/uci-defaults/30_luci-theme-argon`, which writes `luci.main.mediaurlbase` once, guarded on `luci.themes.Argon` being absent, and sorts ahead of `30_luci-theme-bootstrap`, whose own write fires only when that option is unset — so Argon wins a fresh config, and afterwards neither script touches it, which is why a theme picked in LuCI survives the next sysupgrade. Same persistence the markers in `defaults.sh` give the rows above, but earned by the package's own guard, so adding a script of ours would be a duplicate. `luci-theme-bootstrap` stays in as the fallback, since `luci-base` ships `/etc/config/luci` pointing at it and a theme that fails to render leaves no way back through the UI. `luci-compat` is the pre-JS CBI/Lua form layer: nothing in the image needs it — on this feed only `luci-app-openvpn` depends on it — but most of the Fantastic catalogue above is still on the old API, and apk cannot add a missing LuCI runtime after flashing. Cost computed from the dependency closure, not guessed: `+luci-lua-runtime` names `luci-base`, `lua`, `luci-lib-base`, `-nixio`, `-ip`, `-jsonc`, `libubus-lua`, `liblucihttp-lua` and `ucode-mod-lua`, of which three were already here — `luci-base` and `lua` directly, and `libubus-lua` via `prometheus-node-exporter-lua`, whose DEPENDS carries it — so the layer adds eight packages. The theme is ucode-based with no `luasrc/`, so `luci.mk` attaches none of that to it, and it costs only itself: `USE_APK` is default y and `uclient-fetch` carries `PROVIDES:=@wget-any`, while `jsonfilter` is pulled unconditionally by `base-files`, so it is in every OpenWrt image | `x3000/config.common`, `x3000/custom-feeds.txt` |
+| LuCI theme + compat layer (2026-09-13) | `luci-theme-argon` from `jerrykuku/luci-theme-argon` pinned to `v2.4.7` — the 25.12 luci feed carries only bootstrap, footstrap, material, openwrt and openwrt-2020, checked against `themes/` on that branch rather than assumed. **Nothing here sets the theme**: the package ships `/etc/uci-defaults/30_luci-theme-argon`, which writes `luci.main.mediaurlbase` once, guarded on `luci.themes.Argon` being absent, and sorts ahead of `30_luci-theme-bootstrap`, whose own write fires only when that option is unset — so Argon wins a fresh config, and afterwards neither script touches it, which is why a theme picked in LuCI survives the next sysupgrade. Same persistence the markers in `defaults.sh` give the rows above, but earned by the package's own guard, so adding a script here would be a duplicate. `luci-theme-bootstrap` stays in as the fallback, since `luci-base` ships `/etc/config/luci` pointing at it and a theme that fails to render leaves no way back through the UI. `luci-compat` is the pre-JS CBI/Lua form layer: nothing in the image needs it — on this feed only `luci-app-openvpn` depends on it — but most of the Fantastic catalogue above is still on the old API, and apk cannot add a missing LuCI runtime after flashing. Cost computed from the dependency closure, not guessed: `+luci-lua-runtime` names `luci-base`, `lua`, `luci-lib-base`, `-nixio`, `-ip`, `-jsonc`, `libubus-lua`, `liblucihttp-lua` and `ucode-mod-lua`, of which three were already here — `luci-base` and `lua` directly, and `libubus-lua` via `prometheus-node-exporter-lua`, whose DEPENDS carries it — so the layer adds eight packages. The theme is ucode-based with no `luasrc/`, so `luci.mk` attaches none of that to it, and it costs only itself: `USE_APK` is default y and `uclient-fetch` carries `PROVIDES:=@wget-any`, while `jsonfilter` is pulled unconditionally by `base-files`, so it is in every OpenWrt image | `x3000/config.common`, `x3000/custom-feeds.txt` |
 | eBPF userland | `tc-bpf` (tc-tiny unset), `libbpf`, `bpftool-full`, `xdp-loader`, `xdpdump` | `x3000/config.common` |
 | cake-autorate prereqs | `bash`, `fping` (the script itself is dropped in post-flash) | `x3000/config.common` |
 | WireGuard | `kmod-wireguard`, `wireguard-tools`, `luci-proto-wireguard` — inert until a wg interface exists | `x3000/config.common` |
-| TCP / qdisc baseline | `net.core.default_qdisc=fq_codel`; `tcp_sack=1`, `tcp_dsack=1`; a commented opt-OUT to cubic (bbr stays default) | `x3000/files-common/etc/sysctl.d/{11,20,30}-*.conf` |
+| TCP / qdisc baseline | `net.core.default_qdisc=fq_codel`; `tcp_sack=1`, `tcp_dsack=1`; a commented opt-OUT to cubic (bbr stays default) | `x3000/files-common/etc/sysctl.d/` — four fragments, of which `40-kptr-restrict.conf` belongs to the diagnostics bundle the repo-root README documents rather than to this row |
 | harness fix | `prepare.sh` now composes `.config` + runs `defconfig` **after** `feeds install` (pure move of the block). At vjt's HEAD it ran before, so the first run on a fresh clone silently dropped every feed-provided package — his own quectel-5g-tools and wifi-dethrash-collector included | `x3000/prepare.sh` |
 
 ## What stays out, on purpose
@@ -110,9 +110,21 @@ and that went wrong once already: flow offload was documented as dormant while t
 flowtable was installed on `br-lan`, `eth0` and `wwan0` with a third of live
 forwarded flows in `OFFLOAD` state. Read the board, do not trust the row.
 
+**`x3000/docs/boxstate.sh` reads every lever in this table in one pass**, plus
+the flowtable device list, TCP congestion control and ECN/SACK, RPS and XPS
+masks per interface, the 464XLAT topology and zram. It is the command to run
+first; the per-lever commands below are the fallback when only one answer is
+wanted.
+
+```sh
+sh /tmp/boxstate.sh            # the whole report
+sh /tmp/boxstate.sh mix 30     # family split over a 30-second window
+```
+
 | lever | image default | read the running state with |
 |---|---|---|
 | software flow offload | on | `uci -q get firewall.@defaults[0].flow_offloading`, then `nft list ruleset \| grep -c 'flow add'` |
+| flowtable device list | `br-lan`, `eth0`, `wwan0` — fw4 builds it from zone devices, so bridge *ports* are not in it | `nft list ruleset \| sed -n '/flowtable/,/}/p'` — decides whether a forwarded flow can ever be `XMIT_DIRECT`, which is what `xdp-methods-tested.md` 23.3 and 23.16 turn on |
 | packet steering / RPS | `2` and `128` | `uci -q get network.globals.packet_steering; uci -q get network.globals.steering_flows` |
 | irqbalance | enabled | `/etc/init.d/irqbalance enabled && echo on` |
 | zram | `lz4`, 256 MiB | `uci -q get zram.@zram[0].zram_comp_algo; free -m \| grep -i swap` |
@@ -120,7 +132,38 @@ forwarded flows in `OFFLOAD` state. Read the board, do not trust the row.
 | MHI doorbell (993) | on, via `modules.d` | `cat /sys/module/mhi/parameters/force_db_brst_disable` |
 | GRO on `wwan0` (991) | on | `ethtool -k wwan0 \| grep '^generic-receive-offload'` |
 | `netdev_max_backlog` | 1000 | `cat /proc/sys/net/core/netdev_max_backlog` |
+| WAN shaper | none — `cake-wan.init` is a reference script, not installed | `tc qdisc show dev wwan0` — measured absent 2026-09-14, and the latency that costs is entry #5 of the field log in `qos-latency-research.md` |
+| TCP congestion control | `bbr`, set by the `kmod-tcp-bbr` package's own `12-tcp-bbr.conf`, not by this tree; 990 makes that module v3, and this tree's `30-tcp-bbr.conf` is a commented-out opt-out to cubic | `sysctl net.ipv4.tcp_congestion_control` |
+| `default_qdisc` | `fq_codel` | `sysctl net.core.default_qdisc` |
 | LuCI theme | Argon | `uci -q get luci.main.mediaurlbase` — `/luci-static/argon` unless changed |
+
+## On-box scripts
+
+Four scripts in `x3000/docs/`. None is copied into the image — they are pulled
+or pasted onto a running box — and since 2026-09-14 the other three source
+`boxstate.sh` as a shell library rather than carrying their own copies of the
+same readers.
+
+| script | what it does |
+|---|---|
+| `boxstate.sh` | report **and** library. `BOXSTATE_LIB=1 . boxstate.sh` exports `bs_*` readers, `bs_require_*` gates and `bs_set_*` setters with an undo log |
+| `xdp-ft-wwan.sh` | the W0038 flowtable XDP harness — `check \| probe \| dryrun \| status \| off`. Verifies the BPF object against a committed sha256 before loading it |
+| `verify-992a.sh` | the 992 XDP hook verifier, eleven steps, PASS/FAIL tally |
+| `gro-backlog-ab.sh` | GRO and `netdev_max_backlog` A/B, with `--baseline` for one window that changes nothing |
+
+Three rules the library exists to enforce, each of which was a bug before it was
+a rule:
+
+- **Readers exit 0, always.** A reader returning non-zero aborts its caller under
+  `set -e` before any output, which reads as the script producing nothing rather
+  than as a failed read. Questions (`bs_have`, `bs_ft_has`, `bs_zram_active`)
+  keep their status; readers do not.
+- **A gate that cannot verify says so.** The hardware-offload gate used to report
+  `ok` when `uci` was unreadable — a gate passing because it was never tested. It
+  now reports UNVERIFIED.
+- **Every setter logs its undo.** `bs_set_sysctl`, `bs_set_sysfs` and `bs_set_gro`
+  append the previous value to `$BS_UNDO`, and `bs_restore` replays it, so a
+  script that dies mid-window still leaves the box as it found it.
 
 ## Work queue, easiest to hardest
 

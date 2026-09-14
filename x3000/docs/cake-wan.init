@@ -3,7 +3,15 @@
 # cake-wan — Phase-1 hand-driven cake shaper for the lean image (no sqm,
 # no qosify). NOT installed by apply.sh: the lever stays OFF until it is
 # pulled by hand. To use, after baselining (Waveform bufferbloat +
-# a game session) with NO shaper:
+# a game session) with NO shaper.
+#
+# One unshaped baseline already exists, measured 2026-09-14 and recorded
+# as entry #5 of the field debugging log in qos-latency-research.md:
+# 103.8 Mbit/s with latency under load of 32.6 / 66.1 / 156.9 ms and zero
+# loss - about 33.5 ms of queueing on average and 124 ms at the tail. Take
+# a fresh one anyway before setting the numbers below, because the
+# bandwidth figure is what they are derived from and a cellular link does
+# not hold still, but that entry says what the shaper has to beat:
 #
 #   scp cake-wan.init root@router:/etc/init.d/cake-wan
 #   ssh root@router 'chmod +x /etc/init.d/cake-wan; vi /etc/init.d/cake-wan'  # set the numbers
