@@ -66,7 +66,7 @@ the current program's labels. Update both places together:
 
 ```
 99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c  bpf/xdp_ft_probe.bpf
-6fdce11f67ef6e6d42812e0e95ff535abf82d9426e59766b4d6be0250a14b3e2  bpf/xdp_ft_wwan.bpf
+38198343560f1a0fc08e1c6a2af4699b86e2869c55e5a91f2ea2acd9443dcf63  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the three programs do

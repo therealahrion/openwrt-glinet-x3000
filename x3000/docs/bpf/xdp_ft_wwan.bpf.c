@@ -272,80 +272,28 @@ enum stat_slot {
 	ST_TCP_TEARDOWN,
 	ST_MISS,
 	ST_HIT,
-	ST_DIR2,		/* dir read back as 2 - impossible, see below */
-	ST_DIR3,		/* dir read back as 3 - impossible, see below */
+	ST_BAD_DIR,		/* dir outside 0..1 - impossible, see below */
 	ST_TORN_DOWN,
 	ST_NOT_DIRECT,
 	ST_NO_OUT_IFIDX,
 	ST_READ_ERR,
+	ST_NAT44,		/* observation: a v4 flow carrying SNAT or DNAT */
 	ST_NAT66,		/* observation: a v6 flow carrying SNAT or DNAT */
 	ST_WOULD_REDIRECT,
 	ST_NO_HEADROOM,
 	ST_REDIRECT,
 
-	/* Diagnostics for an impossible result, measured 2026-09-14: on two
-	 * IPv6 windows, 41% and 50% of successful lookups read tuple.dir back
-	 * as 2 or 3. The kernel writes dir exactly once
-	 * (nf_flow_table_core.c:27) and flow_offload_lookup() then uses it as
-	 * a container_of index (nf_flow_table_core.c), so a value outside 0..1
-	 * would compute a wild pointer inside the kernel long before this
-	 * program saw it. The kernel does not fault, so the kernel's value is
-	 * 0 or 1 and this program's read of it is wrong.
-	 *
-	 * Two candidates fit and each predicts something the data denies, so
-	 * rather than pick one these slots separate them by measurement:
-	 *
-	 *   l3_ok / l3_bad     l3proto and the packet's own family agree
-	 *   iif_ok / iif_bad   tuple.iifidx equals ctx->ingress_ifindex
-	 *
-	 * Both are ordinary FIELD_BYTE_OFFSET reads of plain scalars sitting
-	 * beside the bitfield, and that relocation class is already proven
-	 * good here. If they agree with the packet, the pointer and the
-	 * offsets are right and the fault is in the bitfield extraction
-	 * alone. If they disagree, th itself is not what it should be and
-	 * every value read through it - would_redirect included - is void.
-	 *
-	 *   baddir_xmit_direct / baddir_xmit_other
-	 *
-	 * dir and xmit_type occupy the same byte. Reading xmit_type on the
-	 * packets whose dir was impossible says whether that byte is intact:
-	 * a byte that still yields DIRECT is not corrupt, and only the
-	 * two-bit extraction is at fault.
-	 *
-	 * These are diagnostics and come out once the answer is in.
+	/* Two invariants on the tuple that came back, kept permanently rather
+	 * than as a diagnostic. Both fields are part of the lookup key, so a
+	 * tuplehash disagreeing with either is not the one that was asked for,
+	 * and everything read through it would be void. They cost two probe
+	 * reads and they are the reason 23.14 could rule out a bad pointer in
+	 * one window instead of arguing about it.
 	 */
 	ST_L3_OK,
 	ST_L3_BAD,
 	ST_IIF_OK,
 	ST_IIF_BAD,
-	ST_BADDIR_XMIT_DIRECT,
-	ST_BADDIR_XMIT_OTHER,
-
-	/* The same two fields, extracted by hand from an eight-byte read of the
-	 * same relocated address, using the same patched shifts.
-	 *
-	 * This exists because the run of 2026-09-14 contradicted itself. The
-	 * byte histogram put every one of 267510 hits in one bucket, value 5 -
-	 * dir 1, xmit_type 1, NEIGH - and the raw eight bytes decoded to
-	 * mtu 1500 at tuple+52, which cannot land there by accident. Applying
-	 * the patched shifts to 5 by hand gives dir 1 and xmit NEIGH. Yet
-	 * BPF_CORE_READ_BITFIELD_PROBED reported dir outside 0..1 on 136122 of
-	 * those packets and DIRECT on 131209 of them. Deterministic arithmetic
-	 * on a constant input cannot do that, so one of the two readings is not
-	 * reading what it says it is.
-	 *
-	 * Computing it here settles which. The only deliberate difference is
-	 * that the upper 56 bits are provably zero: raw is masked to its low
-	 * byte before the shifts, where the macro reads one byte into a u64 and
-	 * trusts the rest of that u64 to be the zero it initialised. If these
-	 * counters and the macro's disagree, that assumption is the difference.
-	 */
-	ST_MYDIR_0,
-	ST_MYDIR_1,
-	ST_MYDIR_OTHER,
-	ST_MYXMIT_NEIGH,
-	ST_MYXMIT_DIRECT,
-	ST_MYXMIT_OTHER,
 	ST__MAX,
 };
 
@@ -426,6 +374,86 @@ static __always_inline void bump_byte(__u32 b)
 	v = bpf_map_lookup_elem(&xdp_ft_dirbyte, &b);
 	if (v)
 		*v += 1;
+}
+
+/* dir and xmit_type, read together out of the single byte that holds them.
+ *
+ * Deliberately not BPF_CORE_READ_BITFIELD_PROBED. That macro produced 197509
+ * impossible dir values and 156892 phantom XMIT_DIRECT verdicts in one window
+ * whose byte at this exact address was 5 - dir 1, xmit NEIGH - on every one of
+ * 354468 lookups. It split a constant input 56/44, which deterministic
+ * arithmetic cannot do, so its result depends on something that varies between
+ * packets. Measured and recorded in xdp-methods-tested.md 23.16.
+ *
+ * This does the same arithmetic with the same relocated shift amounts. The one
+ * deliberate difference is that the value shifted has provably zero upper
+ * bits: the macro reads BYTE_SIZE bytes into a u64 and relies on the rest of
+ * that word still holding the zero it was initialised with, and BYTE_SIZE is
+ * patched from 8 down to 1 at load time, so seven eighths of that word is
+ * whatever the last packet left on the stack. Masking to the low byte cannot
+ * be wrong in the same way.
+ *
+ * Why exactly that goes wrong when the shift should discard those bits anyway
+ * is not established, and is not guessed at here. What is established is that
+ * this version agrees with the byte, with l3proto, with iifidx and with the
+ * kernel's own structural claim in every window run so far, and the macro
+ * agrees with none of them.
+ */
+struct bitfields {
+	__u32 dir;
+	__u32 xmit;
+};
+
+static __always_inline int read_bits(struct flow_offload_tuple_rhash___local *th,
+				     struct bitfields *b)
+{
+	__u32 doff = bpf_core_field_offset(th->tuple.dir);
+	__u32 xoff = bpf_core_field_offset(th->tuple.xmit_type);
+	__u32 dl = __builtin_preserve_field_info(th->tuple.dir,
+						 BPF_FIELD_LSHIFT_U64) & 63;
+	__u32 dr = __builtin_preserve_field_info(th->tuple.dir,
+						 BPF_FIELD_RSHIFT_U64) & 63;
+	__u32 xl = __builtin_preserve_field_info(th->tuple.xmit_type,
+						 BPF_FIELD_LSHIFT_U64) & 63;
+	__u32 xr = __builtin_preserve_field_info(th->tuple.xmit_type,
+						 BPF_FIELD_RSHIFT_U64) & 63;
+	__u64 raw = 0, v8;
+
+	if (bpf_core_read(&raw, sizeof(raw), (char *)th + doff))
+		return -1;
+	v8 = raw & 0xff;
+	b->dir = (__u32)((v8 << dl) >> dr);
+
+	/* The two share a byte in every kernel that has had this struct, but
+	 * that is a property of the layout rather than a guarantee, so it is
+	 * checked rather than assumed. A second read costs one probe read on a
+	 * kernel where it is ever false, and nothing at all on this one.
+	 */
+	if (xoff != doff) {
+		raw = 0;
+		if (bpf_core_read(&raw, sizeof(raw), (char *)th + xoff))
+			return -1;
+		v8 = raw & 0xff;
+	}
+	b->xmit = (__u32)((v8 << xl) >> xr);
+
+	relo_set(RL_DIR_OFF, doff);
+	relo_set(RL_DIR_SZ, bpf_core_field_size(th->tuple.dir));
+	relo_set(RL_DIR_LSHIFT, dl);
+	relo_set(RL_DIR_RSHIFT, dr);
+	relo_set(RL_XMIT_OFF, xoff);
+	relo_set(RL_XMIT_SZ, bpf_core_field_size(th->tuple.xmit_type));
+	relo_set(RL_XMIT_LSHIFT, xl);
+	relo_set(RL_XMIT_RSHIFT, xr);
+	relo_set(RL_L3_OFF, bpf_core_field_offset(th->tuple.l3proto));
+	relo_set(RL_IIF_OFF, bpf_core_field_offset(th->tuple.iifidx));
+	relo_set(RL_TUPLE_OFF, bpf_core_field_offset(th->tuple));
+	relo_set(RL_RHASH_SZ,
+		 bpf_core_type_size(struct flow_offload_tuple_rhash___local));
+	relo_set(RL_RAW_LO, raw & 0xffffffff);
+	relo_set(RL_RAW_HI, raw >> 32);
+	bump_byte((__u32)v8);
+	return 0;
 }
 
 static __always_inline void bump(__u32 slot)
@@ -804,8 +832,8 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 {
 	struct flow_offload_tuple_rhash___local *th, *other;
 	struct flow_offload___local *flow;
+	struct bitfields bits = {};
 	struct ports_ *ports;
-	__u8 xmit;
 	__u32 hsz;
 	int rc;
 
@@ -866,132 +894,21 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 			bump(iif == ctx->ingress_ifindex ? ST_IIF_OK : ST_IIF_BAD);
 	}
 
-	/* What CO-RE patched in, and the bytes it reads with them. Written on
-	 * every packet rather than once, because there is nowhere in an XDP
-	 * program to do one-time setup and the values are constants anyway.
-	 */
-	{
-		__u32 off = bpf_core_field_offset(th->tuple.dir);
-		__u64 raw = 0;
-
-		relo_set(RL_DIR_OFF, off);
-		relo_set(RL_DIR_SZ, bpf_core_field_size(th->tuple.dir));
-		relo_set(RL_DIR_LSHIFT,
-			 __builtin_preserve_field_info(th->tuple.dir,
-						       BPF_FIELD_LSHIFT_U64));
-		relo_set(RL_DIR_RSHIFT,
-			 __builtin_preserve_field_info(th->tuple.dir,
-						       BPF_FIELD_RSHIFT_U64));
-		relo_set(RL_XMIT_OFF, bpf_core_field_offset(th->tuple.xmit_type));
-		relo_set(RL_XMIT_SZ, bpf_core_field_size(th->tuple.xmit_type));
-		relo_set(RL_XMIT_LSHIFT,
-			 __builtin_preserve_field_info(th->tuple.xmit_type,
-						       BPF_FIELD_LSHIFT_U64));
-		relo_set(RL_XMIT_RSHIFT,
-			 __builtin_preserve_field_info(th->tuple.xmit_type,
-						       BPF_FIELD_RSHIFT_U64));
-		relo_set(RL_L3_OFF, bpf_core_field_offset(th->tuple.l3proto));
-		relo_set(RL_IIF_OFF, bpf_core_field_offset(th->tuple.iifidx));
-		relo_set(RL_TUPLE_OFF, bpf_core_field_offset(th->tuple));
-		relo_set(RL_RHASH_SZ,
-			 bpf_core_type_size(struct flow_offload_tuple_rhash___local));
-
-		/* The same eight bytes BPF_CORE_READ_BITFIELD_PROBED reads,
-		 * from the same relocated offset. Histogramming the low byte
-		 * says whether that window holds the bitfield or something
-		 * else entirely.
-		 */
-		if (!bpf_core_read(&raw, sizeof(raw), (char *)th + off)) {
-			/* Shift amounts come from the relocations, so they are
-			 * immediates once patched; masked to 0..63 anyway,
-			 * because a BPF shift past the word size is undefined
-			 * and the verifier is entitled to refuse it.
-			 */
-			__u32 dl = __builtin_preserve_field_info(th->tuple.dir,
-					BPF_FIELD_LSHIFT_U64) & 63;
-			__u32 dr = __builtin_preserve_field_info(th->tuple.dir,
-					BPF_FIELD_RSHIFT_U64) & 63;
-			__u32 xl = __builtin_preserve_field_info(th->tuple.xmit_type,
-					BPF_FIELD_LSHIFT_U64) & 63;
-			__u32 xr = __builtin_preserve_field_info(th->tuple.xmit_type,
-					BPF_FIELD_RSHIFT_U64) & 63;
-			__u64 v8 = raw & 0xff;	/* upper bits provably zero */
-			__u32 mydir = (__u32)((v8 << dl) >> dr);
-			__u32 myxmit = (__u32)((v8 << xl) >> xr);
-
-			relo_set(RL_RAW_LO, raw & 0xffffffff);
-			relo_set(RL_RAW_HI, raw >> 32);
-			bump_byte((__u32)(raw & 0xff));
-
-			bump(mydir == 0 ? ST_MYDIR_0
-			   : mydir == 1 ? ST_MYDIR_1 : ST_MYDIR_OTHER);
-			bump(myxmit == FLOW_OFFLOAD_XMIT_NEIGH ? ST_MYXMIT_NEIGH
-			   : myxmit == FLOW_OFFLOAD_XMIT_DIRECT ? ST_MYXMIT_DIRECT
-			   : ST_MYXMIT_OTHER);
-		}
+	if (read_bits(th, &bits)) {
+		bump(ST_READ_ERR);
+		return -1;
 	}
-
-	d->dir = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, dir);
+	d->dir = bits.dir;
 	if (d->dir > FLOW_OFFLOAD_DIR_REPLY) {
-		/* dir is two bits, so this is 2 or 3 and nothing else. Read
-		 * xmit_type out of the same byte before giving up: it says
-		 * whether the byte is intact.
+		/* Now a genuine impossibility rather than an instrument fault:
+		 * the kernel writes dir once (nf_flow_table_core.c:27) and then
+		 * uses it as a container_of index, so a 2 or a 3 here would
+		 * have faulted the kernel before this program was reached.
 		 */
-		__u8 x = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, xmit_type);
-
-		bump(x == FLOW_OFFLOAD_XMIT_DIRECT ? ST_BADDIR_XMIT_DIRECT
-						   : ST_BADDIR_XMIT_OTHER);
-		bump(d->dir == 2 ? ST_DIR2 : ST_DIR3);
+		bump(ST_BAD_DIR);
 		return -1;
 	}
 
-	/* tuplehash[] is the first member of struct flow_offload, so the flow is
-	 * the matched hash minus dir entries. container_of, by hand.
-	 *
-	 * There is deliberately no bpf_rdonly_cast() here. The cast existed to
-	 * make this computed pointer trusted enough to dereference, but nothing
-	 * below dereferences it: every read goes through bpf_core_read(), which
-	 * is bpf_probe_read_kernel() and takes an arbitrary kernel address.
-	 * probe_read_kernel is reachable from XDP under CAP_PERFMON
-	 * (kernel/bpf/helpers.c, bpf_base_func_proto), which root has.
-	 *
-	 * The cast needed bpf_core_type_id_kernel(), and that TYPE_ID_TARGET
-	 * relocation was the single relocation libbpf could not resolve here:
-	 *
-	 *   libbpf: relo #7: relocation decision ambiguity: success 90056 != success 90242
-	 *
-	 * struct flow_offload is defined in four loaded BTFs on this box -
-	 * nf_flow_table, nf_flow_table_inet, nf_tables and nft_flow_offload.
-	 * The definitions agree on field offsets, so every FIELD_* relocation
-	 * resolves and libbpf's bit_offset check (relo_core.c:1361) passes; but
-	 * a type id is an index into one particular BTF, so the candidates can
-	 * never agree and relo_core.c:1369 rejects the object.
-	 *
-	 * Written as a branch on dir with constant offsets, rather than as
-	 * arithmetic on dir, because the verifier cannot carry a bound through a
-	 * multiply by a negative constant. `dir * -hsz` on a register it knows
-	 * to hold 0..3 comes back with smin at S64_MIN, and
-	 * check_reg_sane_offset() rejects pointer math against an unbounded
-	 * minimum:
-	 *
-	 *   173: (27) r1 *= -88
-	 *   175: (0f) r3 += r1
-	 *   math between ptr_ pointer and register with unbounded min value is not allowed
-	 *
-	 * The same function explicitly permits a known constant offset, negative
-	 * included, so each arm of the branch passes. The dir <= 1 test above
-	 * does not help on its own: llvm applies it to a copy of the register,
-	 * and the masking in between breaks the link back to the original.
-	 *
-	 * hsz is relocated rather than taken from sizeof(). The local mirrors
-	 * are only as right as the header they were copied from, and a wrong
-	 * size here would walk to the wrong address silently. A TYPE_SIZE
-	 * relocation is safe where the type-id one was not, for the same reason
-	 * the field relocations are: its value comes from the layout, which
-	 * every candidate agrees on, not from an index into one BTF. Measured on
-	 * this kernel it is 88, which is what the local mirror computes - so the
-	 * old sizeof() was right, and is now checked rather than assumed.
-	 */
 	hsz = bpf_core_type_size(struct flow_offload_tuple_rhash___local);
 	if (!hsz) {
 		bump(ST_READ_ERR);
@@ -1026,8 +943,7 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 	 * would need a neighbour lookup this program cannot do, so those flows
 	 * stay on the stack's fast path where dst_cache handles them.
 	 */
-	xmit = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, xmit_type);
-	if (xmit != FLOW_OFFLOAD_XMIT_DIRECT) {
+	if (bits.xmit != FLOW_OFFLOAD_XMIT_DIRECT) {
 		bump(ST_NOT_DIRECT);
 		return -1;
 	}
@@ -1050,9 +966,18 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 	 * plain routed IPv6 prefix it should never fire. Counted so that "it
 	 * never fires here" is a measurement rather than an assumption.
 	 */
-	if (p->family == AF_INET6 &&
-	    (d->flags & ((1UL << NF_FLOW_SNAT) | (1UL << NF_FLOW_DNAT))))
-		bump(ST_NAT66);
+	/* Counted per family, and the asymmetry is worth naming. There is no
+	 * NAT64 counter because no NAT64 state exists in this kernel to count:
+	 * on a 464XLAT link the CLAT that turns IPv4 into IPv6 is in the modem
+	 * and the NAT64 that turns it back is in the carrier's network, so
+	 * neither translation is ever a flow in this flowtable. What does exist
+	 * here is ordinary NAT44 on the v4 path - the LAN prefix translated to
+	 * the 192.0.0.2 CLAT address - and NAT66, which a routed v6 prefix
+	 * should never produce. Both are counted so that "it never fires" is a
+	 * measurement rather than an assumption.
+	 */
+	if (d->flags & ((1UL << NF_FLOW_SNAT) | (1UL << NF_FLOW_DNAT)))
+		bump(p->family == AF_INET6 ? ST_NAT66 : ST_NAT44);
 
 	/* The translated address and port for whichever directions apply, taken
 	 * from the peer tuple exactly as nf_flow_snat_ip() and nf_flow_dnat_ip()

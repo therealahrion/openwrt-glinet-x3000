@@ -3203,3 +3203,90 @@ mechanisms was reasoning about a layout that does not exist on the box. The
 instrument that settled it in one window was four `__builtin_preserve_field_info`
 calls reporting what the loader actually wrote. **Where a value is patched at
 load time, print the patched value before theorising about it.**
+
+### 23.16 The macro was the bug, and XMIT_DIRECT was never reachable - 2026-09-14
+
+The hand extraction ran beside the macro on the same packets. One window,
+363290 packets, 99.9% IPv6:
+
+| reading | value |
+|---|---|
+| `hit` | **354468** |
+| `mydir_1` (hand) | **354468** |
+| `myxmit_neigh` (hand) | **354468** |
+| byte histogram `b5` | **354468** |
+| `dir3` (macro) | 197509 |
+| `would_redirect` (macro's `xmit_type`) | 156892 |
+
+`mydir_0`, `mydir_other`, `myxmit_direct`, `myxmit_other`, `l3_bad` and
+`iif_bad` are all zero. Four independent readings - the hand extraction of
+`dir`, the hand extraction of `xmit_type`, the raw byte, and `hit` itself -
+agree to the packet.
+
+**`BPF_CORE_READ_BITFIELD_PROBED` is the fault.** It split a constant input
+55.7% / 44.3% between two answers, which deterministic arithmetic on a fixed
+byte cannot do, so its result depends on something that varies between packets.
+Everything it produced in 23.13, 23.14 and 23.15 - the impossible `dir` values
+and every `would_redirect` - was an artefact of the instrument.
+
+#### What this settles
+
+- **23.3 stands.** Every flow on this box is `FLOW_OFFLOAD_XMIT_NEIGH`, measured
+  now rather than argued. `would_redirect` is zero and always was. The
+  retraction in 23.13 is withdrawn, and so is 23.14's "a floor, not a figure":
+  there was no floor.
+- **The `dir`/`xmit_type` reads are fixed, not just diagnosed.** `read_bits()`
+  replaces the macro: same relocated offsets, same patched shift amounts, on a
+  value masked to its low byte so the upper bits are provably zero rather than
+  assumed to be. The macro reads `BYTE_SIZE` bytes into a `u64` and relies on
+  the rest of that word still holding the zero it was initialised with, and
+  `BYTE_SIZE` is patched from 8 down to 1 at load - so seven eighths of that
+  word is whatever the previous packet left on the stack. Whether that is the
+  mechanism is **not established** and is not asserted here; it is the only
+  difference between the two versions, and one of them is right in every window
+  and the other in none.
+- **`FIELD_SIGNED` relocations are gone from the object**, because the macro was
+  their only user. The object now carries 50 `FIELD_BYTE_OFFSET`, 4 `TYPE_SIZE`
+  and 4 each of the shift and size relocations, and still no `TYPE_ID`.
+
+#### Why there is a nat66 counter and no nat64 one
+
+Raised as an observation and worth writing down, because the answer is not
+obvious on a 464XLAT link and the asymmetry looks like an oversight.
+
+**No NAT64 state exists in this kernel to count.** 464XLAT puts the two halves
+of the translation at opposite ends of the path and neither end is this box:
+
+- the **CLAT**, IPv4 to IPv6, is inside the RM520N modem - `wwan0` carries the
+  RFC 7335 address `192.0.0.2/27` and Linux hands native IPv4 to `192.0.0.1`
+- the **NAT64**, IPv6 back to IPv4, is in the carrier's network behind the
+  synthesized prefix the DNS64 resolver hands out
+
+So a flow in this flowtable is one of exactly two things: native IPv4, which
+carries ordinary **NAT44** because the LAN prefix is translated to the
+`192.0.0.2` CLAT address, or native IPv6, which on a routed prefix carries no
+NAT at all. A NAT64 counter would be permanently zero for a reason that has
+nothing to do with the program.
+
+What the observation did expose is a real gap: **NAT44 was not counted either.**
+`nat66` existed and its v4 counterpart did not, so the v4 path's translation -
+the one that actually fires here - was invisible. Both are counted now.
+
+The one case that would change this is moving the CLAT onto the router, with
+OpenWrt's `464xlat` package and a `nat46` device. Then translated flows would
+be in this flowtable and the program's assumptions about what a tuple means
+would need re-reading. `boxstate.sh` already detects that device, which is why
+it enumerates interfaces rather than listing them.
+
+#### Where W0038 now stands
+
+The lookup half is proven and reusable: 98.8% to 99.0% hit rate across every
+window, both families, with `l3proto` and `iifidx` agreeing with the packet on
+every single lookup. The redirect half has never fired and, on this box as
+configured, cannot: `XMIT_DIRECT` needs either hardware offload on - which
+empties the XDP hashtable and makes every lookup miss - or a forward-path walk
+that lands on a device in the flowtable's own hook list, and the three bridge
+ports are still missing from that list.
+
+That last one is the only live lead left, and it is a `fw4` template change
+rather than anything in this program.
