@@ -59,7 +59,7 @@ if [ ! -s "$BOXSTATE" ]; then
 	exit 2
 fi
 BOXSTATE_LIB=1 . "$BOXSTATE"
-BOXSTATE_NEED=1
+BOXSTATE_NEED=2
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
 	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
 	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again." >&2

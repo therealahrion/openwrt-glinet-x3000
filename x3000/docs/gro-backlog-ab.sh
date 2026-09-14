@@ -6,6 +6,10 @@
 #   sh gro-backlog-ab.sh --threaded   and a threaded-NAPI window
 #   sh gro-backlog-ab.sh --baseline   one window at the current settings,
 #                                     changing nothing
+#   sh gro-backlog-ab.sh --napi       W0002: threaded NAPI A/B. Generates no
+#                                     load itself - the download must be pulled
+#                                     by a LAN client, or the harness competes
+#                                     with the kthread it is measuring
 #
 # --baseline exists to answer a different question from the sweep: whether this
 # box has CPU headroom left at link rate. If it does, then shortening the
@@ -257,6 +261,93 @@ meas() {
 }
 
 # ---- run ------------------------------------------------------------------
+
+# W0002: thread the gro_cells NAPI, and pin it.
+#
+# This mode deliberately runs BEFORE start_load and never calls it. The comment
+# on --threaded below explains why that matters: a curl running on the router
+# competes with the NAPI kthread for the same two cores, so an on-box load
+# measures the harness starving its own kthread rather than anything about the
+# driver. The load has to come from a LAN client pulling a download, with the
+# router only forwarding. That rig is what tabled this test on 2026-09-12; it
+# now exists.
+#
+# Three conditions, alternating, because a cellular link drifts on its own and
+# a single before/after cannot tell drift from effect - see 23.19, where both
+# arms of one cycle collapsed together and would have read as a 40% win.
+#
+#   softirq     threaded=0, the shipped state
+#   thread      threaded=1, kthread wherever the scheduler puts it
+#   thread-pin  threaded=1, kthread pinned off the CPU taking the MHI IRQ
+#
+# time_squeeze has read 0 in every window ever measured here, so the NAPI is
+# not short of poll budget: the queues fill between polls. That is a scheduling
+# latency problem, which is exactly what moving the work to a pinned kthread
+# addresses - and why rtt under load, not throughput, is the number to read.
+if [ "$1" = --napi ]; then
+	say "W0002: threaded NAPI on $WANIF, load driven from a LAN client"
+	say ""
+
+	# Refuse to measure nothing. Eight windows of zeros once read as a result.
+	_t0=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
+	sleep 5
+	_t1=$(cat /sys/class/net/$WANIF/statistics/rx_packets)
+	_pps=$(( (_t1 - _t0) / 5 ))
+	say "  $WANIF rx over 5s: ${_pps} pkt/s"
+	if [ "$_pps" -lt 2000 ]; then
+		bs_bad "not a saturating download - nothing to measure"
+		say "        Start a large sustained download ON A LAN CLIENT, not here."
+		say "        A download pulled by this router competes with the NAPI"
+		say "        kthread for the same two cores and measures the harness."
+		exit 1
+	fi
+	say ""
+
+	_cyc=${CYCLES:-2}
+	_n=1
+	while [ "$_n" -le "$_cyc" ]; do
+		bs_set_sysfs /sys/class/net/$WANIF/threaded 0
+		sleep 2; meas "softirq #$_n"
+
+		bs_set_sysfs /sys/class/net/$WANIF/threaded 1
+		sleep 2
+		# Report what actually exists rather than assuming the write took.
+		_pids=""
+		for _c in /proc/[0-9]*/comm; do
+			grep -q "^napi/$WANIF" "$_c" 2>/dev/null && _pids="$_pids ${_c%/comm}"
+		done
+		_pids=$(echo $_pids | tr ' ' '\n' | sed 's|/proc/||' | tr '\n' ' ')
+		say "  napi kthreads: ${_pids:-none - the threaded write did not take}"
+		meas "thread  #$_n"
+
+		# Pin off CPU0, which is where every MHI vector lands (W0001). Field 39
+		# of /proc/<pid>/stat is the CPU the task last ran on - M07, which 18.4
+		# rates for placement and not for time.
+		for _p in $_pids; do
+			taskset -pc 1 "$_p" >/dev/null 2>&1
+		done
+		sleep 2
+		for _p in $_pids; do
+			_cpu=$(awk '{print $39}' "/proc/$_p/stat" 2>/dev/null)
+			say "  pid $_p last ran on CPU ${_cpu:-?}"
+		done
+		meas "thread-pin #$_n"
+		_n=$((_n+1))
+	done
+
+	cleanup
+	say "Read it this way:"
+	say "  rtt under load is the number. time_squeeze has never moved here, so"
+	say "  this is not about poll budget - it is about how long a datagram waits"
+	say "  between the IRQ and the poll that picks it up."
+	say "  Compare conditions WITHIN a cycle. If the spread between cycles is"
+	say "  bigger than the gap between conditions, the effect is below what this"
+	say "  rig resolves."
+	say "  rx_dropped falling with rtt flat is the win worth baking. rtt rising"
+	say "  is the trade, and on this box latency is the constrained axis."
+	exit 0
+fi
+
 start_load
 say ""
 
