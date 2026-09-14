@@ -174,9 +174,17 @@ start_load() {
 		_n=$((_n+1))
 	done
 	sleep 5
+	# A live PID is not a working download. The 2026-09-14 run reported
+	# "load: 4 of 4 stream drivers running" while two of the four were in a
+	# retry loop failing every 2.5 seconds, because this counted subshells
+	# rather than fetches. The subshell stays alive precisely BECAUSE its
+	# wget keeps failing - the `while :;` loop is what keeps it there - so
+	# the old check was closest to a lie exactly when the load was worst.
 	_live=0
 	for p in $PIDS; do kill -0 $p 2>/dev/null && _live=$((_live+1)); done
-	say "load: $_live of $STREAMS stream drivers running against $URL"
+	_fails=$(grep -c '^fetch exit' $LOADLOG 2>/dev/null)
+	[ -n "$_fails" ] || _fails=0
+	say "load: $_live of $STREAMS stream drivers up, $_fails fetch failure(s) so far"
 
 	_t0=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
 	sleep 3
@@ -190,6 +198,37 @@ start_load() {
 		say "       Try the URL by hand: wget -O /dev/null \"$URL\""
 		cleanup
 		exit 1
+	fi
+
+	# Partial failure is the case that produced an unreadable run and was not
+	# caught. Some bytes arrive, so the check above passes, but the offered
+	# load is a fraction of STREAMS and it wanders as retries land - which
+	# shows up as throughput drift across windows and is indistinguishable
+	# from the setting under test actually mattering.
+	_f2=$(grep -c '^fetch exit' $LOADLOG 2>/dev/null)
+	[ -n "$_f2" ] || _f2=0
+	if [ "$_f2" -gt 0 ]; then
+		say ""
+		say "STOP: $_f2 fetch failure(s) in the first 8s - the offered load is"
+		say "      only part of the $STREAMS streams asked for, and it will wander"
+		say "      as retries land. Throughput and rtt would drift across windows"
+		say "      and read as though the setting under test caused it."
+		say ""
+		say "      Most likely the source is limiting concurrent connections from"
+		say "      one address. Measured 2026-09-14: 4 streams against the default"
+		say "      URL failed two of them continuously with exit 8 while the other"
+		say "      two downloaded fine."
+		say ""
+		say "      Retry with fewer streams, or a source that tolerates concurrency:"
+		say "          STREAMS=2 sh \$0"
+		say "          URL=<other source> sh \$0"
+		say "      Set LOAD_I_ACCEPT_A_PARTIAL_LOAD=1 to measure anyway - the drop"
+		say "      counters stay valid, the throughput and rtt columns do not."
+		if [ "${LOAD_I_ACCEPT_A_PARTIAL_LOAD:-0}" != 1 ]; then
+			cleanup
+			exit 1
+		fi
+		say "      LOAD_I_ACCEPT_A_PARTIAL_LOAD=1 - continuing under protest."
 	fi
 	say "load confirmed: about $_mb Mbit/s arriving on $WANIF"
 }
@@ -477,6 +516,21 @@ for B in 1000 2000 4000; do
 	meas "backlog-$B"
 done
 
+# The first setting again, last. Without this the sweep walks 1000, 2000, 4000
+# once and never looks back, so a link that degrades during the run produces a
+# perfect monotonic decline that is indistinguishable from "deeper backlog is
+# slower" - which is exactly what the 2026-09-14 run produced: 10976, 9211 then
+# 7575 dgram/s, a 31% spread against the 10% the read-it-this-way note below
+# calls comparable. A separate --baseline afterwards returned 7933 dgram/s at
+# backlog 1000, which is where 4000 had landed, so the decline was the load and
+# not the setting.
+#
+# 23.19 reached the same conclusion on the Wi-Fi side and answered it by
+# alternating conditions under one continuous transfer. This is the cheap
+# version of that: one repeat, enough to size the drift against the effect.
+bs_set_sysctl net.core.netdev_max_backlog 1000
+meas "backlog-1000 (drift control)"
+
 # No explicit put-back here: bs_restore in cleanup() holds the value this run
 # started with, and re-setting it by hand was how the old code could restore a
 # leg's value rather than the original.
@@ -520,9 +574,14 @@ fi
 cleanup
 say ""
 say "Read it this way:"
-say "  compare only windows whose dgram/s are within about 10% of each other;"
-say "  the link drifts, and drops are rate-dependent, so a slower window with"
-say "  fewer drops has proved nothing."
+say "  FIRST compare backlog-1000 against its drift control at the end. That"
+say "  pair ran at the same setting, so whatever separates them is drift and"
+say "  nothing else. If the gap between them is as large as the gap between"
+say "  settings, the sweep measured the link and not the backlog - which is"
+say "  what happened on 2026-09-14 and is why the control exists."
+say "  Then compare only windows whose dgram/s are within about 10% of each"
+say "  other; the link drifts, and drops are rate-dependent, so a slower"
+say "  window with fewer drops has proved nothing."
 say "  rx_dropped alone  -> the gro_cells queue overflowed"
 say "  rx_dropped + softnet_dropped together -> the RPS backlog overflowed"
 say "  rtt is under load, so it is the bufferbloat cost of whatever queue depth"

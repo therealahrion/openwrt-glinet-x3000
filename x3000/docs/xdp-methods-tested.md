@@ -4439,3 +4439,148 @@ ethtool -K wwan0 rx-udp-gro-forwarding on
   and worth checking how much of this link's traffic is forwarded UDP at all
   before expecting much - 23.11 established the family split, not the protocol
   mix.
+
+### 23.25 The backlog sweep, run at last: no drops at any depth - 2026-09-14
+
+`gro-backlog-ab.sh` has existed since 2026-09-12 and its default mode - the one
+it was written for - had never been run. It has now. The result removes the
+premise W0002 rests on, at least at the rate this link delivered.
+
+| window | Mbit/s | dgram/s | skb/s | agg | rx_dropped | softnet_dropped | time_squeeze | bytes/skb | rtt min/avg/max |
+|---|---|---|---|---|---|---|---|---|---|
+| backlog-1000 | 126.0 | 10976 | 2344 | 4.68x | **0** | 0 | 0 | 6718 | 47.4 / 75.9 / 183.6 ms |
+| backlog-2000 | 105.8 | 9211 | 2337 | 3.94x | **0** | 0 | 0 | 5657 | 47.2 / 95.1 / 189.3 ms |
+| backlog-4000 | 86.9 | 7575 | 2218 | 3.42x | **0** | 0 | 0 | 4898 | 40.2 / 94.7 / 177.4 ms |
+
+#### What cannot be read from this, by the script's own rule
+
+The header says to compare only windows whose `dgram/s` are within about 10% of
+each other. These are 10976, 9211, 7575 - **31% from first to last**, three times
+the threshold, declining monotonically. So the throughput column and the rtt
+column say nothing about backlog depth. The link drifted, the rule caught it,
+and the backlog comparison the sweep exists to make did not happen.
+
+#### What can be read, because it does not depend on comparing windows
+
+**`rx_dropped` is 0 in all three windows, `softnet_dropped` is 0, `time_squeeze`
+is 0.** Drift cannot manufacture zeros: the *fastest* window, 10976 dgram/s at
+the stock backlog of 1000, dropped nothing either.
+
+That is the finding, and it is aimed straight at W0002. The premise is stated in
+the script's own header:
+
+> At ~20k datagrams/s this link overflows a queue and drops about 0.2% of them.
+> [...] time_squeeze has stayed 0 throughout, so the NAPI is not running out of
+> poll budget - the queues fill between polls, which is a scheduling-latency
+> problem. That is why threaded NAPI is worth testing at all.
+
+No drops means nothing is filling between polls, which means **there is nothing
+for threaded NAPI to fix here.** A deeper backlog cannot reduce zero either,
+which is why the knob the sweep exists to turn had nothing to act on.
+
+**This does not refute the premise at 20k dgram/s.** The 0.2% figure was measured
+at roughly twice today's peak rate. What the run establishes is narrower and
+still useful: at ~11k dgram/s this receive path is not dropping anything, is not
+short of poll budget, and has no queue pressure at the shipped backlog.
+
+GRO is working: 4.68x aggregation at the top window, 6718 bytes/skb against a
+~1435-byte datagram. That sits between the two figures already on record -
+24.8x on 2026-09-09 and 2.20x on 2026-09-11 - and is consistent with the
+rate-dependence 22 already describes rather than being a new result.
+
+Latency remains the only poor number. 47 / 76 / 184 ms under load at the stock
+backlog, and the average rose to 95 ms at both deeper settings. That is the
+expected bufferbloat direction, but with a 31% rate drift across the run I am
+not attributing it to the backlog.
+
+#### A defect in the harness, not just in the run
+
+The sweep walks 1000, 2000, 4000 in fixed order and never revisits a setting.
+**On a link that degrades monotonically during a run, the first window wins
+whatever it was set to.** That is exactly the failure 23.19 dealt with on the
+Wi-Fi side, where conditions were made to alternate under one continuous
+transfer so drift shows up as cycle-to-cycle spread instead of as a fake result.
+`wifi-encap.sh` alternates; this sweep does not, and today it produced a perfect
+monotonic decline that is indistinguishable from "deeper backlog is slower".
+
+Two things follow, and both are cheap:
+
+1. `sh /tmp/gro-backlog-ab.sh --baseline` is already a drift control - one
+   window under the same load, changing no sysctl. If it returns near 11k
+   dgram/s the link recovered and the decline was within-run; if it stays near
+   7.5k the link degraded and stayed degraded.
+2. `/tmp/.gro_ab_load.log` was written this run - the script reported fetcher
+   errors. Streams dying and restarting would produce exactly this decline, and
+   that would make it a harness fault rather than a link one.
+
+#### The drift control settles it: the sweep measured the load, not the backlog
+
+`--baseline` was run immediately afterwards - one window, same load generator,
+`netdev_max_backlog` left at the restored 1000:
+
+| window | Mbit/s | dgram/s | agg | rx_dropped | rtt avg |
+|---|---|---|---|---|---|
+| sweep, backlog-1000 | 126.0 | 10976 | 4.68x | 0 | 75.9 ms |
+| baseline, backlog-1000 | 91.1 | 7933 | 3.51x | 0 | 81.3 ms |
+
+**Same setting, 28% apart.** And 7933 is essentially where `backlog-4000` landed
+(7575). So the monotonic decline across the sweep was the offered load, not the
+queue depth. The backlog comparison did not merely fail its comparability rule -
+it measured nothing at all, and that is now established rather than suspected.
+
+A second tell points the same way. The pre-window load check reported about
+94 Mbit/s before the sweep and about 115 Mbit/s before the baseline - *higher* -
+while the measured window went the other way, 126.0 down to 91.1. A steadily
+degrading link cannot make both of those move in opposite directions. An
+unstable load can.
+
+#### Why the load was unstable: my fetcher, not the far end
+
+`/tmp/.gro_ab_load.log` holds 34 lines, all `fetch exit 8`, in pairs about every
+2.5 seconds from 17:37:42 to 17:38:24 - steadily, for the whole run. Exit 8 is a
+server error response. Four streams were asked for; two downloaded and two sat
+in a retry loop failing immediately, which is what a public speed-test source
+limiting concurrent connections from one address looks like.
+
+**The harness reported this as healthy.** `start_load()` printed "load: 4 of 4
+stream drivers running", and that count was of live subshell PIDs. The subshell
+stays alive *because* its `wget` keeps failing - the `while :;` retry loop is
+what keeps it there - so the check was closest to a lie exactly when the load was
+worst. The only load gate was "are at least 5 Mbit/s arriving", which two working
+streams passed comfortably.
+
+That is the same class of error as `bs_gro()` reading a feature bit: an
+instrument that cannot distinguish the state it is supposed to detect. Three of
+these have now turned up in this document in one day.
+
+Fixed in `gro-backlog-ab.sh`:
+
+- `start_load()` counts real fetch failures and reports "N drivers up, K fetch
+  failure(s)" instead of a PID count.
+- **Any failure in the first 8 seconds now stops the run**, naming the likely
+  cause and the two escapes (`STREAMS=2`, or a different `URL`).
+  `LOAD_I_ACCEPT_A_PARTIAL_LOAD=1` overrides, with the warning that the drop
+  counters stay valid while throughput and rtt do not.
+- The sweep now **repeats backlog-1000 as a drift control at the end**, so the
+  spread attributable to drift is measured in the same run as the effect. This
+  is the cheap form of the alternation 23.19 arrived at for the Wi-Fi A/B.
+- The read-it-this-way note now says to compare the control pair *first*.
+
+#### What it changes
+
+- **W0002's premise is unsupported at this rate.** Its argument was
+  scheduling-latency evidenced by drops. There were no drops.
+- **W0042's case is weaker, not stronger.** Its value was making W0002
+  measurable. Measuring something with no demonstrated problem behind it is not
+  worth rewriting a working patch for.
+- **The sweep has been fixed rather than re-run as-is.** It now refuses a
+  partial load and carries its own drift control, so the next run either
+  produces a comparable set or says why it cannot.
+- **Four windows now show zero drops**, counting the baseline: 10976, 9211,
+  7575 and 7933 dgram/s, all at `rx_dropped` 0. The zeros are the one column
+  the load fault does not touch, because a bad load generator only lowers the
+  rate and drops are rate-dependent.
+- **Nothing here reaches 20k dgram/s**, and now the reason is known: half the
+  streams were never running. Whether the original 0.2% drop figure reproduces
+  at that rate is still open, and needs a load source that tolerates four
+  concurrent connections.
