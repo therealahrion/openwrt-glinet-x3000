@@ -3316,3 +3316,163 @@ The `fw4` template removes both doubts at once - the flowtable is created with
 the ports in it, so no flow can predate them and no live `add` is involved. That
 is the only live lead left, and it is a firewall4 change rather than anything in
 this program.
+
+> **Followed, and it worked - 23.17.** Creating the flowtable with the ports in
+> it rather than adding them live moved a wired client from 0 to 100%
+> `XMIT_DIRECT` on every flowtable hit. The redirect half of W0038 is real, and
+> its scope is narrower than that number suggests. Both are in 23.17.
+
+### 23.17 XMIT_DIRECT fires, and the bridge port decides it - 2026-09-14
+
+**The redirect half of W0038 works.** 23.16 said it "has never fired and, on
+this box as configured, cannot", and named the `fw4` template as the only live
+lead. Following that lead settled it.
+
+#### What changed
+
+`nft delete flowtable inet fw4 ft` is refused with `Resource busy`: the forward
+chain's `flow add @ft` rule holds a reference, and nft will not drop a flowtable
+a rule points at. But `fw4 print`'s own output opens with
+
+```
+table inet fw4
+flush table inet fw4
+delete flowtable inet fw4 ft
+```
+
+so fw4 can do what a bare delete cannot - it flushes the table in the same
+transaction, which drops the referencing rule first. Editing one line of that
+generated ruleset and loading it back with `nft -f` creates the flowtable with
+the three bridge ports already in it, atomically, with nothing written to disk.
+`x3000/docs/flowtable-ports.sh` is that, with the guards.
+
+#### The measurement
+
+Five windows on 2026-09-14, all with the ports in the list. Every one closes its
+accounting exactly - the exits sum to `seen`, and the byte histogram sums to
+`hit`:
+
+| # | client | port | mix | seen | hit | DIRECT |
+|---|---|---|---|---|---|---|
+| 1 | phone | Wi-Fi | 99% v6 | 250340 | 237646 | 2150 |
+| 2 | phone | Wi-Fi | 99.9% v6 | 342956 | 342578 | 81 |
+| 3 | PC | **wired** | 100% v4 | 251709 | 247820 | **247820 - all of them** |
+| 4 | PC | Wi-Fi | 100% v4 | 356040 | 351416 | **0** |
+| 5 | phone | Wi-Fi | 99.96% v6 | 358070 | 348233 | **0** |
+
+Window 3 read `not_direct` **0**, and `b13` on every one of 247820 hits. That is
+98.45% of all packets crossing `wwan0` in the window and 100% of the flows the
+lookup found.
+
+**Windows 3 and 4 are the controlled comparison, and they are the finding.**
+Same PC, same IPv4-only stack, same kind of transfer, ~250k against ~356k
+packets. The only variable is which bridge port the client sits on, and the
+result goes 100% to 0%.
+
+So the variable is the **port**, not the address family. Two hypotheses died
+here: that the families behave differently, and that neighbour state at
+`nft_flow_offload.c:73` explains it - the phone held three `REACHABLE` global v6
+addresses going into window 5 and still produced nothing.
+
+**Three windows were misread before the client was pinned down.** Windows 1 and
+2 were phone speedtests, and both produced a small IPv4 `DIRECT` count I
+attributed to the phone. It was the wired PC's background traffic in the same
+window. Nothing in the counter dump says which client a flow belongs to, and I
+did not check until `/proc/net/nf_conntrack` was read for the LAN-side source.
+**A window that mixes clients cannot attribute a per-client result**, and this
+one had two clients in it throughout.
+
+#### Why the port decides it, read from source
+
+`dev_fill_forward_path()` (`net/core/dev.c`) walks while a device has an
+`ndo_fill_forward_path`, and **returns -1 the moment one of them errors**:
+
+```c
+while (ctx.dev && ctx.dev->netdev_ops->ndo_fill_forward_path) {
+        ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
+        if (ret < 0)
+                return -1;
+        ...
+}
+if (!ctx.dev)
+        return ret;
+path->type = DEV_PATH_ETHERNET;
+path->dev = ctx.dev;
+```
+
+Only a device with **no** callback reaches that last branch - and
+`DEV_PATH_ETHERNET` is the one case in `nft_dev_path_info()` that sets
+`info->indev`, which is exactly what `nft_flowtable_find_dev()` then looks for.
+
+- **`eth1` is a plain netdev with no `ndo_fill_forward_path`.** The walk falls
+  through, `info->indev = eth1`, that device is now in the flowtable list, and
+  `xmit_type` becomes `XMIT_DIRECT`. Window 3.
+- **A Wi-Fi vif on the 802.3 data path has one.** `mac80211/iface.c:956`
+  attaches `.ndo_fill_forward_path` to `ieee80211_dataif_8023_ops` and to no
+  other ops struct; it delegates to the driver at `:942` and returns
+  `-EOPNOTSUPP` at `:902` when the driver has none. mt76 has one, and at the
+  pinned commit `39c960c3` it opens with `mt7915/main.c:1776`:
+
+  ```c
+  if (!mtk_wed_device_active(wed))
+          return -ENODEV;
+  ```
+
+  WED is off on this box (section 11), so it fails, the walk returns -1,
+  `nft_dev_path_info()` is never reached, `info.indev` stays NULL, and
+  `nft_dev_forward_path()` returns before setting anything. Windows 4 and 5.
+
+#### WED would not fix it, and that is the counterintuitive part
+
+The obvious next move is W0032 - enable WED so the driver callback succeeds. It
+does not help. With WED active the callback sets
+
+```c
+path->type = DEV_PATH_MTK_WDMA;
+...
+ctx->dev = NULL;
+```
+
+and `nft_dev_path_info()` has **no case for `DEV_PATH_MTK_WDMA`**. It handles
+`DEV_PATH_ETHERNET`, `DSA`, `VLAN`, `PPPOE` and `BRIDGE`, and nothing else. So
+`info->indev` stays NULL and the walk is discarded exactly as before.
+`DEV_PATH_MTK_WDMA` exists for the PPE hardware-offload path, which is consumed
+elsewhere. **W0032 is not a prerequisite for W0038 after all.**
+
+What would work is the opposite of an optimisation. A Wi-Fi vif with **no**
+`ndo_fill_forward_path` at all - 802.3 encap offload off, so the vif uses
+`ieee80211_dataif_ops` rather than `ieee80211_dataif_8023_ops` - falls through to
+the `DEV_PATH_ETHERNET` branch, and `phy0-ap0` is already in the flowtable list.
+**Turning a hardware offload off is what would turn this software fast path on**
+for Wi-Fi clients. That is reasoned from these four functions and untested;
+there may be no runtime knob for it at all.
+
+#### Version alignment, because half of this is not read against this tree
+
+`mt76` was read at `39c960c3`, which is this tree's pinned commit, and
+`nft_flow_offload.c` and `net/core/dev.c` at v6.12, which resolve as written.
+**`mac80211` here is `backports-6.18.39`, not the kernel's own**, and `iface.c`
+was read at v6.12 - so the `ieee80211_dataif_8023_ops` half is E2 against the
+wrong tree until it is checked against backports.
+
+#### Where W0038 stands now
+
+- **The lookup half**: proven and reusable. 94.9% to 99.9% hit across every
+  window, both families, with `l3proto` and `iifidx` agreeing with the packet on
+  every single lookup.
+- **The redirect half**: **works, for clients on a wired bridge port**, at 100%
+  of flowtable hits and 98.45% of packets. For a client on a Wi-Fi port it
+  cannot work in any configuration currently reachable here.
+- **The rewrite itself has still never executed.** `would_redirect` counts flows
+  where every check passed, not packets that were translated. The NAT, the
+  checksum arithmetic, the L2 construction and the redirect have been through a
+  compiler and a verifier and nothing else. A wrong checksum shows up as clients
+  losing connectivity, so `probe` comes first and `off` stays to hand.
+- **The change does not persist.** All of it lives in the running ruleset and
+  dies on `fw4 restart` or a reboot. Making it survive is W0039, a firewall4
+  patch of the same shape as `001-flowtable-fall-back-to-l3-device.patch`.
+- **The payoff argument is unchanged, and still weak.** 14.3 and 18 say this box
+  is not cycles-bound, the one poor number is latency, and a generic-mode
+  redirect bypasses the qdisc (17.2). W0038 now optimises a resource the box has
+  spare, for the wired half of its clients, at the cost of the resource it does
+  not have. It works. That is not the same as being worth attaching.

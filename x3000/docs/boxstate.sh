@@ -33,7 +33,7 @@
 # not have, or a function whose meaning changed, should say so rather than
 # dying on "not found" three screens later. Bump it when a bs_* function's
 # name, arguments or meaning change; adding one does not need a bump.
-BOXSTATE_API=1
+BOXSTATE_API=2
 
 WAN=${WAN:-wwan0}
 # Only meaningful when this file is run, not when it is sourced.
@@ -179,7 +179,19 @@ bs_hexsum() {
 bs_squeeze()         { bs_hexsum 3; }
 bs_softnet_dropped() { bs_hexsum 2; }
 
-bs_hfo() { uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null || echo unset; }
+bs_hfo() {
+  # Three outcomes, not two. `uci -q get` returns non-zero for an option that
+  # is simply absent, so the old reader called that "unset" and the gate below
+  # degraded to UNVERIFIED - a gate that had in fact passed, reported as never
+  # tested, in every window run on 2026-09-14. firewall4 declares the default
+  # itself, in root/usr/share/ucode/fw4.uc:
+  #     flow_offloading_hw: [ "bool", "0" ]
+  # so an absent option means off. Only a missing uci is genuinely unreadable.
+  bs_have uci || { echo unreadable; return 0; }
+  _h=$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+  [ -n "$_h" ] && echo "$_h" || echo 0
+  return 0
+}
 bs_sfo() { uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || echo unset; }
 bs_ft_devices() {
   bs_have nft || return 0
@@ -352,10 +364,11 @@ bs_require_kfunc() {
 
 bs_require_hfo_off() {
   h=$(bs_hfo)
-  # "unset" means uci could not be read, not that the setting is off. Reporting
-  # ok here would be a gate that passes because it was never actually tested,
+  # Only a missing uci is unverifiable. An absent option reads as 0 above,
+  # because firewall4's own default is 0 - see bs_hfo. Reporting ok for a value
+  # nothing could read would be a gate that passes because it was never tested,
   # which is worse than one that fails.
-  if [ "$h" = "unset" ]; then
+  if [ "$h" = "unreadable" ]; then
     bs_note "cannot read flow_offloading_hw (no uci?) - hardware offload UNVERIFIED"
     bs_say "        If it is on, every bpf_xdp_flow_lookup() returns -ENOENT and"
     bs_say "        a window of all-misses looks exactly like a broken program."
@@ -418,6 +431,63 @@ bs_note_bridge_ports() {
   done
   [ -n "$miss" ] && bs_note "br-lan ports missing from the flowtable list:$miss" \
                  || bs_ok "every br-lan port is in the flowtable list"
+  return 0
+}
+
+# Being in the list is necessary and, for a Wi-Fi port, not sufficient. Measured
+# 2026-09-14 across five windows: a wired client on eth1 reached
+# FLOW_OFFLOAD_XMIT_DIRECT on 100% of flowtable hits, and the same client moved
+# to Wi-Fi reached it on none, in either address family.
+#
+# dev_fill_forward_path() (dev.c) walks while a device has ndo_fill_forward_path
+# and returns -1 as soon as one of them errors; only a device with no callback
+# at all falls through to DEV_PATH_ETHERNET, which is the branch that sets
+# info->indev. eth1 has no callback, so it takes that branch. A Wi-Fi vif on the
+# 802.3 data path has one (mac80211 iface.c:956), it delegates to the driver,
+# and mt76 returns -ENODEV unless WED is active (mt7915/main.c:1776).
+#
+# So this reports scope rather than a pass or a fail: the list is right, and
+# what benefits from it is the wired half of the bridge.
+bs_note_direct_scope() {
+  [ -d /sys/class/net/br-lan/brif ] || return 0
+  wired="" wifi=""
+  for p in $(ls /sys/class/net/br-lan/brif 2>/dev/null); do
+    if [ -d "/sys/class/net/$p/wireless" ] || [ -e "/sys/class/net/$p/phy80211" ]; then
+      wifi="$wifi $p"
+    else
+      wired="$wired $p"
+    fi
+  done
+  [ -n "$wired" ] && bs_note "XMIT_DIRECT is reachable for clients on:$wired"
+  [ -n "$wifi" ] && bs_note "and not for clients on:$wifi - the vif has an ndo_fill_forward_path that fails (23.17)"
+  return 0
+}
+
+# Offloaded flows, attributed to the LAN client and the bridge port it is on.
+#
+# Two bugs are deliberately baked out of this, because both produced confident
+# wrong output before they were caught:
+#
+#   - The ORIGINAL tuple's src is the LAN client. A greedy `.*src=` matches the
+#     REPLY tuple instead and reports the remote server, which made every
+#     "LAN-side source" a public address. Take the FIRST src= field.
+#   - `bridge fdb show` prints "<mac> dev <port> master <bridge>", so "dev" is
+#     field 2 and the port is field 3. Reading the keyword at field 3 reported
+#     every port as unknown.
+bs_ct_offload() {
+  [ -r /proc/net/nf_conntrack ] || return 0
+  awk '/OFFLOAD/{for(i=1;i<=NF;i++) if($i ~ /^src=/){print $1" "substr($i,5); break}}' \
+      /proc/net/nf_conntrack 2>/dev/null
+  return 0
+}
+
+bs_port_of() {
+  bs_have bridge || { echo ""; return 0; }
+  _m=$(ip neigh show 2>/dev/null | awk -v i="$1" '$1==i && $2=="lladdr"{print $3; exit}')
+  [ -n "$_m" ] || { echo ""; return 0; }
+  bridge fdb show 2>/dev/null \
+    | awk -v m="$_m" '$1==m && $2=="dev" && /master/{print $3; exit}'
+  return 0
 }
 
 # Sourced as a library: define everything above, print nothing, return here.
@@ -503,6 +573,7 @@ if [ -n "$D" ]; then
   kv "flowtable" "present"
   say "    devices: $D"
   bs_note_bridge_ports
+  bs_note_direct_scope
 else
   kv "flowtable" "ABSENT - software flow offloading is off"
 fi

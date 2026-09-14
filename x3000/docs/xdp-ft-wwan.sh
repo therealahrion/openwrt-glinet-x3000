@@ -82,7 +82,7 @@ BOXSTATE_LIB=1 . "$BOXSTATE"
 # A stale boxstate.sh cached in /tmp from an older revision is the same trap the
 # object checksum guards against, and it fails less obviously: a renamed reader
 # is "not found" three screens into a run.
-BOXSTATE_NEED=1
+BOXSTATE_NEED=2
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
 	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
 	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again so the" >&2
@@ -205,6 +205,7 @@ check() {
 	bs_require_flowtable "$IFACE"
 	bs_require_hfo_off
 	bs_note_bridge_ports
+	bs_note_direct_scope
 
 	# State that does not invalidate the window but changes how to read it.
 	bs_has_shaper "$IFACE" || warn "no shaper on $IFACE - a redirect would bypass"\
@@ -278,7 +279,15 @@ legend() {
 		say "                  this program saw it. Non-zero is a real anomaly"
 		say "  torn_down       the flow is being retired"
 		say "  not_direct      xmit_type is not DIRECT - NEIGH needs a lookup this"
-		say "                  program cannot do, so those stay on the stack"
+		say "                  program cannot do, so those stay on the stack."
+		say "                  WHICH BRIDGE PORT THE CLIENT IS ON DECIDES THIS."
+		say "                  Measured 2026-09-14 over five windows: a wired"
+		say "                  client on eth1 was DIRECT on 100% of hits, and the"
+		say "                  same client moved to Wi-Fi was DIRECT on none, in"
+		say "                  either family. A window driven from a Wi-Fi client"
+		say "                  therefore reads zero here whatever else is true,"
+		say "                  and that is the program being right rather than"
+		say "                  failing. See xdp-methods-tested.md 23.17"
 		say "  no_out_ifidx    DIRECT but no egress ifindex recorded"
 		say "  read_err        a probe read of the flow failed"
 		say "  nat66           a v6 flow carrying SNAT or DNAT    (observation)"

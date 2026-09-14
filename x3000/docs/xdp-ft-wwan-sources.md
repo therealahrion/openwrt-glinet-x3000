@@ -599,7 +599,7 @@ Only the first of these is fixed by the v6 work. A window still measures nothing
 if the traffic terminates on the router, and still measures the wrong thing if
 the flows predate a flowtable change.
 
-### Why nothing is XMIT_DIRECT, and it is structural
+### Why nothing was XMIT_DIRECT, and what fixed it
 
 `nft_dev_path_info()` sets `FLOW_OFFLOAD_XMIT_DIRECT` in exactly two places:
 
@@ -644,10 +644,29 @@ device to an existing flowtable does not register the hook
 `nft_flowtable_find_dev()` searches, or that the flows in those windows were
 matched against state built before the change. Neither has been tested.
 
-What has not been tried is the form that removes both doubts at once: putting
-the ports in the **fw4 template**, so the flowtable is created with them and no
-flow can predate them. That is the only live lead left on this workstream, and
-it is a firewall4 change rather than anything in this program.
+**Resolved 2026-09-14, and the fix was creating the flowtable with the ports
+rather than adding them to a live one.** `nft delete flowtable` is refused with
+`Resource busy` because the forward chain's `flow add @ft` rule references it,
+but `fw4 print` emits a ruleset that flushes the whole table first - so editing
+one line of that and loading it back with `nft -f` builds the flowtable with the
+ports already in it, atomically, with nothing written to disk.
+`x3000/docs/flowtable-ports.sh` does exactly that.
+
+The result on a wired client: **`not_direct` 0, `would_redirect` 247820 of
+247820 hits** - 98.45% of every packet crossing `wwan0` in the window.
+
+**But the bridge port decides it, and only wired ports qualify.** The same PC
+moved to Wi-Fi, same IPv4-only traffic, produced zero. `dev_fill_forward_path()`
+returns -1 as soon as any device's `ndo_fill_forward_path` errors, and only a
+device with no callback at all falls through to `DEV_PATH_ETHERNET` - the one
+case that sets `info->indev`. `eth1` has no callback, so it qualifies. A Wi-Fi
+vif on the 802.3 data path has one, it delegates to mt76, and mt76 returns
+`-ENODEV` unless WED is active (`mt7915/main.c:1776`).
+
+Enabling WED does not fix it either: the callback then returns
+`DEV_PATH_MTK_WDMA`, and `nft_dev_path_info()` has no case for that type, so
+`info->indev` stays NULL regardless. The full chain is in
+`xdp-methods-tested.md` 23.17.
 
 ### What would make it fire
 
@@ -661,6 +680,13 @@ for the one thing only it can provide, the NAT translation, and `bpf_fib_lookup(
 for the egress device and the MAC addresses. The lookup has to run on the
 *translated* addresses, so the order is flow lookup, NAT, FIB lookup, build L2,
 redirect.
+
+> **Largely obsolete, 2026-09-14.** The flowtable now supplies the egress
+> device and both MAC addresses directly for wired clients, so the
+> `bpf_fib_lookup()` redesign below is no longer needed to make the fast path
+> work - it would only extend it to Wi-Fi clients, which have a different and
+> structural blocker (23.17). Kept because the cost argument in it is still the
+> right one to weigh.
 
 **Whether it is worth building is now argued against by a measurement, not just
 by the dry run.** One saturating window on `wwan0` read `time_squeeze` 0,

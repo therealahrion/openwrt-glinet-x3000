@@ -124,7 +124,7 @@ sh /tmp/boxstate.sh mix 30     # family split over a 30-second window
 | lever | image default | read the running state with |
 |---|---|---|
 | software flow offload | on | `uci -q get firewall.@defaults[0].flow_offloading`, then `nft list ruleset \| grep -c 'flow add'` |
-| flowtable device list | `br-lan`, `eth0`, `wwan0` — fw4 builds it from zone devices, so bridge *ports* are not in it | `nft list ruleset \| sed -n '/flowtable/,/}/p'` — decides whether a forwarded flow can ever be `XMIT_DIRECT`, which is what `xdp-methods-tested.md` 23.3 and 23.16 turn on |
+| flowtable device list | `br-lan`, `eth0`, `wwan0` — fw4 builds it from each zone's networks, and a bridge *port* is not a network, so `eth1`, `phy0-ap0` and `phy1-ap0` are absent | `sh x3000/docs/flowtable-ports.sh` — adding them takes a wired client from 0 to 100% `XMIT_DIRECT`, which is what W0038 needs; `add` is in-memory only and `fw4 restart` undoes it. Making it persist is W0039. See `xdp-methods-tested.md` 23.17 |
 | packet steering / RPS | `2` and `128` | `uci -q get network.globals.packet_steering; uci -q get network.globals.steering_flows` |
 | irqbalance | enabled | `/etc/init.d/irqbalance enabled && echo on` |
 | zram | `lz4`, 256 MiB | `uci -q get zram.@zram[0].zram_comp_algo; free -m \| grep -i swap` |
@@ -150,6 +150,7 @@ same readers.
 | `xdp-ft-wwan.sh` | the W0038 flowtable XDP harness — `check \| probe \| dryrun \| status \| off`. Verifies the BPF object against a committed sha256 before loading it |
 | `verify-992a.sh` | the 992 XDP hook verifier, eleven steps, PASS/FAIL tally |
 | `gro-backlog-ab.sh` | GRO and `netdev_max_backlog` A/B, with `--baseline` for one window that changes nothing |
+| `flowtable-ports.sh` | puts the bridge ports into the flowtable so a forwarded flow can reach `XMIT_DIRECT`, and attributes offloaded flows to the port their client is on. In-memory only; `fw4 restart` undoes it |
 
 Three rules the library exists to enforce, each of which was a bug before it was
 a rule:
