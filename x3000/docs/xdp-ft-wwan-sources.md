@@ -53,7 +53,7 @@ sha256 of the committed objects:
 
 ```
 c4371b7a76baf9e6eb99bad111cdbb64b416bbcf701f71eaf30fb61bbc276602  bpf/xdp_ft_probe.bpf
-44f6b93a217d0be4277980670925dac6fcafead89e31834503bfa38f0cfdebab  bpf/xdp_ft_wwan.bpf
+bedfb95a2f92db2bb84f105cf522368e186e93fea71313589b4a9a0acd73edf1  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the two programs do
@@ -116,6 +116,53 @@ The general rule worth keeping: **a program that reads kernel structs through
 a program that takes that type's BTF id cannot.** Where both are options, the
 probe read is the portable one.
 
+`bpf_core_type_size()` is safe where `bpf_core_type_id_kernel()` is not, and for
+exactly the same reason the field relocations are: its value comes from the
+layout, which every candidate agrees on, rather than from an index into one
+particular BTF. The object now carries two `TYPE_SIZE` relocations and no
+type-id relocation at all.
+
+## The verifier rejection behind it, and why it is gone
+
+With the relocation resolved the object reached the verifier and was rejected
+there instead:
+
+```
+172: (57) r1 &= 255   ; R1 = scalar(smin=0, smax=umax=3)
+173: (27) r1 *= -88   ; R1 = scalar(smax=0x7ffffffffffffff8, umax=0xfffffffffffffff8)
+175: (0f) r3 += r1
+math between ptr_ pointer and register with unbounded min value is not allowed
+```
+
+That is `container_of()` written as arithmetic: `th - dir * sizeof(tuplehash)`.
+The verifier cannot carry a bound through a multiply by a negative constant, so
+a register it knew to hold 0..3 came back with `smin` at `S64_MIN`, and
+`check_reg_sane_offset()` refuses pointer math against an unbounded minimum.
+
+Two things are worth noting about that trace. The `dir <= 1` test three
+instructions earlier does not help: llvm applies it to a *copy* of the register,
+and the masking in between breaks the link back to the original, so `r1` is
+still 0..3 at the multiply. And the same function that rejects an unbounded
+minimum **explicitly permits a known constant offset, negative included** — it
+only rejects constants beyond `BPF_MAX_VAR_OFF`.
+
+So the fix is to write it as a branch on `dir` with constant offsets, one arm
+per direction, and no arithmetic on `dir` at all. The generated code is what it
+should be:
+
+```
+294: r4 = 0x58        <- the TYPE_SIZE relocation, patched at load
+295: if w4 == 0 goto  <- the guard
+298: r1 -= r4         <- pointer minus a known constant
+...
+370: r2 = 0x58
+374: r1 += r2
+```
+
+No multiply, two known-constant offsets, and the size is relocated rather than
+taken from `sizeof()` on a local mirror that is only as right as the header it
+was copied from.
+
 ## Things the source depends on, each read from v6.12.103
 
 - `bpf_xdp_flow_lookup()` resolves its flowtable from `xdp->rxq->dev`. On
@@ -169,9 +216,11 @@ refusals. The other two error codes the kfunc can set — `-EINVAL` for a bad
 depend on the packet, so 25619 hits rules both out; the program should record the
 error value rather than leaving that as an inference.
 
-**The fastpath compiles and relocates; it has never been loaded or run.** The
-ambiguity above is resolved and the object carries no type-id relocation, but
-passing the verifier is a separate question and is untested. The NAT rewrite in
+**The fastpath compiles, relocates and clears the two failures found so far;
+it has never been loaded successfully or run.** The relocation ambiguity is
+resolved and the pointer arithmetic the verifier rejected is gone, both verified
+by reading the object rather than by loading it. Whether the verifier accepts
+the rest is still untested — it had never got past instruction 175 before. The NAT rewrite in
 particular has been through a compiler and nothing else. A wrong checksum shows
 up as clients losing connectivity, so `probe` comes first and `off` stays to
 hand.

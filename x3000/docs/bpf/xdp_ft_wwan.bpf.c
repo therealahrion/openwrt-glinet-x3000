@@ -332,6 +332,7 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 	__u32 out_ifidx;
 	__u8 dir, xmit;
 	void *data_end;
+	__u32 hsz;
 
 	bump(ST_SEEN);
 
@@ -389,9 +390,46 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 	 * hits the ambiguity check at relo_core.c:1369 and the whole object is
 	 * rejected. Dropping the cast removes the object's only TYPE_ID_TARGET
 	 * relocation; the other 27 are unaffected.
+	 *
+	 * Written as a branch on dir with constant offsets, rather than as
+	 * arithmetic on dir, because the verifier cannot carry a bound through a
+	 * multiply by a negative constant. `dir * -hsz` on a register it knows to
+	 * hold 0..3 comes back with smin at S64_MIN, and check_reg_sane_offset()
+	 * rejects pointer math against an unbounded minimum:
+	 *
+	 *   173: (27) r1 *= -88
+	 *   175: (0f) r3 += r1
+	 *   math between ptr_ pointer and register with unbounded min value is not allowed
+	 *
+	 * The same function explicitly permits a known constant offset, negative
+	 * included, so each arm of the branch passes. The dir <= 1 test above does
+	 * not help on its own: llvm applies it to a copy of the register, and the
+	 * masking in between breaks the link back to the original.
+	 *
+	 * hsz is relocated rather than taken from sizeof(). The local mirrors are
+	 * only as right as the header they were copied from, and a wrong size here
+	 * would walk to the wrong address silently. A TYPE_SIZE relocation is safe
+	 * where the type-id one was not, for the same reason the field relocations
+	 * are: its value comes from the layout, which every candidate agrees on,
+	 * not from an index into one particular BTF.
 	 */
-	flow = (struct flow_offload___local *)
-		((char *)th - (__u64)dir * sizeof(struct flow_offload_tuple_rhash___local));
+	hsz = bpf_core_type_size(struct flow_offload_tuple_rhash___local);
+	if (!hsz)
+		return XDP_PASS;
+
+	if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
+		/* th is tuplehash[0], so it already sits at the flow's base, and
+		 * the peer is the slot after it.
+		 */
+		flow  = (struct flow_offload___local *)th;
+		other = (struct flow_offload_tuple_rhash___local *)
+			((char *)th + hsz);
+	} else {
+		/* th is tuplehash[1]; both the base and the peer are one slot back. */
+		flow  = (struct flow_offload___local *)((char *)th - hsz);
+		other = (struct flow_offload_tuple_rhash___local *)
+			((char *)th - hsz);
+	}
 
 	/* Checked, unlike the reads further down: flags is what decides whether
 	 * NAT happens at all, so a silent zero here would redirect the packet
@@ -405,9 +443,6 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 		bump(ST_TORN_DOWN);
 		return XDP_PASS;
 	}
-
-	other = &flow->tuplehash[dir ? FLOW_OFFLOAD_DIR_ORIGINAL
-				    : FLOW_OFFLOAD_DIR_REPLY];
 
 	/* Egress. Only the direct form carries the addresses required; NEIGH
 	 * would require a neighbour lookup this program cannot do, so those
