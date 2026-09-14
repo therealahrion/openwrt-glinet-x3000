@@ -9,7 +9,7 @@
 #   xdp-ft-wwan.sh off            detach and unpin
 #
 # Run `check` first. Every gate it tests is one the program silently depends on,
-# so a failure here names the reason rather than leaving a program that
+# so a failure here names the reason instead of leaving you with a program that
 # loads and never hits.
 
 set -eu
@@ -53,16 +53,21 @@ check() {
 	need bpftool || true
 	need nft || true
 
-	# 1. The interface exists and is the raw-IP device the parser assumes.
+	# 1. The interface exists and is the raw-IP device we think it is.
 	if "$IP" link show "$IFACE" >/dev/null 2>&1; then
-		LT=$("$IP" link show "$IFACE" | sed -n 's|.*link/\([a-z]*\).*|\1|p' | head -1)
-		case "$LT" in
-		rawip|none|void)
-			ok "$IFACE is link/$LT - no L2 header, IP at offset 0 as the parser assumes" ;;
-		ether)
-			bad "$IFACE is link/ether - it carries an Ethernet header this parser would misread" ;;
+		# Read the ARPHRD number rather than parsing iproute2's label: an ip
+		# that predates ARPHRD_RAWIP prints link/[519] and the label tells
+		# nothing. 519 RAWIP, 65534 NONE, 1 ETHER.
+		AT=$(cat "/sys/class/net/$IFACE/type" 2>/dev/null)
+		case "$AT" in
+		519|65534)
+			ok "$IFACE type $AT - no L2 header, IP at offset 0 as the parser assumes" ;;
+		1)
+			bad "$IFACE type 1 (ARPHRD_ETHER) - it carries an Ethernet header this parser would misread" ;;
+		"")
+			bad "cannot read /sys/class/net/$IFACE/type" ;;
 		*)
-			warn "$IFACE is link/${LT:-unknown} - unexpected; check hard_header_len before trusting the parse" ;;
+			warn "$IFACE type $AT - unexpected; confirm there is no L2 header before trusting the parse" ;;
 		esac
 	else
 		bad "$IFACE does not exist"
@@ -83,12 +88,19 @@ check() {
 		bad "no /sys/kernel/btf/vmlinux - DEBUG_INFO_BTF is off, the kfunc cannot exist"
 	fi
 
-	# 4. The kfunc itself. This is the gate that decides everything.
-	if bpftool btf dump file /sys/kernel/btf/vmlinux format raw 2>/dev/null \
-	   | grep -q 'bpf_xdp_flow_lookup'; then
-		ok "bpf_xdp_flow_lookup is in the kernel BTF"
+	# 4. The kfunc itself. This is the gate that decides everything. nf_flow_table
+	#    is a module here, so its BTF is /sys/kernel/btf/nf_flow_table and not
+	#    vmlinux - the same place verify-992a.sh looks.
+	modprobe nf_flow_table 2>/dev/null
+	if [ -r /sys/kernel/btf/nf_flow_table ]; then
+		if bpftool btf dump file /sys/kernel/btf/nf_flow_table format raw 2>/dev/null \
+		   | grep -q bpf_xdp_flow_lookup; then
+			ok "bpf_xdp_flow_lookup is in the nf_flow_table module BTF"
+		else
+			bad "bpf_xdp_flow_lookup not in nf_flow_table BTF - nf_flow_table_bpf.o was not built"
+		fi
 	else
-		bad "bpf_xdp_flow_lookup absent - nf_flow_table_bpf.o was not built"
+		bad "no BTF for nf_flow_table - module not loaded, or DEBUG_INFO_BTF_MODULES off"
 	fi
 
 	# 5. Software flow offload on, hardware OFF. Hardware offload sends
