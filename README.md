@@ -64,11 +64,18 @@ and how to read its state on a running router:
   Benefit(s):     Far less per-packet work on a two-core router, which is
                   what limits 5G downlink speed on this box.
   Impact(s):      Gives wwan0 real NAPI contexts, so "ethtool -K wwan0 gro
-                  off" and the per-device threaded switch start working.
-                  Nothing outside the MBIM receive path changes.
+                  off" becomes a live kill switch. Nothing outside the MBIM
+                  receive path changes. It also makes the per-device
+                  "threaded" switch do something, which is a hazard rather
+                  than a feature - see Limitation(s).
   Limitation(s):  Downlink only; the upload side is untouched. Packets have
                   to arrive close together for there to be anything to
-                  merge, so it does little at low rates.
+                  merge, so it does little at low rates. Do not write 1 to
+                  /sys/class/net/wwan0/threaded on a kernel carrying this
+                  patch: gro_cells queues are per-CPU and carry no lock, and
+                  threaded NAPI drains them from unbound kernel threads. That
+                  toggle is inert without this patch and took the WAN down
+                  twice with it.
   Attribution(s): Mine, written for this fork. Background:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>

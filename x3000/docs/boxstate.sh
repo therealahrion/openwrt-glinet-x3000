@@ -33,7 +33,7 @@
 # not have, or a function whose meaning changed, should say so rather than
 # dying on "not found" three screens later. Bump it when a bs_* function's
 # name, arguments or meaning change; adding one does not need a bump.
-BOXSTATE_API=2
+BOXSTATE_API=3
 
 WAN=${WAN:-wwan0}
 # Only meaningful when this file is run, not when it is sourced.
@@ -114,6 +114,67 @@ bs_mtu()        { cat "/sys/class/net/$1/mtu" 2>/dev/null || true; }
 bs_gro() {
   bs_have ethtool || { echo "-"; return; }
   ethtool -k "$1" 2>/dev/null | awk '/^generic-receive-offload:/{print $2}'
+}
+
+# Which XDP mode a program is attached in, or "none".
+#
+# This is not cosmetic. iproute2 renders XDP_ATTACHED_DRV as "prog/xdp" and
+# XDP_ATTACHED_SKB as "prog/xdpgeneric", so a pattern for 'prog/xdp' matches
+# BOTH and cannot tell them apart - which is the mistake xdp-ft-wwan.sh makes at
+# its attach and verify sites. The distinction is load-bearing here because only
+# the skb one sets dev->xdp_prog and therefore elides GRO; see
+# bs_gro_effective() below. The cases are ordered longest-first so the bare
+# 'prog/xdp*' arm is reached only after the two specific spellings have failed;
+# a case glob has no word boundary to anchor on, so the order IS the guard.
+#
+# bs_pick_ip, not a bare `ip`: busybox's applet does not understand xdp and
+# prints nothing about it, so a bare `ip -d link show` would report "none" for a
+# device that has a program attached. That is the whole reason bs_pick_ip
+# exists, and reaching for `ip` directly here would have reintroduced the bug it
+# was written to kill.
+bs_xdp_mode() {
+  _ip=$(bs_pick_ip)
+  [ -n "$_ip" ] || { echo "-"; return; }
+  _x=$("$_ip" -d link show "$1" 2>/dev/null) || { echo "-"; return; }
+  case "$_x" in
+    *prog/xdpgeneric*) echo generic ;;
+    *prog/xdpoffload*) echo offload ;;
+    *prog/xdp*)        echo native ;;
+    *)                 echo none ;;
+  esac
+}
+
+# Whether GRO is ACTUALLY happening, which is not what `ethtool -k` reports.
+#
+# netif_elide_gro() (include/linux/netdevice.h:2423) is
+#
+#     !(dev->features & NETIF_F_GRO) || dev->xdp_prog
+#
+# and dev->xdp_prog is set only by generic_xdp_install() (net/core/dev.c:5944),
+# so it means "a program is attached in skb mode". ethtool sees the feature bit
+# and nothing else, so it reports "on" while a generic XDP program is eliding
+# GRO underneath it.
+#
+# That distinction decides real behaviour on this box. gro_cells_receive()
+# (net/core/gro_cells.c:23) tests the same predicate and falls straight through
+# to netif_rx() when it holds, so with a generic program attached the per-CPU
+# gro_cells queues 991 installs are never touched at all - the WAN is back to
+# its pre-991 receive path while ethtool still says GRO is on.
+bs_gro_effective() {
+  _f=$(bs_gro "$1")
+  # "-" is bs_gro's no-ethtool answer and "" is an interface it could not read.
+  # Neither means off, and reporting them as off would be the same class of
+  # mistake this function exists to fix.
+  case "$_f" in
+    on)   : ;;
+    -|"") echo "unknown (no ethtool, cannot read the feature bit)"; return ;;
+    *)    echo "off (feature bit $_f)"; return ;;
+  esac
+  case "$(bs_xdp_mode "$1")" in
+    generic) echo "off (elided by generic XDP)" ;;
+    -)       echo "unknown (no xdp-capable ip, cannot rule out generic XDP)" ;;
+    *)       echo "on" ;;
+  esac
 }
 bs_lro() {
   bs_have ethtool || { echo "-"; return; }

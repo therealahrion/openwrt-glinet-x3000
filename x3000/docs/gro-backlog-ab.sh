@@ -75,7 +75,7 @@ if [ ! -s "$BOXSTATE" ]; then
 	exit 1
 fi
 BOXSTATE_LIB=1 . "$BOXSTATE"
-BOXSTATE_NEED=2
+BOXSTATE_NEED=3
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
 	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
 	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again." >&2
@@ -98,7 +98,7 @@ command -v wget    >/dev/null 2>&1 || { say "FATAL: wget not installed"; exit 1;
 # restoring whatever the previous A/B leg happened to leave behind. With three
 # knobs the hand-rolled version was correct; it was the fourth knob somebody
 # adds that it was going to get wrong.
-say "starting state: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro $WANIF)"
+say "starting state: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro_effective $WANIF) xdp=$(bs_xdp_mode $WANIF)"
 say "time_squeeze so far: $(bs_squeeze)"
 
 PIDS=""
@@ -109,7 +109,7 @@ cleanup() {
 	[ -s "$LOADLOG" ] && say "fetcher errors were logged to $LOADLOG"
 	bs_restore
 	say ""
-	say "now: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro $WANIF)"
+	say "now: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro_effective $WANIF) xdp=$(bs_xdp_mode $WANIF)"
 }
 trap 'say ""; say "interrupted - restoring"; cleanup; exit 130' INT TERM
 
@@ -318,37 +318,51 @@ napi_recover() {
 	return 1
 }
 
-# Staged by risk, after two 2026-09-14 runs took the WAN down and cost two
-# reboots. Four things those runs did not do, each of which cost something:
+# DISABLED. Threaded NAPI is not a tuning knob on this interface - it is an
+# unsafe configuration, and 23.21 shows that in source rather than in counters.
 #
-#   1. They toggled under load. Nobody would DEPLOY W0002 that way - the flag
-#      would be set at boot - so toggling under load was never the
-#      configuration worth testing. The idle toggle is, and it is safer.
-#   2. They captured no kernel log, and logread is a ring buffer, so each
-#      reboot destroyed the only account of what happened.
-#   3. Run 1 kept measuring for five windows after the link was already dead.
-#   4. They left irqbalance running while testing NAPI placement - which moves
-#      IRQ affinity underneath the one variable the test is about. The preflight
-#      warns about it; this revision stops it for the run and restores it after.
-#      Neither earlier run measured a controlled configuration.
+# gro_cells carries no lock at 6.12.103. gro_cells_receive() enqueues with the
+# unlocked __skb_queue_tail() at gro_cells.c:37 and gro_cell_poll() dequeues with
+# the unlocked __skb_dequeue() at :58; the only exclusion is that both run on the
+# same CPU with BH disabled, which is what the /* called under BH context */
+# comment at :49 is asserting. dev_set_threaded() (dev.c:6688) threads every NAPI
+# on dev->napi_list with no filter, and napi_kthread_create() (dev.c:1508) uses a
+# plain kthread_run(), so the resulting threads are UNBOUND. A gro_cell belonging
+# to CPU 0 can then be drained from CPU 1 while CPU 0 is still enqueueing into it.
 #
-# This still risks the link. It no longer risks it blind.
+# Staging cannot fix that. dev_set_threaded() starts each thread before it sets
+# NAPI_STATE_THREADED twelve lines later, so there is a window in which traffic
+# meets an unbound thread and no userspace taskset has run yet. Both 2026-09-14
+# failures happened inside seconds of the write, which is what that window looks
+# like.
+#
+# The escape hatch below exists for one purpose: verifying a kernel that has
+# W0041 applied, where the gro_cells NAPI kthreads are bound to their cells'
+# CPUs. On a stock kernel there is no correct number to collect here.
+#
+# The rest of this mode is kept intact because it is what W0041 verification
+# needs: an idle-link toggle first, irqbalance stopped for the run and restored
+# after, logread captured throughout, and a stop on the first sign the link has
+# gone rather than five more dead windows.
 if [ "$1" = --napi ]; then
-	say "W0002: threaded NAPI on $WANIF - staged by risk"
+	say "W0002: threaded NAPI on $WANIF - REFUSED on a stock kernel"
 	say ""
-	say "Two 2026-09-14 attempts killed the downlink and each needed a reboot."
-	say "This toggles on an IDLE link first, stops irqbalance, captures logread"
-	say "throughout, and stops the moment the link stops instead of measuring"
-	say "five dead windows."
+	say "gro_cells has no lock (gro_cells.c:37 and :58 are the unlocked skb"
+	say "queue primitives) and relies on producer and consumer sharing a CPU"
+	say "with BH disabled. Threading it creates UNBOUND kthreads (dev.c:1508),"
+	say "which breaks that. 23.21 has the full chain."
 	say ""
-	say "It can still take the link down, and WHY it does is not established."
-	say "23.20 records both runs and two withdrawn explanations; the point of"
-	say "this revision is to collect the evidence those runs did not."
+	say "Two 2026-09-14 attempts killed the downlink and each cost a reboot."
+	say "A third would measure the same broken configuration."
 	say ""
-	if [ "${NAPI_I_ACCEPT_A_REBOOT:-0}" != 1 ]; then
-		say "Set NAPI_I_ACCEPT_A_REBOOT=1 to proceed."
+	if [ "${NAPI_W0041_KERNEL:-0}" != 1 ]; then
+		say "This mode only makes sense on a kernel carrying W0041, which binds"
+		say "each gro_cells NAPI kthread to its own cell's CPU. On such a build,"
+		say "set NAPI_W0041_KERNEL=1 to run the verification."
 		exit 1
 	fi
+	say "NAPI_W0041_KERNEL=1 - proceeding as a W0041 verification run."
+	say ""
 
 	# Evidence first: logread is a ring buffer and a reboot empties it.
 	LOG=/tmp/napi-logread.txt
@@ -489,11 +503,11 @@ if [ "$1" = --threaded ]; then
 	say "was the on-box curl starving the NAPI kthread of CPU. That explanation"
 	say "is now in doubt: on 2026-09-14 the same toggle, under a LAN-driven load"
 	say "with nothing competing on the box, took the WAN down hard enough to"
-	say "need a reboot. A collapse attributed to contention may have been this"
-	say "all along."
+	say "need a reboot - twice. A collapse attributed to contention was more"
+	say "likely the unbound-kthread race 23.21 describes, all along."
 	say ""
-	say "Set NAPI_I_ACCEPT_A_REBOOT=1 to run it anyway."
-	[ "${NAPI_I_ACCEPT_A_REBOOT:-0}" = 1 ] || exit 1
+	say "Like --napi, this only makes sense on a kernel carrying W0041."
+	[ "${NAPI_W0041_KERNEL:-0}" = 1 ] || exit 1
 	bs_set_sysfs /sys/class/net/$WANIF/threaded 1
 	_nt=0
 	for _c in /proc/[0-9]*/comm; do

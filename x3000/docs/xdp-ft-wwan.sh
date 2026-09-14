@@ -82,7 +82,7 @@ BOXSTATE_LIB=1 . "$BOXSTATE"
 # A stale boxstate.sh cached in /tmp from an older revision is the same trap the
 # object checksum guards against, and it fails less obviously: a renamed reader
 # is "not found" three screens into a run.
-BOXSTATE_NEED=2
+BOXSTATE_NEED=3
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
 	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
 	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again so the" >&2
@@ -188,9 +188,14 @@ check() {
 		bad "$IFACE does not exist"
 	fi
 
-	if "$IP" -d link show "$IFACE" 2>/dev/null | grep -q 'prog/xdp'; then
-		warn "$IFACE already has a program attached; run 'off' first"
-	fi
+	# bs_xdp_mode rather than a 'prog/xdp' grep: the two spellings iproute2
+	# uses, prog/xdp and prog/xdpgeneric, both match that pattern, and which
+	# one is present decides whether 991's GRO is running. See the attach site.
+	_pre=$(bs_xdp_mode "$IFACE")
+	case "$_pre" in
+		none|-) : ;;
+		*) warn "$IFACE already has a program attached ($_pre mode); run 'off' first" ;;
+	esac
 
 	bs_require_btf
 
@@ -246,12 +251,35 @@ load() {
 	# Confirm rather than trust the exit code: an earlier version of this
 	# script reported a successful attach after ip had failed, because inside
 	# an && list set -e does not fire.
-	if "$IP" -d link show "$IFACE" 2>/dev/null | grep -q 'prog/xdp'; then
-		ok "attached to $IFACE"
-	else
-		say "attach reported success but no program is on $IFACE"
-		return 1
-	fi
+	#
+	# And confirm WHICH MODE, not merely that something attached. Plain `ip
+	# link set ... xdp` is best-effort: dev_xdp_mode() (net/core/dev.c:9444)
+	# takes the driver's ndo_bpf if it has one and falls to skb mode if not,
+	# with no retry. That choice decides whether 991's GRO survives, because
+	# only the skb path sets dev->xdp_prog, which is what netif_elide_gro()
+	# tests and what gro_cells_receive() checks per datagram - landing in
+	# generic mode silently reverts the WAN to its pre-991 netif_rx() path.
+	# A grep for 'prog/xdp' cannot see the difference: iproute2 spells the
+	# skb attachment 'prog/xdpgeneric', which that pattern also matches.
+	_mode=$(bs_xdp_mode "$IFACE")
+	case "$_mode" in
+		native)
+			ok "attached to $IFACE in native mode (991's GRO intact)" ;;
+		generic)
+			warn "attached to $IFACE in GENERIC mode - dev->xdp_prog is set,"
+			warn "  so netif_elide_gro() is now true and gro_cells_receive()"
+			warn "  falls through to netif_rx(). 991's GRO is OFF while this"
+			warn "  program is attached. Expect 992 to be missing from the"
+			warn "  kernel; with it, dev_xdp_mode() would have chosen native." ;;
+		offload)
+			ok "attached to $IFACE in hardware-offload mode" ;;
+		none)
+			say "attach reported success but no program is on $IFACE"
+			return 1 ;;
+		*)
+			warn "attached to $IFACE, but no xdp-capable ip could read the mode"
+			warn "  - cannot tell whether 991's GRO survived the attach" ;;
+	esac
 }
 
 legend() {

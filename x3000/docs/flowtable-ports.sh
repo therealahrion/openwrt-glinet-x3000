@@ -43,7 +43,7 @@ if [ ! -r "$BOXSTATE" ]; then
 fi
 [ -s "$BOXSTATE" ] || { echo "FATAL: boxstate.sh not found and could not be fetched." >&2; exit 1; }
 BOXSTATE_LIB=1 . "$BOXSTATE"
-BOXSTATE_NEED=2
+BOXSTATE_NEED=3
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
   echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this needs $BOXSTATE_NEED." >&2
   echo "       rm -f /tmp/boxstate.sh and re-run so both come from one revision." >&2

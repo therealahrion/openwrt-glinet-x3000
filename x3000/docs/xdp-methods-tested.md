@@ -3765,6 +3765,12 @@ write is a trigger rather than a state. That is as far as the evidence goes.
 
 #### What would settle it, at what cost
 
+**Superseded by 23.21 as far as running it again goes.** The source says
+threaded NAPI on a gro_cells device is unsafe by construction, so none of the
+steps below is worth a third reboot. They are kept because they describe what
+this section would have needed, and because step 2 is still worth doing for the
+993 stall on its own account.
+
 Ordered by what each costs to run:
 
 1. **Toggle `threaded` on an idle link, with irqbalance stopped, capturing
@@ -3779,8 +3785,9 @@ Ordered by what each costs to run:
 3. **Sample `rsrp` inside the failure window**, not after the reboot, to retire
    the radio as a candidate rather than arguing about it.
 
-Until at least the first of those runs on a box with irqbalance stopped, W0002
-has no measurement and this section has no mechanism.
+W0002 has no measurement and this section has no mechanism. 23.21 explains why
+it is not going to get either: the configuration under test is racy by
+construction, so there is no correct number hiding behind these two failures.
 
 #### What this changes
 
@@ -3798,3 +3805,637 @@ has no measurement and this section has no mechanism.
   what remains is that both failures look like a downlink that stops while the
   box stays up. Whether they share a cause is untested, and step 2 above is the
   cheap way to find out.
+
+### 23.21 Threaded NAPI cannot be safe on `wwan0`: gro_cells has no lock - 2026-09-14
+
+W0002 is not a tuning knob with an unmeasured cost. On a gro_cells device it is
+an **unsafe configuration**, and that is readable in source without running
+anything. This section supersedes 23.20's "cause not established" on the
+question of whether to try again: the answer is no, and the reason does not
+depend on either failed run.
+
+#### First, the provenance: `wwan0` is a gro_cells device because 991 is mine
+
+Stock `mhi_wwan_mbim` is not a gro_cells driver and has no NAPI at all. At
+`v6.12.103` the entire receive delivery path is one call - `netif_rx()` at
+`drivers/net/wwan/mhi_wwan_mbim.c:348` - and the file contains zero occurrences
+of `napi` or `gro`. On a stock kernel `/sys/class/net/wwan0/threaded` is
+therefore **inert**: `dev_set_threaded()` walks an empty `dev->napi_list`,
+creates no kthreads, and sets a flag nothing reads.
+
+`991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` in this tree is what put per-CPU
+gro_cells NAPIs on that netdev, and it is my patch. Its own commit message named
+"a working `/sys/class/net/<dev>/threaded` toggle" as a side benefit of the
+switch. **That line was wrong** and has been removed: the toggle it enabled is
+the one behaviour change 991 makes that is not an improvement. 991 now carries
+the hazard in its message instead.
+
+So the ordering is: 991 moved `wwan0` into the gro_cells class, the class has an
+upstream defect, and W0002 walked into it. The defect is not 991's to fix, but
+it was 991's to disclose.
+
+The upstream users of `gro_cells` at `v6.12.103` are `amt`, `bareudp`,
+`geneve`, `macsec`, `pfcp`, `vxlan`, `ip_tunnel` and
+`rmnet_vnd` - the last of which is Qualcomm's own modem netdev, so the hazard
+reaches shipping modem hardware without anyone applying a local patch first.
+
+#### What gro_cells relies on, at 6.12.103
+
+`net/core/gro_cells.c` in the kernel this box runs has **no lock of any kind**:
+
+| line | what happens |
+|---|---|
+| `:28` | `cell = this_cpu_ptr(gcells->cells)` - the producer always takes the running CPU's cell |
+| `:30` | `skb_queue_len(&cell->napi_skbs) > max_backlog` - unlocked read |
+| `:37` | `__skb_queue_tail(&cell->napi_skbs, skb)` - the **unlocked** enqueue, not `skb_queue_tail()` |
+| `:38` | `if (skb_queue_len(...) == 1) napi_schedule(...)` - the edge-triggered re-arm |
+| `:49` | `/* called under BH context */` - the contract, written as a comment |
+| `:58` | `skb = __skb_dequeue(&cell->napi_skbs)` - the **unlocked** dequeue |
+
+The `__` variants do not take `napi_skbs.lock`. So the entire mutual exclusion
+between producer and consumer is: **both run on the same CPU with BH disabled.**
+Per-CPU data plus BH-disable is the lock.
+
+This is not my reading imposed on the code. Upstream states it directly in
+commit `25718fdcbdd2` ("net: gro_cells: Use nested-BH locking for gro_cell",
+Sebastian Andrzej Siewior, first in **v6.18**):
+
+> The gro_cell data structure is per-CPU variable and relies on disabled BH for
+> its locking. [...] This change adds only lockdep coverage and does not alter
+> the functional behaviour for !PREEMPT_RT.
+
+Two things follow. The invariant is confirmed by the maintainer who touched it
+most recently. And the `local_lock_t` that v6.18 adds is a **PREEMPT_RT and
+lockdep change only** - it is explicitly a no-op for a non-RT build like this
+one, so backporting it would fix nothing here.
+
+The lock was not always absent. `f8e8f97c11d5` (Eric Dumazet, 2013) added a
+`spin_lock` to `gro_cell_poll()` for a different race, and its reasoning was the
+same invariant: plain `spin_lock` sufficed "since both producer and consumer run
+in Bottom-Half context". That lock is gone and the invariant is all that is left.
+
+#### What `threaded` does to that invariant
+
+`gro_cells_init()` at `:78` walks `for_each_possible_cpu` and at `:85` calls
+`netif_napi_add(dev, &cell->napi, gro_cell_poll)` on the **real** netdev. So the
+per-CPU gro_cells NAPIs sit on `wwan0`'s own `dev->napi_list`, alongside anything
+the driver registered. Two possible CPUs on this SoC means two of them.
+
+Then, in `net/core/dev.c`:
+
+- `:6688` `dev_set_threaded()` iterates **every** entry on `dev->napi_list` and
+  creates a kthread for each. There is no filter - not for
+  `NAPI_STATE_NO_BUSY_POLL`, not for gro_cells, not for anything.
+- `:1508` `napi_kthread_create()` calls plain `kthread_run()`. **Unbound.** The
+  only CPU-bound NAPI thread anywhere in that file is the backlog NAPI at
+  `:12287`, which is a different mechanism and does not apply here.
+- `:7009` the thread calls `local_bh_disable()`, and `:7012` takes
+  `this_cpu_ptr(&softnet_data)` - BH is disabled on whatever CPU the scheduler
+  put the thread on, which has nothing to do with which cell it is draining.
+
+So CPU 0's gro_cell can be drained by a kthread running on CPU 1 while
+`gro_cells_receive()` on CPU 0 is enqueueing into it. That is an unlocked
+`__skb_queue_tail()` racing an unlocked `__skb_dequeue()` on the same
+`sk_buff_head` from two cores. The SCHED bit serialises pollers against each
+other; it does not serialise the poller against the producer, because the
+producer never takes it.
+
+**Evidence grade: E2.** Every line above was read in the tree this build ships,
+`v6.12.103`, not inferred from a counter.
+
+#### Two objections worth closing, because both sound reasonable
+
+**"gro_cells NAPIs are dummies - surely `threaded` skips them."** It does not.
+`dev_set_threaded()` (`dev.c:6688`) iterates `dev->napi_list` with no filter of
+any kind and calls `napi_kthread_create()` for every entry that lacks a thread.
+gro_cells puts its NAPIs on that exact list with `netif_napi_add(dev, ...)`
+(`gro_cells.c:85` at 6.12.103, `:96` at master). So one kthread is created per
+possible CPU. **This is not only a source reading: run 2 observed exactly two
+kthreads on this two-CPU board**, which is what one-per-possible-CPU predicts.
+
+**"`napi_schedule()` from `gro_cells_receive()` will just fall back to softirq
+or ksoftirqd."** It will not, once the bit is set. `____napi_schedule()` at
+`dev.c:4637`:
+
+```c
+if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
+        thread = READ_ONCE(napi->thread);
+        if (thread) {
+                if (use_backlog_threads() && thread == raw_cpu_read(backlog_napi))
+                        goto use_local_napi;
+                set_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
+                wake_up_process(thread);
+                return;
+        }
+}
+use_local_napi:
+        list_add_tail(&napi->poll_list, &sd->poll_list);
+```
+
+The threaded arm **returns**. It never reaches `sd->poll_list`, so the work never
+goes near a softirq or `ksoftirqd`. The single carve-out at `:4653` is for the
+backlog NAPI - the one per-CPU NAPI the kernel does bind to its CPU - which is
+the same asymmetry W0041 is about, showing up again in a second place.
+
+#### How this sits against the two outages
+
+It fits, and I am **not** grading that fit above E3. What the race would produce
+is a list whose linkage or `qlen` no longer agree:
+
+- **Silent.** No `WARN`, no `pr_err`, nothing to log. Both runs: `logread` empty.
+- **Permanent.** If `qlen` stops passing through 1, the `:38` re-arm edge never
+  recurs, and writing `threaded=0` cannot repair a corrupted list. Both runs: no
+  recovery from `threaded=0`, reboot required.
+- **`rx_dropped` either way.** Whether the corrupted `qlen` lands above or below
+  `max_backlog` decides whether drops are counted at all. Under 23.20's overflow
+  reading, run 1's 88 and run 2's 0 contradicted each other. Under corruption
+  they are just two different corrupt states, and neither is informative.
+
+One observation from run 2 looked like more than the rest: **two kthreads, both
+on CPU 1.** Two possible CPUs give two gro_cells NAPIs and therefore two
+kthreads, which matches - and both on CPU 1 would mean CPU 0's cell was being
+consumed from CPU 1.
+
+The reading depends on datagrams being in the cells at all, which 23.22 first
+denied and then confirmed: `dev_xdp_mode()` (`dev.c:9444`) resolves to DRV
+whenever the driver owns `ndo_bpf`, 992 does, and a DRV-mode program leaves
+`dev->xdp_prog` NULL. So GRO was live and the cells were in the path on the
+shipped image either way. The kthread placement is consistent with the race
+without establishing it - which is what it was worth all along.
+
+It also lines up with the box's IRQ placement, which was measured separately.
+Every MHI interrupt lands on CPU 0 here regardless of the affinity mask, so
+`gro_cells_receive()` runs on CPU 0 and enqueues into CPU 0's cell. The wake
+comes from `____napi_schedule()` on CPU 0 via `wake_up_process()`, and a wake
+issued from a CPU that is saturated with receive work is exactly the case where
+the scheduler places the woken task on the *other* core. On a two-core box that
+makes the cross-CPU drain the likely outcome rather than the unlucky one.
+
+**The scheduler half of that is E3 - reasoning, not a trace.** The two facts it
+sits between are E1: the MHI IRQ lands on CPU 0, and both kthreads were observed
+on CPU 1.
+
+#### Against the documented framing
+
+The NAPI documentation describes threaded NAPI as changing only the execution
+context: the same poll loop, run in a kthread instead of a softirq. For a driver
+NAPI that is a fair summary - the work is the same and it stays attached to the
+same hardware queue.
+
+For gro_cells it understates the change, because "context" there includes
+**which CPU**. A driver's NAPI protects its ring with the NAPI SCHED bit and its
+own locking, so moving the poll to another core is a scheduling decision. A
+gro_cell has neither: its queue is per-CPU and its primitives are the unlocked
+`__skb_*` ones, and the SCHED bit serialises pollers against each other without
+ever serialising a poller against the producer. gro_cells is the one NAPI user
+for which "same loop, different context" is not a safe restatement, and that is
+precisely where this lands.
+
+#### Why no harness can make the toggle safe
+
+Pinning the kthreads afterwards does not close the hole. `dev_set_threaded()`
+creates each thread with `kthread_run()`, which **starts it immediately**, and
+sets `NAPI_STATE_THREADED` a few lines later at `:6721`. Between those two
+points no userspace `taskset` has run yet, and traffic arriving in that window is
+already being handed to an unbound thread. Both failures happened within seconds
+of the write, which is what that window looks like.
+
+An idle-link toggle narrows the window but does not remove it, and "narrower"
+is not a property worth another reboot of the house router.
+
+#### What this changes
+
+- **W0002 is retired as a workaround**, not deferred. There is nothing to
+  measure: the configuration is unsafe by construction on this interface, so a
+  latency number obtained from it would not be a number worth having.
+- **23.20's "cause not established" stands for the outages themselves.** This
+  section does not close that; it removes the reason to reopen it.
+- **W0041 is the fix**, and it is upstream-shaped rather than local. Two forms:
+
+  1. Bind each gro_cells NAPI kthread to the CPU whose cell it serves. Preserves
+     the feature and restores the invariant exactly.
+  2. Have gro_cells opt its NAPIs out of threaded mode, so writing `threaded=1`
+     on such a device threads only the driver's own NAPI.
+
+  Form 1 is the better fix if threaded gro_cells is wanted at all; form 2 is
+  smaller and is what I would send first, because it cannot regress anything
+  that works today.
+
+- **991 is amended, not withdrawn.** The GRO batching it buys is the thing it
+  was written for and none of that is in question. What changed is that its
+  commit message no longer advertises a toggle that is unsafe on the class it
+  moves the netdev into, and now warns instead.
+
+- **The defect is not specific to this box, and not specific to 991.** Every
+  upstream gro_cells user - `amt`, `bareudp`, `geneve`, `macsec`, `pfcp`,
+  `vxlan`, `ip_tunnel`, `rmnet_vnd` - exposes a writable `threaded` in sysfs and
+  has the same exposure on any non-RT kernel. `rmnet_vnd` matters most for the
+  report: it is a modem netdev in mainline, so the bug is reachable on stock
+  hardware by writing one sysfs file. That makes W0041 reportable on its own
+  merits, and the GL-X3000 is the reproducer rather than the subject.
+
+### 23.22 How GRO is actually handled on the WAN, and why my instrument could not see it - 2026-09-14
+
+I had not checked this. 23.21 reasons about what happens once a datagram is in a
+gro_cell without ever establishing that datagrams on this box reach one. They
+often do not, the condition that stops them is one this tree creates on purpose,
+and the reader I was using to watch it is blind to that condition.
+
+#### The predicate
+
+`gro_cells_receive()` does not always use its cells. At `gro_cells.c:23`:
+
+```c
+if (!gcells->cells || skb_cloned(skb) || netif_elide_gro(dev)) {
+        res = netif_rx(skb);
+        goto unlock;
+}
+```
+
+and `netif_elide_gro()`, at `include/linux/netdevice.h:2423`, is:
+
+```c
+if (!(dev->features & NETIF_F_GRO) || dev->xdp_prog)
+        return true;
+```
+
+`dev->xdp_prog` is written in exactly one place - `generic_xdp_install()` at
+`net/core/dev.c:5944` - so it means **a program attached in skb mode**. Native
+XDP is held by the driver and does not set it.
+
+So on `wwan0` there are two ways for a datagram to miss the gro_cells path
+entirely, and the second one is invisible to `ethtool`.
+
+#### What that means for 991
+
+**A generic-mode XDP program on `wwan0` does not reduce GRO. It turns 991 off.**
+Every datagram goes to `netif_rx()`, which is the exact call 991 replaced. The
+per-CPU cells sit allocated and empty, the NAPIs stay on `dev->napi_list`, and
+the WAN runs its pre-991 receive path while `ethtool -k wwan0` still reports
+`generic-receive-offload: on`.
+
+The capability grid already carried this as "GSK01 costs GRO+991", so the
+interaction was known. What was missing is that nothing on this box ever checked
+which mode was live.
+
+#### Two places that could not tell, including mine
+
+**`bs_gro()` reads the wrong half of the predicate.** It runs `ethtool -k` and
+takes `generic-receive-offload:`. That is `dev->features & NETIF_F_GRO` and
+nothing else. It cannot see `dev->xdp_prog`, so it prints `on` while GRO is
+elided. Both W0002 runs printed that value in their opening line, and I read it
+as confirmation that GRO was in the path.
+
+**`xdp-ft-wwan.sh` does not record which mode it got.** It attaches at `:240`
+with
+
+```sh
+"$IP" link set dev "$IFACE" xdp pinned "$PINDIR/$PROGNAME"
+```
+
+Plain `xdp` is best-effort: native where the driver has an `ndo_bpf`, generic
+otherwise. Its verify at `:191` and `:249` then greps for `prog/xdp` - and
+iproute2 renders the skb attachment as `prog/xdpgeneric`, which that pattern also
+matches. Its own teardown at `:577`-`:578` clears both spellings, under a comment
+saying "a program attached in skb mode is not cleared by `xdp off`". The script
+knows the ambiguity exists at the end and never resolves it at the start.
+
+#### What this does to 23.21: nothing, and I said otherwise
+
+The first revision of this section claimed the elision undermined 23.21's
+corroboration - that if a generic-mode program had been attached during the
+W0002 runs, no datagram reached a cell and the race could not have fired.
+**That was an over-correction, and 992 is why.**
+
+`dev_xdp_mode()` at `net/core/dev.c:9444` is not a fallback. It is a capability
+check with no retry:
+
+```c
+if (flags & XDP_FLAGS_HW_MODE)  return XDP_MODE_HW;
+if (flags & XDP_FLAGS_DRV_MODE) return XDP_MODE_DRV;
+if (flags & XDP_FLAGS_SKB_MODE) return XDP_MODE_SKB;
+return dev->netdev_ops->ndo_bpf ? XDP_MODE_DRV : XDP_MODE_SKB;
+```
+
+992 implements `ndo_bpf`, so on the shipped image a bare `ip link set dev wwan0
+xdp ...` resolves to **DRV**, the program lands on `link->xdp_prog`, and
+`dev->xdp_prog` stays NULL. GRO is not elided. 992's own commit message says
+this, cites `dev_xdp_mode()` by name, and gives it as the reason for owning
+`ndo_bpf` at all. I rediscovered a hazard that patch had already closed and then
+wrote it up as though it were open.
+
+So on the shipped build (`990/991/992/993/995`) there are two possibilities for
+the W0002 runs - no program attached, or a DRV-mode one - and `dev->xdp_prog` is
+NULL in both. The cells were in the path. **23.21's run-2 corroboration is
+restored**, at the strength it originally had: consistent with the race, not
+proof of it.
+
+What survives from this section is narrower and still worth having: the elision
+is reachable by an explicit `xdpgeneric`, and on any build without 992 it is the
+default. The instruments could not see either case, which is the part that
+needed fixing.
+
+#### The fix, in the durable tool
+
+`boxstate.sh` goes to API 3 and gains two readers; all five callers were bumped
+in the same pass.
+
+- **`bs_xdp_mode <dev>`** returns `none`, `native`, `generic` or `offload`. The
+  cases are ordered longest-spelling-first, because a `case` glob has no word
+  boundary and `*prog/xdp*` would otherwise swallow `prog/xdpgeneric`. It goes
+  through `bs_pick_ip` rather than a bare `ip`: busybox's applet does not
+  understand xdp and prints nothing about it, so a bare call would report `none`
+  for a device that has a program attached - the exact bug `bs_pick_ip` was
+  written to kill, which I reintroduced in the first draft of this function and
+  caught on re-read.
+- **`bs_gro_effective <dev>`** evaluates the real predicate and returns `on`,
+  `off (feature bit ...)`, `off (elided by generic XDP)`, or an explicit
+  `unknown` when `ethtool` or an xdp-capable `ip` is missing. Absent tooling
+  reports as unknown rather than off, which is the same distinction this function
+  exists to make.
+
+`gro-backlog-ab.sh` now opens and closes with `gro=$(bs_gro_effective ...)` and
+`xdp=$(bs_xdp_mode ...)` instead of the feature bit.
+
+#### A better argument for W0041, found on the way
+
+The elided path is the safe one. `netif_rx()` delivers to the per-CPU backlog,
+and the backlog NAPI's kthread **is** bound to its CPU: `backlog_napi_setup()`
+at `net/core/dev.c:12287` does `napi->thread = this_cpu_read(backlog_napi)`,
+where `backlog_napi` is an `smp_hotplug_thread` with `thread_comm
+"backlog_napi/%u"` - one thread per CPU, bound by the hotplug machinery.
+
+**The kernel already does exactly what W0041 asks, for its own per-CPU NAPI.**
+That is the strongest available argument that gro_cells' unbound threads are an
+oversight rather than a design decision, and it is what the upstream posting
+should lead with: not "here is a race", but "the one other per-CPU NAPI in the
+tree is CPU-bound, and this one was missed."
+
+### 23.23 gro_cells is the wrong abstraction for this driver, and what to do about it - 2026-09-14
+
+The question is whether 991 can be made to work correctly threaded as well as
+unthreaded. It can, but not by fixing how it uses gro_cells. **It uses gro_cells
+correctly. gro_cells is the wrong tool for a driver shaped like this one**, and
+replacing it with a single driver-owned NAPI fixes threading by construction and
+drops the dependency on W0041 landing upstream.
+
+#### One producer CPU, `nr_cpu_ids` cells
+
+gro_cells splits a queue per CPU because its intended users cannot predict which
+CPU a packet will arrive on. vxlan, geneve, IPsec and `ip_tunnel` all receive
+from *some other device's* NAPI - whichever hardware queue of the underlying NIC
+got the frame - so the producer CPU varies per packet and per-CPU cells are what
+keep those producers off each other.
+
+`mhi_wwan_mbim` is not shaped like that. The chain is fixed at every link:
+
+- MHI dispatches downlink work with `tasklet_schedule(&mhi_event->task)` -
+  `drivers/bus/mhi/host/main.c:475` - one tasklet per event ring, and this link
+  has one event ring.
+- `__tasklet_schedule_common()` at `kernel/softirq.c:744` enqueues onto
+  `this_cpu_ptr(headp)` and calls `raise_softirq_irqoff()`, so the tasklet runs
+  on the CPU that scheduled it, which is the CPU that took the MHI interrupt.
+- Every MHI interrupt on this board lands on **CPU 0**, measured, regardless of
+  the `smp_affinity` mask - the `MSI_FLAG_NO_AFFINITY` behaviour W0001 rests on.
+
+So `gro_cells_init()` allocates one cell per possible CPU and exactly one of them
+is ever used. The second cell on this dual-core SoC has never held a packet.
+
+What the unused half costs is not memory. It is that `gro_cells_init()` puts a
+NAPI per possible CPU onto `dev->napi_list` (`gro_cells.c:78`, `:85`), and those
+extra NAPIs are the entire reason `/sys/class/net/wwan0/threaded` is unsafe:
+`dev_set_threaded()` threads all of them with unbound kthreads, and the cells
+they drain are per-CPU and lockless. 991 pays the hazard of a per-CPU design for
+a workload with one producer CPU.
+
+#### What gro_cells does not do, since the opposite is widely believed
+
+A confident account of this architecture reached me on 2026-09-14 claiming that
+gro_cells "uses a hashing or steering mechanism to instantly distribute these
+SKBs across the system's per-CPU software queues", and that threading `wwan0`
+moves the MBIM de-aggregation into the kthread. Both are false here, and if
+either were true the section above would be wrong - so they are worth nailing
+down rather than waving away.
+
+**gro_cells performs no steering of any kind.** The only CPU selection in its
+receive path is `gro_cells.c:28`:
+
+```c
+cell = this_cpu_ptr(gcells->cells);
+```
+
+The other two per-CPU references in the file, `:78` and `:113`, are
+`gro_cells_init()` and `gro_cells_destroy()` walking every cell to create and
+tear them down. There is no hash, no `get_rps_cpu()`, no `smp_processor_id()`
+arithmetic, nothing that could place a packet on another CPU's queue. "Per-CPU"
+in gro_cells means *producers on different CPUs do not contend with each other*.
+It does not mean work is spread. Every packet arriving on CPU 0 queues to CPU 0's
+cell and is polled on CPU 0.
+
+**The MBIM unpacking is not in a NAPI poll, and threading cannot move it.**
+`napi_struct` appears **zero** times in `drivers/net/wwan/mhi_wwan_mbim.c` and
+zero times in `drivers/net/mhi_net.c`; there is no custom poll function in either.
+De-aggregation is `mhi_mbim_rx()` at `:255`, called from `:456` inside
+`mhi_mbim_dl_callback()` at `:423`, which is registered as `.dl_xfer_cb` at
+`:658` and runs in MHI's tasklet. Writing 1 to `threaded` threads the gro_cells
+polls, which sit *downstream* of the unpacking. The unpacking stays exactly where
+it was, on the CPU that took the interrupt.
+
+**What actually spreads receive work across cores here is RPS.**
+`get_rps_cpu()` is called from `netif_rx_internal()` (`net/core/dev.c:5313`) and
+from `netif_receive_skb_list_internal()` (`:6019`). GRO's completed output
+flushes into the latter at `:6081`, so RPS applies *after* GRO merging on the
+gro_cells path, and directly on the `netif_rx()` path. This box already runs it:
+`packet_steering=2` with every interface at `rps_cpus 3`.
+
+So the ledger for 991 is smaller than the story suggests, and still worth having:
+**gro_cells buys exactly one thing, a NAPI context in which `napi_gro_receive()`
+is legal for a driver that owns no NAPI.** Stock had no GRO at all. The
+distribution, the parallelism and the threaded unpacking are not happening.
+
+The account is not nonsense - it is an accurate description of a different
+machine. A tunnel riding a multiqueue NIC, or rmnet on a host with several
+receive queues, genuinely does have a varying producer CPU, and there the
+per-CPU cells do exactly the job described. The error is transplanting that onto
+a single-event-ring MHI link whose producer never varies.
+
+#### The replacement: one driver-owned NAPI
+
+This is the shape every ordinary driver uses, and it is what 991 should have
+done:
+
+- `netif_napi_add(ndev, &link->napi, mhi_mbim_poll)` and `napi_enable()` in
+  `ndo_init`, where `gro_cells_init()` is today; `napi_disable()` and
+  `netif_napi_del()` in `ndo_uninit`, where `gro_cells_destroy()` is. 991 already
+  got that lifetime pairing right and the reasoning carries over unchanged.
+- A driver-owned `struct sk_buff_head` drained by the poll, enqueued with the
+  **locked** `skb_queue_tail()` and dequeued with `skb_dequeue()` - not the `__`
+  variants. Producer and consumer may legitimately be on different CPUs once the
+  poll can run in a kthread, so the queue has to carry its own lock. This is
+  exactly what `f8e8f97c11d5` (Dumazet, 2013) had in gro_cells before the lock
+  was dropped.
+- The DL callback de-aggregates as it does now, queues each datagram, and calls
+  `napi_schedule(&link->napi)` **unconditionally** rather than on a queue-length
+  edge. The 0-to-1 re-arm in `gro_cells_receive()` is the design detail that
+  makes a single missed poll permanent; `napi_schedule()` is idempotent through
+  `napi_schedule_prep()`, so calling it every time is both correct and cheap.
+- `mhi_mbim_poll()` drains up to `budget` with `napi_gro_receive()` - the same
+  call `gro_cell_poll()` makes, so GRO itself is unchanged - then
+  `napi_complete_done()`.
+
+#### What that buys
+
+- **Threaded NAPI becomes correct by construction.** One NAPI is serialised
+  against itself by the SCHED bit, the queue carries its own lock, and the
+  kthread may run anywhere. W0002 becomes measurable rather than destructive, and
+  W0001 becomes meaningful.
+- **No dependency on W0041.** That patch stays worth posting for the eight
+  upstream gro_cells users, but this tree stops waiting on it.
+- **Fewer NAPIs**: one per link instead of one per possible CPU.
+- **Better degradation under generic XDP.** Today a skb-mode attach sends every
+  datagram to `netif_rx()`, which is the whole pre-991 path. With a driver NAPI,
+  `napi_gro_receive()` still runs and only the merging is skipped, because
+  `netif_elide_gro()` is tested inside `dev_gro_receive()` at `gro.c:488` rather
+  than at the delivery call. The `ethtool -K wwan0 gro off` kill switch keeps
+  working through the same test.
+- **992 is barely touched.** It hooks `mhi_mbim_rx()` before delivery; only the
+  final `gro_cells_receive()` call becomes a queue-and-schedule.
+
+#### What it costs, stated before it is measured
+
+A spinlock per datagram on enqueue. `skb_queue_tail()` takes `list->lock` with
+interrupts saved, and at roughly 21 datagrams per 32KB NTB that is 21
+uncontended lock round-trips per transfer where there are currently none. I
+expect that to be lost in the noise on a path that currently walks
+conntrack per datagram, but **that is a prediction and it has not been
+measured.** The A/B is the same rig 23.19 used.
+
+If it does show, the next step is a `ptr_ring` rather than an `sk_buff_head` -
+what `tun.c` does for the same reason - at the cost of a fixed ring size that
+has to be chosen and a good deal more code.
+
+#### The tier above, named but not recommended
+
+The full conversion is to make the MHI event ring itself the NAPI: disable the
+event tasklet while the poll runs and process completions from `mhi_mbim_poll()`
+under a real budget. That is what would deliver IRQ coalescing,
+`napi_defer_hard_irqs` and `gro_flush_timeout` - the knobs that would actually
+move the latency number this box is short on.
+
+It is not the next step, because the MHI core does not export the hooks for it.
+`main.c:475` schedules the tasklet unconditionally and there is no
+poll-or-disable interface for an event ring; `mhi_poll_reg_field()` is a
+register-polling helper and unrelated. Getting there means changing
+`drivers/bus/mhi/host`, which is a much larger upstream conversation than a
+driver-local NAPI, and it should not be started before the driver-local version
+has shown what the ceiling is.
+
+#### Where this leaves the work
+
+- **W0042** is the 991 rewrite: replace gro_cells with a driver-owned NAPI.
+- **W0041** stays open and stays worth posting, on the strength of
+  `backlog_napi_setup()` binding the kernel's own per-CPU NAPI thread while
+  gro_cells' are left unbound. It is no longer blocking anything here.
+- **W0002 stays blocked until W0042 lands.** The answer to "attempt it again" is
+  still no; what changed is that there is now a way to make the answer yes.
+
+### 23.24 The GRO feature bit is on by default and means nothing, and one real lever falls out of that - 2026-09-14
+
+A second-hand account arrived claiming that "every standard virtual netdevice
+natively supports software GRO by default", that `ethtool -k wwan0` showing
+`generic-receive-offload: on` proves it, and that this is "an undisputed, proven
+fact" for cellular interfaces. The observation is right and the conclusion is
+backwards, for the same reason my own `bs_gro()` was wrong in 23.22.
+
+#### The bit is set by the core, for every netdev, always
+
+`register_netdevice()` at `net/core/dev.c:10575`:
+
+```c
+dev->hw_features |= (NETIF_F_SOFT_FEATURES | NETIF_F_SOFT_FEATURES_OFF);
+dev->features    |= NETIF_F_SOFT_FEATURES;
+```
+
+and `NETIF_F_SOFT_FEATURES` is `(NETIF_F_GSO | NETIF_F_GRO)`
+(`include/linux/netdev_features.h:237`). No driver involvement at all - which is
+why stock `mhi_wwan_mbim.c` contains **zero** lines mentioning `features` and
+still reports `generic-receive-offload: on`.
+
+#### The bit does not make GRO happen
+
+GRO exists in exactly one place: inside `napi_gro_receive()`. A driver that calls
+`netif_rx()` never goes near it. The path is
+
+```
+netif_rx() -> netif_rx_internal() -> enqueue_to_backlog()
+           -> process_backlog()  -> __netif_receive_skb()
+```
+
+and `process_backlog()` contains **zero** occurrences of the string `gro`. It
+dequeues from `sd->process_queue` and calls `__netif_receive_skb()` directly.
+
+So on a stock kernel `ethtool -k wwan0` says GRO is on and **not one packet is
+ever aggregated**. That is the entire reason 991 exists, and this tree already
+recorded it: "GR01 x NW2, unpatched - inert. The feature bit is settable and does
+nothing."
+
+I have no standing to be smug about this. `bs_gro()` read the same bit and drew
+the same unwarranted conclusion, in this document, two sections ago.
+
+#### What that account gets right, which is not nothing
+
+- **"Cellular drivers push data up via `netif_rx()` or simple tasklets."**
+  Correct: `mhi_wwan_mbim.c:348` is `netif_rx()`, `mhi_net.c:228` is
+  `__netif_rx()`.
+- **"`echo 1 > threaded` does nothing; there is no low-level driver kthread."**
+  Correct **for stock**, and it is the same provenance point 23.22 makes from the
+  other direction: an empty `dev->napi_list` means `dev_set_threaded()` creates
+  no threads. It is wrong for this tree, because 991 put per-CPU gro_cells NAPIs
+  on that list. It also does not "throw an error" - it returns 0 and does
+  nothing.
+- **`rx-udp-gro-forwarding` and `rx-gro-list` are real.**
+  `NETIF_F_GRO_UDP_FWD_BIT` at `netdev_features.h:86` and
+  `NETIF_F_GRO_FRAGLIST_BIT` at `:83`, both listed in
+  `NETIF_F_SOFT_FEATURES_OFF` (`:240`), so the core exposes them in `hw_features`
+  and leaves them off.
+
+#### One claim that is overstated rather than wrong
+
+"Historically, GRO only worked for packets destined for the router itself." That
+is true of **UDP only**. `net/ipv4/udp_offload.c:654`:
+
+```c
+if ((!sk && (skb->dev->features & NETIF_F_GRO_UDP_FWD)) ||
+    (sk && udp_test_bit(GRO_ENABLED, sk)) || NAPI_GRO_CB(skb)->is_flist)
+        return call_gro_receive(udp_gro_receive_segment, head, skb);
+goto out;   /* no GRO */
+```
+
+`!sk` is the forwarded case - no local socket - and without the feature bit it
+falls through to no GRO. TCP has no such gate: `NETIF_F_GRO_UDP_FWD` appears zero
+times in `net/ipv4/tcp_offload.c` and `net/core/gro.c`. Forwarded TCP has always
+been aggregated on ingress and re-segmented by GSO on egress.
+
+#### W0043: the lever this leaves behind
+
+`rx-udp-gro-forwarding` is inert on the interface class it is usually
+recommended for, because those drivers have no GRO to forward. **On this box it
+is not inert, because 991 supplied the NAPI context.** That makes it the first
+zero-risk thing to try in a while:
+
+```sh
+ethtool -K wwan0 rx-udp-gro-forwarding on
+```
+
+- Runtime only, `ethtool -K`, reversible with `off`, no reboot, and unlike
+  `threaded` it cannot wedge the receive path.
+- It helps only UDP the router **forwards** rather than terminates - WireGuard,
+  QUIC and other tunnelled transit. Traffic to the router itself already had GRO
+  through the `sk && udp_test_bit(GRO_ENABLED, sk)` arm.
+- The `rx-gro-list off` half of the usual recipe is a no-op here:
+  `NETIF_F_GRO_FRAGLIST` is in `NETIF_F_SOFT_FEATURES_OFF` and is already off
+  unless something turned it on.
+- **Unmeasured.** Worth an A/B on the same rig as 23.19 before it is believed,
+  and worth checking how much of this link's traffic is forwarded UDP at all
+  before expecting much - 23.11 established the family split, not the protocol
+  mix.
