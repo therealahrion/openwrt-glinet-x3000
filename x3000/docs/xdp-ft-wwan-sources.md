@@ -66,7 +66,7 @@ the current program's labels. Update both places together:
 
 ```
 99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c  bpf/xdp_ft_probe.bpf
-f8684e26d7d2009f981083d401d1aa6ff3d8e9515242b87e136fee1aba023b1d  bpf/xdp_ft_wwan.bpf
+557f1559a0bbeb001a043b4d8c185248b2ee913696202368ca7936ee7442f6f4  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the three programs do
@@ -315,8 +315,16 @@ on this box is `FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
 
 ### The scope was wrong for this link, and the fix was the easier program
 
-Measured 2026-09-14, and it caps everything the IPv4-only revision could ever
-have shown: **this WAN is 464XLAT and IPv4 is 0.8% of its traffic.**
+> **Correction, 2026-09-14.** "IPv4 is 0.8% of its traffic" was one window of
+> one workload. Later windows on the same box measured 99.99% IPv4 and 99.7%
+> IPv6 within the hour, with two independent instruments agreeing in a paired
+> window. The 464XLAT topology below stands; the ratio does not. Both families
+> were still the right build, for a better reason: **a single-family program
+> measures nothing about the other half, and which half is live changes with
+> the workload.** See `xdp-methods-tested.md` 23.13.
+
+Measured 2026-09-14: **this WAN is 464XLAT, and in one speedtest window IPv4
+was 0.8% of its traffic.**
 
 `wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1` — the RFC 7335
 service-continuity prefix — and there is no `nat46` module, `clatd` or separate
@@ -472,11 +480,24 @@ are gathered before anything is written* above.
 
 Still open, in order of how much they matter:
 
-- **The rewrite has never executed.** Not once, in either family. `not_direct`
-  accounts for every hit, so the dry run has never reached the commit stage and
-  the checksum arithmetic has been through a compiler and nothing else.
-- **`XMIT_DIRECT` is unreachable while the kfunc works** — see *Why nothing is
-  XMIT_DIRECT* above. That is the blocker, and it is not an IPv4 or IPv6
-  question.
-- **The IPv6 dry run has never been run.** It is the first window on this link
-  that will measure the traffic that is actually there rather than 0.8% of it.
+- **`would_redirect` is non-zero for the first time, and is not yet
+  trustworthy.** 221258 packets, 48% of an IPv6 window. The same window read
+  `tuple.dir` back as 2 or 3 on 41–50% of its lookups, which the kernel cannot
+  hold — `dir` is written once at `nf_flow_table_core.c:27` and then used as a
+  `container_of` index, so a 2 or 3 would fault the kernel before this program
+  saw it. Since `dir` selects the container walk and the NAT peer fields, a read
+  wrong half the time is not reliably right the rest of it. This revision adds
+  the counters that discriminate the candidates — `l3_ok`/`iif_ok` checked
+  against the packet, and `xmit_type` read from the same byte as the bad `dir`.
+  Nothing about the redirect should be believed until they come back.
+- **`XMIT_DIRECT` is reachable after all** — the claim above that it is not is
+  retracted; see `xdp-methods-tested.md` 23.13. The hardware-offload route at
+  `:168` is still closed by construction, but the `DEV_PATH_BRIDGE` route at
+  `:154` is open.
+- **Three variables move together** between the windows that redirect and the
+  ones that do not: address family, wired against WiFi, and which bridge port
+  the flow uses. One at a time will separate them; asserting the family
+  explanation now would repeat the mistake the 0.8% figure made.
+- **The rewrite has never executed.** Not once, in either family, so the
+  checksum arithmetic has been through a compiler and a disassembler and
+  nothing else.

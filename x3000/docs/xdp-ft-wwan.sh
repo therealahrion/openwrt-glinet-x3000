@@ -44,7 +44,7 @@ case "${1:-check}" in
 dryrun)
 	OBJNAME=xdp_ft_wwan.bpf
 	PROGNAME=xdp_ft_dryrun
-	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect"
+	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other"
 	;;
 *)
 	OBJNAME=xdp_ft_probe.bpf
@@ -92,7 +92,7 @@ BPF_DIR=${BPF_DIR:-$_here/bpf}
 # are the same values and are updated together.
 case "$OBJNAME" in
 xdp_ft_wwan.bpf)
-	WANT_SHA=f8684e26d7d2009f981083d401d1aa6ff3d8e9515242b87e136fee1aba023b1d ;;
+	WANT_SHA=557f1559a0bbeb001a043b4d8c185248b2ee913696202368ca7936ee7442f6f4 ;;
 xdp_ft_probe.bpf)
 	WANT_SHA=99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c ;;
 *)	WANT_SHA= ;;
@@ -267,7 +267,11 @@ legend() {
 		say "                  a connection terminating ON this router never"
 		say "                  enters the flowtable at all"
 		say "  hit             it did"
-		say "  bad_dir         tuple.dir outside 0..1, which should never happen"
+		say "  dir2, dir3      tuple.dir read back as 2 or 3. The kernel writes"
+		say "                  dir once and then uses it as a container_of index,"
+		say "                  so a value outside 0..1 would fault the kernel"
+		say "                  before this program saw it. Non-zero here means"
+		say "                  THIS program is misreading it, not the kernel"
 		say "  torn_down       the flow is being retired"
 		say "  not_direct      xmit_type is not DIRECT - NEIGH needs a lookup this"
 		say "                  program cannot do, so those stay on the stack"
@@ -278,7 +282,19 @@ legend() {
 		say "  no_headroom     unused in a dry run"
 		say "  redirect        unused in a dry run"
 		say ""
-		say "  v4, v6 and nat66 are observations, not exits. They describe the"
+		say "  Diagnostics for dir2/dir3, all observations:"
+		say "  l3_ok/l3_bad    tuple.l3proto agrees with the packet's own family"
+		say "  iif_ok/iif_bad  tuple.iifidx equals the ingress ifindex"
+		say "                  Both are plain scalar reads beside the bitfield."
+		say "                  Both ok means the pointer and offsets are right"
+		say "                  and only the bitfield extraction is wrong; either"
+		say "                  bad means the matched tuple is not the one asked"
+		say "                  for and every value read through it is void,"
+		say "                  would_redirect included"
+		say "  baddir_xmit_*   xmit_type read from the SAME byte as the bad dir."
+		say "                  Still reading DIRECT means the byte is intact"
+		say ""
+		say "  v4, v6, nat66 and the diagnostics are observations, not exits. They describe the"
 		say "  window rather than accounting for it, and they do not sum with"
 		say "  the rest: every packet counted in v4 or v6 is counted again in"
 		say "  whichever exit it took."
@@ -311,15 +327,16 @@ legend() {
 }
 
 # `status` has no way of knowing which program left the map behind, and naming
-# twenty slots with the probe's ten labels would print confident nonsense. The
-# map itself says which: the probe declares ten entries, the dry run twenty.
+# twenty-seven slots with the probe's ten labels would print confident nonsense.
+# The map itself says which: the probe declares ten entries, the dry run
+# twenty-seven.
 adopt_slots_from_map() {
 	ents=$(bpftool map show pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null \
 	       | sed -n 's/.*max_entries \([0-9][0-9]*\).*/\1/p' | head -1)
 	case "${ents:-}" in
-	20)
+	27)
 		PROGNAME=xdp_ft_dryrun
-		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect"
+		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit dir2 dir3 torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect l3_ok l3_bad iif_ok iif_bad baddir_xmit_direct baddir_xmit_other"
 		;;
 	10)
 		PROGNAME=xdp_ft_probe
@@ -480,10 +497,22 @@ dump() {
 detach() {
 	# Both modes: a program attached in skb mode is not cleared by `xdp off`
 	# alone. Same pair cleanup() in verify-992a.sh removes.
-	"$IP" link set dev "$IFACE" xdp off 2>/dev/null || true
-	"$IP" link set dev "$IFACE" xdpgeneric off 2>/dev/null || true
+	unhook
 	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 	say "detached and unpinned"
+}
+
+# Taking the program off the interface is separate from unpinning the map,
+# because the sample has to stop before the counters are read. Dumping while
+# still attached let a packet bump hit after that slot had been read and bump
+# its exit slot before that one was, so the exits came to 39 more than the hits
+# in one window - small, but it is the kind of discrepancy that gets blamed on
+# the program.
+unhook() {
+	# Both modes: a program attached in skb mode is not cleared by `xdp off`
+	# alone. Same pair cleanup() in verify-992a.sh removes.
+	"$IP" link set dev "$IFACE" xdp off 2>/dev/null || true
+	"$IP" link set dev "$IFACE" xdpgeneric off 2>/dev/null || true
 }
 
 # An interrupt during the sample would otherwise leave a program attached to
@@ -499,6 +528,9 @@ probe|dryrun)
 	RX0=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
 	sleep "$SECS"
 	RX1=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
+	# Stop counting before reading the counters, or the map is dumped under
+	# live traffic and the slots are read at different instants.
+	unhook
 	# Never let a failed read abort the branch: set -e would take the script
 	# out before detach, leaving a program attached to the WAN interface.
 	dump || true

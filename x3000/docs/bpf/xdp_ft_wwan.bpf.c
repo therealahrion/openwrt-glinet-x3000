@@ -271,7 +271,8 @@ enum stat_slot {
 	ST_TCP_TEARDOWN,
 	ST_MISS,
 	ST_HIT,
-	ST_BAD_DIR,
+	ST_DIR2,		/* dir read back as 2 - impossible, see below */
+	ST_DIR3,		/* dir read back as 3 - impossible, see below */
 	ST_TORN_DOWN,
 	ST_NOT_DIRECT,
 	ST_NO_OUT_IFIDX,
@@ -280,6 +281,44 @@ enum stat_slot {
 	ST_WOULD_REDIRECT,
 	ST_NO_HEADROOM,
 	ST_REDIRECT,
+
+	/* Diagnostics for an impossible result, measured 2026-09-14: on two
+	 * IPv6 windows, 41% and 50% of successful lookups read tuple.dir back
+	 * as 2 or 3. The kernel writes dir exactly once
+	 * (nf_flow_table_core.c:27) and flow_offload_lookup() then uses it as
+	 * a container_of index (nf_flow_table_core.c), so a value outside 0..1
+	 * would compute a wild pointer inside the kernel long before this
+	 * program saw it. The kernel does not fault, so the kernel's value is
+	 * 0 or 1 and this program's read of it is wrong.
+	 *
+	 * Two candidates fit and each predicts something the data denies, so
+	 * rather than pick one these slots separate them by measurement:
+	 *
+	 *   l3_ok / l3_bad     l3proto and the packet's own family agree
+	 *   iif_ok / iif_bad   tuple.iifidx equals ctx->ingress_ifindex
+	 *
+	 * Both are ordinary FIELD_BYTE_OFFSET reads of plain scalars sitting
+	 * beside the bitfield, and that relocation class is already proven
+	 * good here. If they agree with the packet, the pointer and the
+	 * offsets are right and the fault is in the bitfield extraction
+	 * alone. If they disagree, th itself is not what it should be and
+	 * every value read through it - would_redirect included - is void.
+	 *
+	 *   baddir_xmit_direct / baddir_xmit_other
+	 *
+	 * dir and xmit_type occupy the same byte. Reading xmit_type on the
+	 * packets whose dir was impossible says whether that byte is intact:
+	 * a byte that still yields DIRECT is not corrupt, and only the
+	 * two-bit extraction is at fault.
+	 *
+	 * These are diagnostics and come out once the answer is in.
+	 */
+	ST_L3_OK,
+	ST_L3_BAD,
+	ST_IIF_OK,
+	ST_IIF_BAD,
+	ST_BADDIR_XMIT_DIRECT,
+	ST_BADDIR_XMIT_OTHER,
 	ST__MAX,
 };
 
@@ -708,9 +747,37 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 	}
 	bump(ST_HIT);
 
+	/* Two invariants the matched tuple must satisfy, read as plain scalars
+	 * rather than bitfields. See the diagnostic block in enum stat_slot.
+	 * The lookup key carries both values, so a tuplehash that came back
+	 * disagreeing with either is not the one that was asked for.
+	 */
+	{
+		__u32 iif = 0;
+		__u8 l3 = 0;
+
+		if (bpf_core_read(&l3, sizeof(l3), &th->tuple.l3proto))
+			bump(ST_L3_BAD);
+		else
+			bump(l3 == p->family ? ST_L3_OK : ST_L3_BAD);
+
+		if (bpf_core_read(&iif, sizeof(iif), &th->tuple.iifidx))
+			bump(ST_IIF_BAD);
+		else
+			bump(iif == ctx->ingress_ifindex ? ST_IIF_OK : ST_IIF_BAD);
+	}
+
 	d->dir = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, dir);
 	if (d->dir > FLOW_OFFLOAD_DIR_REPLY) {
-		bump(ST_BAD_DIR);
+		/* dir is two bits, so this is 2 or 3 and nothing else. Read
+		 * xmit_type out of the same byte before giving up: it says
+		 * whether the byte is intact.
+		 */
+		__u8 x = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, xmit_type);
+
+		bump(x == FLOW_OFFLOAD_XMIT_DIRECT ? ST_BADDIR_XMIT_DIRECT
+						   : ST_BADDIR_XMIT_OTHER);
+		bump(d->dir == 2 ? ST_DIR2 : ST_DIR3);
 		return -1;
 	}
 

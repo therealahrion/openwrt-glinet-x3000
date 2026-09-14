@@ -2356,7 +2356,15 @@ flow there are no MAC addresses in the tuple to build a header from. 16.5 did
 not check which arm was populated, and neither did I until the dry run counted
 it.
 
-### 23.3 Why nothing is ever XMIT_DIRECT here
+### 23.3 Why nothing was ever XMIT_DIRECT here
+
+> **Retracted in part, 2026-09-14 - see 23.13.** The general claim, "every flow
+> on this box is `FLOW_OFFLOAD_XMIT_NEIGH`", is false. A dry run over IPv6
+> traffic from a WiFi client measured 221258 packets reaching `XMIT_DIRECT`.
+> What survives is the specific reading of `:168` below: the hardware-offload
+> route to `XMIT_DIRECT` is closed here by construction. The `DEV_PATH_BRIDGE`
+> route at `:154` is open, and 23.8 was right that the flowtable device list
+> was what closed it.
 
 `nft_dev_path_info()` sets it in exactly two places:
 
@@ -2612,10 +2620,17 @@ recorded the configuration they ran under:
   everywhere, LRO off, `gro_max_size` at the 65536 default,
   `netdev_max_backlog` at the 1000 default.
 
-### 23.11 This link is 464XLAT, and IPv4 is 0.8% of it
+### 23.11 This link is 464XLAT, and one window measured IPv4 at 0.8% of it
 
-The single most important fact about this WAN, and it was not in any document
-until now.
+> **The headline figure is retracted, 2026-09-14 - see 23.13.** 0.8% was one
+> window of one workload, not a property of the link. Later windows on the same
+> box within the hour measured 99.99% IPv4 and 99.7% IPv6. Everything below
+> about the 464XLAT topology and the DNS64 evidence stands; any claim that this
+> link *has* a family ratio does not. The heading said "IPv4 is 0.8% of it" and
+> has been changed to say which window.
+
+The 464XLAT topology is the single most important fact about this WAN, and it
+was not in any document until now.
 
 `wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1`. That is the
 RFC 7335 IPv4 Service Continuity prefix - the standard CLAT address in a
@@ -2877,3 +2892,135 @@ Not verified, and this is the whole of it:
    IPv4 traffic.
 3. Only if `would_redirect` is non-zero does anything about the fastpath matter.
    If it is still 0, the blocker is 23.3 and no amount of program work moves it.
+
+### 23.13 Four windows, one retraction, one impossible counter - 2026-09-14
+
+The both-families build ran on the box. Four windows, and they overturn two
+things this document asserted. The numbers are recorded here as data; the one
+that needs an explanation does not get a guess.
+
+| | W1 LAN | W2 LAN paired | W3 WiFi | W4 WiFi |
+|---|---|---|---|---|
+| `seen` | 136164 | 134850 | 456861 | 103562 |
+| `v4` | 136163 | 134842 | 1510 | 872 |
+| `v6` | 1 | 8 | 455351 | 102690 |
+| `hit` | 134792 | 133378 | 447488 | 102435 |
+| `not_direct` | - | - | 934 | 214 |
+| `bad_dir` | - | - | 225163 | 42043 |
+| **`would_redirect`** | - | - | **221258** | **60217** |
+
+W1 and W2 are probe windows, so they carry no decision counters.
+
+#### The family ratio is a property of the workload, not the link
+
+23.11 recorded 0.8% IPv4 and reversed this program's scope on it. W1 and W2
+measured 99.99% **IPv4** on the same box. Both are right about their own window
+and neither describes "the link".
+
+W2 settles that it is not an instrument artefact, by running both instruments
+over the same thirty seconds:
+
+| | IPv4 | IPv6 |
+|---|---|---|
+| probe, wire packets on `wwan0` | 134842 | 8 |
+| `InReceives`, host-wide, post-GRO | 4414 | 14 |
+
+They agree on the family. So 23.11's window genuinely carried IPv6 - a speedtest
+to a dual-stack host - and W1/W2 genuinely carried IPv4. What changes between
+them is what the clients were doing.
+
+Two things fall out of that paired window:
+
+- **GRO on `wwan0` aggregates at least 30x.** 134842 wire packets became 4414
+  IP-layer receives. At least, because `InReceives` is host-wide and counts
+  LAN-side receives too, which inflates the denominator. That is most of the 63x
+  anomaly 23.11 flagged and left unexplained, now measured per-family instead of
+  inferred across both.
+- **`Ip6InReceives` is the wrong instrument for a WAN family mix.** 14 IPv6
+  receives against 8 wire packets on `wwan0`: the excess is LAN-side chatter.
+  `boxstate.sh mix` reads it host-wide and will overstate IPv6 whenever WAN IPv6
+  is low.
+
+**So building both families was right for a different reason than the one
+given.** Not "IPv4 is 0.8%" but: a single-family program measures nothing about
+the other half, and which half is live changes with the workload. Two windows,
+two opposite answers, is the whole argument.
+
+#### XMIT_DIRECT is reachable, and 23.3's general claim is false
+
+`would_redirect` has been 0 in every previous run. W3 and W4 put it at 221258
+and 60217 - 48% and 58% of what was seen. The `DEV_PATH_BRIDGE` route at
+`nft_flow_offload.c:154` is open, which is what 23.8 predicted when it withdrew
+the closure and named the flowtable device list as the suspect.
+
+**Three variables move together between the windows that redirect and the ones
+that do not**, and no measurement yet separates them:
+
+| | W1/W2 | W3/W4 |
+|---|---|---|
+| family | IPv4 | IPv6 |
+| client | wired LAN | WiFi |
+| bridge port | `eth1` | `phy0-ap0` / `phy1-ap0` |
+
+"IPv6 flows are DIRECT" fits. So does "flows created after the ports were added
+are DIRECT", and so does "some bridge ports are in the flowtable list and others
+are not" - the additions were made live with `nft` and do not survive
+`fw4 reload`. One variable at a time will sort it; asserting the family
+explanation now would be the same mistake as 23.11.
+
+#### An impossible counter, and why it is not being explained yet
+
+`bad_dir` counts lookups whose `tuple.dir` read back outside 0..1. It was 41%
+and 50% of hits in the two IPv6 windows.
+
+That value cannot exist in the kernel. `dir` is written in exactly one place,
+`nf_flow_table_core.c:27`, only ever 0 or 1, and `flow_offload_lookup()` then
+uses it as a `container_of` index. A 2 or a 3 there would compute a wild pointer
+inside the kernel on the way to returning the tuplehash. The kernel does not
+fault. **So the kernel's value is fine and this program's read of it is wrong.**
+
+It matters because `dir` selects the `container_of` walk and the NAT peer
+fields. A read that is wrong 41% of the time is not reliably right the other
+59%; it is landing on a legal value. **So `would_redirect` is not yet a number
+to trust**, and the first non-zero redirect count this program has ever produced
+has to be treated as provisional.
+
+Two mechanisms fit the generated code and each predicts something the data
+denies:
+
+- *The eight-byte bitfield probe read lands in the trailing union rather than on
+  the bitfield byte.* For an `XMIT_NEIGH` flow the union holds a kernel pointer,
+  so `dir` would come back effectively random - but W1's IPv4 traffic is almost
+  entirely `NEIGH` and its `bad_dir` is 0.05%, not 50%.
+- *The read is correct and something else is at fault.* Then the IPv6 windows
+  have no explanation at all.
+
+41% in one window and 50% in another also rules out a fixed mis-shift, which
+would be constant.
+
+Naming a third candidate would not be thoroughness. The build now carries the
+measurement that discriminates instead:
+
+| slot | what it settles |
+|---|---|
+| `dir2` / `dir3` | a constant wrong value means something different from a varying one |
+| `l3_ok` / `l3_bad` | `tuple.l3proto` against the packet's own family |
+| `iif_ok` / `iif_bad` | `tuple.iifidx` against `ctx->ingress_ifindex` |
+| `baddir_xmit_direct` / `baddir_xmit_other` | `xmit_type`, read from the **same byte** as the bad `dir` |
+
+`l3proto` and `iifidx` are plain scalars beside the bitfield, read through the
+`FIELD_BYTE_OFFSET` relocation class already proven good here, and both are part
+of the lookup key - so a tuplehash that comes back disagreeing with either is
+not the one that was asked for. Both agreeing means the pointer and the offsets
+are right and the fault is in the two-bit extraction alone. Either disagreeing
+means `th` is not what it should be and every value read through it is void,
+`would_redirect` included.
+
+#### A harness defect the same windows exposed
+
+W4's exit counters summed to 39 more than its hits, where every earlier window
+closed exactly. The cause is in the harness, not the program: `dump` ran while
+the program was still attached, so a packet arriving mid-dump could bump `hit`
+after that slot had been read and bump its exit slot before that one was. Small,
+and it is exactly the kind of discrepancy that gets blamed on the program.
+`unhook` is now split out of `detach` and runs before the dump.
