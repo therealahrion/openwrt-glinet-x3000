@@ -4,6 +4,14 @@
 #
 #   sh gro-backlog-ab.sh              the backlog sweep
 #   sh gro-backlog-ab.sh --threaded   and a threaded-NAPI window
+#   sh gro-backlog-ab.sh --baseline   one window at the current settings,
+#                                     changing nothing
+#
+# --baseline exists to answer a different question from the sweep: whether this
+# box has CPU headroom left at link rate. If it does, then shortening the
+# per-packet forwarding path - which is all an XDP fast path can do here - buys
+# no throughput, and the only thing left to win is latency. It writes no sysctl
+# and restores nothing because it changes nothing.
 #
 # Three load-matched windows under the same sustained download:
 #   backlog-1000   GRO on, netdev_max_backlog at its default
@@ -76,6 +84,24 @@ trap 'say ""; say "interrupted - restoring"; cleanup; exit 130' INT TERM
 # either, leaving the other counter flat.
 in4() { awk '/^Ip:/{ if(h==""){ for(i=1;i<=NF;i++) if($i=="InReceives") c=i; h=1; next } print $c+0 }' /proc/net/snmp; }
 in6() { awk '/^Ip6InReceives/{print $2+0}' /proc/net/snmp6 2>/dev/null || echo 0; }
+
+# /proc/stat per-CPU: user nice system idle iowait irq softirq steal ...
+# Echoes total, idle and softirq jiffies summed across CPUs.
+#
+# Indicative only, and deliberately labelled as such in the output. This box has
+# already cost three withdrawn per-packet figures because /proc/stat does not
+# conserve time here, so it is read as "is there obvious headroom" and never as a
+# per-packet cost. The trustworthy saturation signal in the same window is
+# time_squeeze, which is a count rather than a time: NAPI increments it when it
+# exhausts its poll budget, so a flat time_squeeze under a saturating load means
+# the receive path is not running out of cycles.
+cpu() {
+	awk '/^cpu[0-9]/ {
+		t = 0
+		for (i = 2; i <= NF; i++) t += $i
+		tot += t; idle += $5 + $6; sirq += $8
+	} END { print tot+0, idle+0, sirq+0 }' /proc/stat
+}
 
 # softnet_stat is hex, one row per CPU: processed, dropped, time_squeeze, ...
 sq() {
@@ -156,6 +182,7 @@ meas() {
 	_e0=$(cat /sys/class/net/$WANIF/statistics/rx_errors)
 	_i0=$(( $(in4) + $(in6) ))
 	_q0=$(sq)
+	_c0=$(cpu)
 
 	sleep "$WINDOW"
 
@@ -165,9 +192,12 @@ meas() {
 	_e1=$(cat /sys/class/net/$WANIF/statistics/rx_errors)
 	_i1=$(( $(in4) + $(in6) ))
 	_q1=$(sq)
+	_c1=$(cpu)
 
 	set -- $_q0; _sd0=$1; _ss0=$2
 	set -- $_q1; _sd1=$1; _ss1=$2
+	set -- $_c0; _ct0=$1; _ci0=$2; _cs0=$3
+	set -- $_c1; _ct1=$1; _ci1=$2; _cs1=$3
 
 	_rtt=$(awk -F'=' '/round-trip|rtt/{print $2}' /tmp/.gro_ab_ping 2>/dev/null | tr -d ' ')
 	_loss=$(awk '/packet loss/{for(i=1;i<=NF;i++) if($i ~ /%$/){print $i; exit}}' /tmp/.gro_ab_ping 2>/dev/null)
@@ -178,11 +208,14 @@ meas() {
 	    -v dp=$((_p1-_p0)) -v ds=$((_i1-_i0)) -v db=$((_b1-_b0)) \
 	    -v dd=$((_r1-_r0)) -v de=$((_e1-_e0)) \
 	    -v sd=$((_sd1-_sd0)) -v ss=$((_ss1-_ss0)) \
-	    -v rtt="$_rtt" -v loss="$_loss" 'BEGIN{
+	    -v rtt="$_rtt" -v loss="$_loss" \
+	    -v ct=$((_ct1-_ct0)) -v ci=$((_ci1-_ci0)) -v cs=$((_cs1-_cs0)) 'BEGIN{
 		if (ds<=0 || dp<=0) { printf "%-12s no traffic in the window\n", lab; exit }
 		printf "%-12s %6.1f Mbit/s %6d dgram/s %6d skb/s  agg=%5.2fx\n", lab, db*8/w/1000000, dp/w, ds/w, dp/ds
 		printf "%-12s rx_dropped=%-5d softnet_dropped=%-5d time_squeeze=%-4d rx_errors=%d\n", "", dd, sd, ss, de
 		printf "%-12s bytes/skb=%-6d  rtt=%s  ping loss=%s\n", "", db/ds, rtt, loss
+		if (ct > 0)
+			printf "%-12s cpu busy=%.0f%% softirq=%.0f%% (indicative - /proc/stat does not conserve here;\n%-12s time_squeeze above is the count that does)\n", "", (ct-ci)*100/ct, cs*100/ct, ""
 		if (dp < ds)
 		    printf "%-12s ** fewer datagrams than delivered skbs: InReceives is system-wide, so this ratio is not about this interface **\n", ""
 		if (db/ds > 65536)
@@ -194,6 +227,21 @@ meas() {
 # ---- run ------------------------------------------------------------------
 start_load
 say ""
+
+# One window, current settings, nothing written and nothing to restore. The
+# question it answers is whether there is CPU headroom at link rate, so it wants
+# the link saturated - keep STREAMS where the sweep has it and shorten WINDOW if
+# the cellular data matters.
+if [ "$1" = --baseline ]; then
+	meas "baseline"
+	cleanup
+	say "Read it this way:"
+	say "  time_squeeze 0 under a saturating window means NAPI never ran out of"
+	say "  poll budget, so the receive path is not short of cycles and a shorter"
+	say "  per-packet path cannot buy throughput. rtt under load is then the only"
+	say "  thing left for one to improve."
+	exit 0
+fi
 
 for B in 1000 2000 4000; do
 	sysctl -w net.core.netdev_max_backlog=$B >/dev/null

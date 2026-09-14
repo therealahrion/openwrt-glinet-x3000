@@ -53,7 +53,7 @@ sha256 of the committed objects:
 
 ```
 c4371b7a76baf9e6eb99bad111cdbb64b416bbcf701f71eaf30fb61bbc276602  bpf/xdp_ft_probe.bpf
-6b725e40f94f42c240c9ffce522951f314d15e3f5f2d1f73de3d91dd8f2f3a7e  bpf/xdp_ft_wwan.bpf
+d667bb5d327078f90aa99d8d253b92a3654841c6db5cc0e9c4e78e75faaacb52  bpf/xdp_ft_wwan.bpf
 ```
 
 ## What the two programs do
@@ -81,6 +81,14 @@ require risking a connection.
 The two share one `decide()` function rather than two copies of the same logic,
 and the counters are bumped inside it, so the dry run and the real path cannot
 drift into measuring different things.
+
+**Every rejection has its own counter, and that is not cosmetic.** An earlier
+revision pooled six parse failures into one `parse_skip` slot. A window then
+returned 145880 of 146062 in that slot and it took a full cycle to work out the
+traffic had been IPv6 — a `not_ipv4` counter would have said so on sight. The
+parser now returns the slot that rejected the packet and the caller bumps it, so
+seventeen slots account for every packet and any window that measured the wrong
+thing says which wrong thing it measured.
 
 **Reads are gathered before anything is written.** Every read through the flow is
 a probe read of a computed address and can fail. `decide()` reads all of them,
@@ -266,8 +274,103 @@ the first pair it compared. `struct flow_offload_tuple_rhash` measures 88 bytes
 in the kernel's own BTF, which is what the local mirror computes, so the old
 `sizeof()` was right — it is now relocated rather than merely lucky.
 
-**Next is the dry run, not the rewrite.** `xdp-ft-wwan.sh dryrun` attaches
-`xdp_ft_dryrun`, which decides everything and writes nothing. The NAT rewrite in
+**The dry run says the rewrite would never fire. Not rarely — never.** One
+30-second sample, 236046 packets:
+
+| counter | value | |
+|---|---|---|
+| `seen` | 236046 | equal to the `rx_packets` delta |
+| `hit` | 233120 | 98.8% |
+| `miss` | 2784 | |
+| `parse_skip` | 142 | |
+| `torn_down` | 27 | |
+| `not_direct` | 233093 | **every hit that was not torn down** |
+| `would_redirect` | **0** | |
+
+142 + 2784 + 27 + 233093 = 236046, so every packet is accounted for. Every flow
+on this box is `FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
+
+### The scope is wrong for this link, and the fix is the easier program
+
+Measured 2026-09-14, and it caps everything below: **this WAN is 464XLAT and
+IPv4 is 0.8% of its traffic.**
+
+`wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1` - the RFC 7335
+service-continuity prefix - and there is no `nat46` module, `clatd` or separate
+device, so the CLAT is inside the modem. Linux sees genuine IPv4 and the program
+is on the right interface. There is simply almost none of it: the carrier
+resolvers do DNS64, so every dual-stack client picks IPv6 for everything. Over a
+30-second speedtest, 44 IPv4 `InReceives` against 5329 IPv6.
+
+So this object, working perfectly, reaches under one percent of the link.
+
+The correction is cheaper than the original: `bpf_xdp_flow_lookup()` already has
+a `case AF_INET6:` arm filling `src_v6`/`dst_v6`, so the lookup needs no kernel
+change, and native IPv6 has no NAT - the entire address-and-port rewrite and all
+of its checksum arithmetic disappear. Decrement `hop_limit`, build L2, redirect.
+The single failure mode that can silently break a connection is not present in
+the v6 version.
+
+### Three windows that measured nothing, and what they cost
+
+Worth recording, because each failure mode is a live trap for anyone repeating
+this and none of them announced themselves:
+
+| window | what it showed | why it was worthless |
+|---|---|---|
+| dry run after adding `eth1` | `parse_skip` 145880 of 146062 | the download resolved AAAA. This program is IPv4-only, so every packet failed the version nibble before the flowtable was ever consulted |
+| `curl -4` on the router | 66108 `lookup_err` of 66114 IPv4 packets | `curl` ran *on the box*, so the connections terminated locally. The flowtable only ever holds **forwarded** flows, so it correctly knew none of them |
+| both of the above | `hit` 6 and 16 | with the flow table empty of the traffic, `not_direct` had nothing to count |
+
+The preconditions a valid window needs, in order: **IPv4** (or `not_ipv4`
+dominates), **forwarded through the box** (or `miss` dominates), and **flows
+created after any flowtable change** (the route is computed once, at flow
+creation). The legend in `xdp-ft-wwan.sh` now states all three.
+
+### Why nothing is XMIT_DIRECT, and it is structural
+
+`nft_dev_path_info()` sets `FLOW_OFFLOAD_XMIT_DIRECT` in exactly two places:
+
+- `case DEV_PATH_BRIDGE` (`nft_flow_offload.c:154`) — the forward-path walk has
+  to cross a bridge, and `nft_dev_forward_path()` then requires the device it
+  lands on to be one `nft_flowtable_find_dev()` finds in the flowtable's own
+  hook list (`:202`), or it returns before copying any MAC.
+- `nf_flowtable_hw_offload(flowtable) && nft_is_valid_ether_device(...)`
+  (`:168`) — **which requires hardware offload to be on.**
+
+The second is closed by construction here. Hardware offload has to stay *off* for
+any of this to work, because `nf_flow_table_offload_setup()` only populates the
+XDP hashtable while it is off (`nf_flow_table_offload.c:1258`) — the sixth line
+of this script's own preflight. The setting that makes the kfunc answer is the
+setting that forecloses `XMIT_DIRECT`. Section 10.2 recorded hardware offload and
+the kfunc as mutually exclusive; this is a second and sharper edge of the same
+blade, and it was not visible until the dry run measured it.
+
+The upload direction cannot reach the first route either: the walk starts at
+`dst_cache->dev`, which for a LAN-to-WAN flow is `wwan0`, and
+`nft_is_valid_ether_device()` rejects it outright — `ARPHRD_RAWIP`, not
+`ARPHRD_ETHER`, with no `ETH_ALEN` address. That direction is not what this
+program handles, but it explains why nothing in the table is ever direct.
+
+### What would make it fire
+
+`bpf_fib_lookup()` is available to XDP (`xdp_func_proto`,
+`bpf_xdp_fib_lookup_proto`) and returns `ifindex`, `smac` and `dmac` on
+`BPF_FIB_LKUP_RET_SUCCESS`. It is what the in-tree `xdp_fwd` sample uses, and it
+resolves exactly what `XMIT_NEIGH` means the kernel has not cached.
+
+That gives a design with no `XMIT_DIRECT` dependency at all: use the flowtable
+for the one thing only it can provide, the NAT translation, and `bpf_fib_lookup()`
+for the egress device and the MAC addresses. The lookup has to run on the
+*translated* addresses, so the order is flow lookup, NAT, FIB lookup, build L2,
+redirect.
+
+**Whether it is worth building is a separate question, and the dry run argues
+both ways.** A 98.8% flowtable hit rate means the software flow offload is
+already doing its job on nearly every packet. What an XDP program can save on top
+of that is the netfilter ingress dispatch and `nf_flow_offload_ip_hook()`'s own
+work — real, but modest — against a FIB lookup it has to pay for and the qdisc
+bypass it cannot avoid. That trade has not been measured. The NAT rewrite in
 particular has been through a compiler and nothing else. A wrong checksum shows
 up as clients losing connectivity, so `probe` comes first and `off` stays to
 hand.

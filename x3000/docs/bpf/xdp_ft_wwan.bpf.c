@@ -42,6 +42,23 @@
  *
  * IPv4 only, deliberately: the rewrite for v6 is a different function and
  * getting one right is worth more than getting two nearly right.
+ *
+ * That decision was sound and, on this link, it picked the wrong family.
+ * Measured 2026-09-14: this WAN is 464XLAT with the CLAT inside the modem, the
+ * carrier resolvers do DNS64, and every dual-stack client therefore chooses
+ * IPv6. Over a 30-second speedtest IPv4 was 44 of 5373 IP-layer receives -
+ * 0.8%. So this program, working perfectly, would accelerate under one percent
+ * of what crosses the link.
+ *
+ * The v6 version is also the easier one, which is the part that makes this
+ * worth fixing rather than regretting. bpf_xdp_flow_lookup() already has a
+ * case AF_INET6 arm filling src_v6/dst_v6, so the lookup needs no change; and
+ * native IPv6 has no NAT, so the whole address and port rewrite below - and
+ * every checksum it has to repair - simply does not exist. Decrement
+ * hop_limit, build L2, redirect. The one failure mode that can silently break
+ * a user's connections is absent from it.
+ *
+ * See xdp-methods-tested.md section 23.11.
  */
 
 #define BPF_NO_KFUNC_PROTOTYPES
@@ -176,12 +193,22 @@ struct flow_offload_tuple_rhash___local *
 bpf_xdp_flow_lookup(struct xdp_md *, struct bpf_fib_lookup *,
 		    struct bpf_flowtable_opts___local *, __u32) __ksym;
 
-/* Every exit the decision path can take gets a slot, so a dry run accounts for
- * all of seen rather than leaving a remainder to guess at.
+/* Every exit the decision path can take gets its own slot, so a dry run
+ * accounts for all of seen rather than leaving a remainder to guess at.
+ *
+ * The parse failures are split rather than pooled, and that is not cosmetic: a
+ * run where the traffic turned out to be IPv6 showed 145880 of 146062 in a
+ * single parse_skip slot and took a whole cycle to diagnose, when a not_ipv4
+ * counter would have said so on sight.
  */
 enum stat_slot {
 	ST_SEEN = 0,
-	ST_PARSE_SKIP,
+	ST_NOT_IPV4,
+	ST_FRAG_OR_OPTS,
+	ST_NOT_TCP_UDP,
+	ST_SHORT,
+	ST_LOW_TTL,
+	ST_TCP_TEARDOWN,
 	ST_MISS,
 	ST_HIT,
 	ST_BAD_DIR,
@@ -247,6 +274,9 @@ struct parsed {
 };
 
 /* Parse a raw-IP packet at ctx->data. Returns 0 on "worth looking up". */
+/* Returns 0, or the counter slot naming which check rejected the packet. The
+ * caller bumps it, so every rejection is attributable rather than pooled.
+ */
 static __always_inline int parse_rawip(struct xdp_md *ctx, struct parsed *p)
 {
 	void *data_end = (void *)(long)ctx->data_end;
@@ -255,29 +285,31 @@ static __always_inline int parse_rawip(struct xdp_md *ctx, struct parsed *p)
 	struct ports_ *ports;
 
 	if ((void *)(iph + 1) > data_end)
-		return -1;
+		return ST_SHORT;
 
-	/* Raw IP: the version nibble is the only thing identifying the family. */
+	/* Raw IP: the version nibble is the only thing identifying the family.
+	 * This is the counter that says a window measured IPv6 and nothing else.
+	 */
 	if ((iph->ihl_version >> 4) != 4)
-		return -1;
+		return ST_NOT_IPV4;
 
 	/* Options change the L4 offset; the flowtable declines these too. */
 	if ((iph->ihl_version & 0x0f) != 5)
-		return -1;
+		return ST_FRAG_OR_OPTS;
 
 	if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
-		return -1;
+		return ST_FRAG_OR_OPTS;
 
 	/* Forwarding decrements; 1 would have to become 0. */
 	if (iph->ttl <= 1)
-		return -1;
+		return ST_LOW_TTL;
 
 	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-		return -1;
+		return ST_NOT_TCP_UDP;
 
 	ports = (struct ports_ *)(iph + 1);
 	if ((void *)(ports + 1) > data_end)
-		return -1;
+		return ST_SHORT;
 
 	p->iph = iph;
 	p->ports = ports;
@@ -369,9 +401,11 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 	struct flow_offload___local *flow;
 	__u8 xmit;
 	__u32 hsz;
+	int rc;
 
-	if (parse_rawip(ctx, p)) {
-		bump(ST_PARSE_SKIP);
+	rc = parse_rawip(ctx, p);
+	if (rc) {
+		bump(rc);
 		return -1;
 	}
 
@@ -383,9 +417,12 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 	if (p->iph->protocol == IPPROTO_TCP) {
 		__u8 *flagsb = (__u8 *)p->ports + 13;
 
-		if ((void *)(flagsb + 1) > p->data_end ||
-		    (*flagsb & 0x05)) {		/* FIN | RST */
-			bump(ST_PARSE_SKIP);
+		if ((void *)(flagsb + 1) > p->data_end) {
+			bump(ST_SHORT);
+			return -1;
+		}
+		if (*flagsb & 0x05) {		/* FIN | RST */
+			bump(ST_TCP_TEARDOWN);
 			return -1;
 		}
 	}
@@ -589,11 +626,13 @@ int xdp_ft_probe(struct xdp_md *ctx)
 {
 	struct flow_offload_tuple_rhash___local *th;
 	struct parsed p;
+	int rc;
 
 	bump(ST_SEEN);
 
-	if (parse_rawip(ctx, &p)) {
-		bump(ST_PARSE_SKIP);
+	rc = parse_rawip(ctx, &p);
+	if (rc) {
+		bump(rc);
 		return XDP_PASS;
 	}
 

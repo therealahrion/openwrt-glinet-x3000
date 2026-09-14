@@ -482,6 +482,14 @@ ports advertise `NDO_XMIT` and `NDO_XMIT_SG` as well, so `eth1 -> eth0` XDP
 forwarding works today and `eth1 -> wwan0` returns `-EOPNOTSUPP`. Closing that
 would mean adding `ndo_xdp_xmit` to `mhi_wwan_mbim` - see section 13.
 
+> **Corrected, 2026-09-14.** That gate is the native and devmap path only. A
+> generic-mode redirect by ifindex never reaches `devmap.c`:
+> `xdp_do_generic_redirect()` (`filter.c:4533`) applies only
+> `xdp_ok_fwd_dev()` (`:4554`) - `IFF_UP` and the MTU - then calls
+> `generic_xdp_tx()`. The core does not refuse `wwan0` or an AP netdev as a
+> generic redirect target. Whether `mbim_tx_fixup()` copes with the skb is a
+> different question, and untested. See 23.7.
+
 ### 9.4 The XDP gates on `mtk_eth_soc`, and why none of them bite here
 
     mtk_page_pool_enabled(eth)  ->  mtk_is_netsys_v2_or_greater(eth)
@@ -1309,6 +1317,14 @@ flow up, and the port where it can look a flow up cannot run early. And every
 packet that matters on this box crosses `wwan0`.
 
 ### 16.5 What survives, and it is not nothing
+
+> **Built and measured, 2026-09-14; still open.** See section 23. The lookup
+> works - 98.8% hit on `wwan0`. The redirect fires on nothing, because every
+> flow here is `FLOW_OFFLOAD_XMIT_NEIGH` and the `tuple.out` MAC addresses this
+> design reads exist only for `XMIT_DIRECT`. The gate analysis below is correct
+> as far as it goes; it does not check which arm of the union is populated,
+> which is what decides it. Whether that is fixable is an open question with a
+> named suspect - see 23.8.
 
 **Shape A - wwan0 ingress to eth1 or an AP netdev, using `bpf_xdp_flow_lookup()`.**
 Needs no kernel patch. Every gate is already satisfied:
@@ -2276,3 +2292,397 @@ skb mode here.
   `[PATCH net]` for the use-after-free fix currently bundled in 991, then
   `[PATCH net-next 1/2]` gro_cells and `[PATCH net-next 2/2]` the XDP hook. See
   `992-upstream-submission.md`, section 2 onward.
+
+## 23. Shape A built, run, and closed - 2026-09-14
+
+Section 16.5 named Shape A as the one result on this box buildable with no
+kernel patch, and 16.6 asked for a measurement to decide it. Both halves are now
+answered. The lookup works better than 16.5 assumed. The redirect fires on
+nothing at all, and the reason is structural rather than a bug in the program.
+
+Built as `x3000/docs/bpf/xdp_ft_wwan.bpf.c` with three programs - a counting
+probe, a dry run that decides everything and writes nothing, and the fastpath -
+driven by `x3000/docs/xdp-ft-wwan.sh`.
+
+### 23.1 The kfunc works on a raw-IP interface
+
+One 30-second sample on `wwan0` with a download in flight:
+
+| counter | value | |
+|---|---|---|
+| `seen` | 26043 | equal to the `rx_packets` delta, exactly |
+| `hit` | 25619 | 98.37% |
+| `lookup_err` | 423 | 1.62% |
+| `not_ipv4` | 1 | |
+
+25619 + 423 + 1 = 26043, so every packet is accounted for. `seen` matching the
+driver counter exactly means the program sits in front of the whole receive
+path rather than a sample of it. This is what 16.5 asserted from the gates and
+nobody had run: `bpf_xdp_flow_lookup()` resolves on a raw-IP modem interface.
+
+One correction to the probe's own counters. The split between "miss" and
+"lookup error" is not real: `bpf_xdp_flow_tuple_lookup()` returns
+`ERR_PTR(-ENOENT)` when `flow_offload_lookup()` finds nothing
+(`nf_flow_table_bpf.c:49`) and the caller sets `opts->error` from it (`:96`), so
+an ordinary miss sets the error too. The 423 are flow misses.
+
+### 23.2 The redirect fires on nothing
+
+The dry run decides everything the fastpath would - direction, container walk,
+flags, teardown, `xmit_type`, egress ifindex, both NAT values - counts what it
+would have done, and returns `XDP_PASS` without writing a byte. 236046 packets:
+
+| counter | value |
+|---|---|
+| `seen` | 236046 |
+| `hit` | 233120 (98.8%) |
+| `miss` | 2784 |
+| `parse_skip` | 142 |
+| `torn_down` | 27 |
+| `not_direct` | **233093** |
+| `would_redirect` | **0** |
+
+142 + 2784 + 27 + 233093 = 236046. Every flow on this box is
+`FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
+
+That is fatal to Shape A as 16.5 specified it, because the specification reads
+"builds an Ethernet header itself from `tuple.out.h_source` / `h_dest`" - and
+`tuple.out` is the union arm that only exists for `XMIT_DIRECT`. For a `NEIGH`
+flow there are no MAC addresses in the tuple to build a header from. 16.5 did
+not check which arm was populated, and neither did I until the dry run counted
+it.
+
+### 23.3 Why nothing is ever XMIT_DIRECT here
+
+`nft_dev_path_info()` sets it in exactly two places:
+
+- `case DEV_PATH_BRIDGE` (`nft_flow_offload.c:154`). The forward-path walk has
+  to cross a bridge, and `nft_dev_forward_path()` then requires the device it
+  lands on to be one `nft_flowtable_find_dev()` finds in the flowtable's own
+  hook list (`:202`), or it returns before copying any MAC.
+- `nf_flowtable_hw_offload(flowtable) && nft_is_valid_ether_device(...)`
+  (`:168`) - **which requires hardware offload to be on.**
+
+The second is closed by construction here, and this is the part worth carrying
+forward. Hardware offload has to stay *off* or
+`nf_flow_table_offload_setup()` never takes the `nf_flow_offload_xdp_setup()`
+branch (`nf_flow_table_offload.c:1258`) and the per-device XDP hashtable is
+never populated - so every lookup returns `-ENOENT`. **The setting that makes
+the kfunc answer is the setting that forecloses `XMIT_DIRECT`.** Section 10.2
+recorded hardware offload and the kfunc as mutually exclusive; this is a second
+and sharper edge of the same blade, and it was invisible until something ran the
+decision path and counted.
+
+The upload direction cannot reach the first route either: the walk starts at
+`dst_cache->dev`, which for a LAN-to-WAN flow is `wwan0`, and
+`nft_is_valid_ether_device()` rejects it at `:60` - `ARPHRD_RAWIP`, not
+`ARPHRD_ETHER`, with no `ETH_ALEN` address.
+
+### 23.4 What would make it fire, and why that is not worth taking
+
+`bpf_fib_lookup()` is available to XDP (`xdp_func_proto`,
+`bpf_xdp_fib_lookup_proto`) and returns `ifindex`, `smac` and `dmac` on
+`BPF_FIB_LKUP_RET_SUCCESS`. It resolves precisely what `XMIT_NEIGH` means the
+kernel has not cached. That gives a design with no `XMIT_DIRECT` dependency:
+use the flowtable for the one thing only it provides, the NAT translation, and
+resolve L2 in the program, as the in-tree `xdp_fwd` sample does.
+
+It is not worth building, and section 14.3 already said why: this router is not
+CPU-bound and will not be on this WAN. A fast path that shortens the per-packet
+forwarding cost is attacking a resource that is three quarters idle. 23.6 covers
+the independent confirmation.
+
+And 17.2 is the other half: any flow taking an XDP redirect leaves the ingress
+shaper and the egress qdisc behind, on exactly the link that needs the AQM. So
+the redesign would buy a resource this box has spare, at the cost of the one it
+does not.
+
+### 23.5 Two techniques worth keeping
+
+Both came out of getting the fastpath to load, and both generalise beyond it.
+
+**A CO-RE type-id relocation cannot resolve against a type defined in more than
+one loaded BTF; a field or size relocation can.** The fastpath was rejected with
+
+```
+libbpf: relo #7: relocation decision ambiguity: success 90056 != success 90242
+```
+
+from `relo_core.c:1369`. `struct flow_offload` is defined in four loaded BTFs
+here - measured with `bpftool btf dump`: `nf_flow_table`,
+`nf_flow_table_inet`, `nf_tables` and `nft_flow_offload`. libbpf compares
+candidates on `bit_offset` first (`:1361`), and identical definitions agree
+there, so every `FIELD_*` relocation resolved; but a BTF type id is an index
+into one particular BTF, so the candidates can never agree. Dumping the
+object's `.BTF.ext` showed 28 relocations, exactly one of them
+`TYPE_ID_TARGET`, and it was relo #7:
+`bpf_core_type_id_kernel(struct flow_offload)`, the second argument to
+`bpf_rdonly_cast()`.
+
+The cast was unnecessary. Nothing dereferenced the pointer - every read went
+through `bpf_core_read()`, which is `bpf_probe_read_kernel()` and takes an
+arbitrary kernel address, reachable from XDP under `CAP_PERFMON`
+(`helpers.c:1892`, `:2017`). Removing it left 27 relocations, all `FIELD_*`.
+Where a size is needed, `bpf_core_type_size()` is safe for the same reason the
+field relocations are: its value comes from the layout, which every candidate
+agrees on, not from an index.
+
+**`container_of()` has to be written as a branch with constant offsets, not as
+arithmetic on an index.** `th - dir * sizeof(tuplehash)` compiles to
+`r1 *= -88`, and the verifier cannot carry a bound through a multiply by a
+negative constant - a register known to hold 0..3 came back with `smin` at
+`S64_MIN`, which `check_reg_sane_offset()` (`verifier.c:12895`, message at
+`:12916`) rejects. The same function explicitly permits a known constant offset,
+negative included, so one branch per direction passes. The `dir <= 1` test three
+instructions earlier does not help: llvm applies it to a copy of the register,
+and the masking in between breaks the link back to the original.
+
+### 23.6 What is new, and what only confirmed what this document had
+
+Worth separating, because two of the four things I set out as findings were
+already recorded here and I re-derived them.
+
+**New:**
+
+- The kfunc hits on `wwan0`, measured - 23.1.
+- Every flow is `XMIT_NEIGH`, so Shape A as specified redirects nothing - 23.2.
+- The hardware-offload trap that makes `XMIT_DIRECT` unreachable while the
+  kfunc is usable - 23.3.
+- Both relocation and verifier techniques - 23.5.
+- A correction to 9.3, below.
+
+**Already here, and re-derived:**
+
+- *The qdisc bypass.* 17.2 documents it in more depth than I reached,
+  including the kernel's own comment at `dev.c:5231` and the
+  `sch_handle_ingress()` gap. 16.5 already carried the pointer: "It *does*
+skip the egress qdisc, which
+  is not a bonus; see section 17.2."
+- *This box is not CPU-bound.* 14.3 measured it on 2026-09-10 across four
+  alternating 60-second legs at roughly 250 Mbps, and concluded CPU0 would not
+  saturate until near 1 Gbps. I re-measured it with one 12-second window at
+  103.8 Mbps and reached the same answer.
+
+The re-measurement is not worthless, and the reason is specific: 14.3 carries
+an instrument warning because its figures come from `/proc/stat`, which 18.3
+showed does not conserve time on this box. My window read `time_squeeze` from
+`/proc/net/softnet_stat` instead - a count, not a time, incremented when NAPI
+exhausts its poll budget - and it stayed at 0 with `rx_dropped` and
+`softnet_dropped` also 0 at 23% busy. That is an independent confirmation using
+an instrument that does not share the discredited one's failure mode. The
+conclusion of 14.3 stands on firmer ground than it did, which is the only thing
+the re-derivation bought.
+
+What it did not buy was time. Both facts were in this file before I started, and
+reading 14.3 and 17.2 first would have made 23.4 a paragraph rather than a
+measurement.
+
+### 23.7 Correction to 9.3
+
+9.3 says nothing can redirect *into* `wwan0`, citing the
+`NETDEV_XDP_ACT_NDO_XMIT` gate at `devmap.c:488`. That is true of the native and
+devmap paths and not of the generic one. A generic-mode program redirecting by
+ifindex never reaches devmap: `xdp_do_generic_redirect()` (`filter.c:4533`)
+applies only `xdp_ok_fwd_dev()` (`:4554`), which checks `IFF_UP` and the MTU,
+then calls `generic_xdp_tx()`. So the core does not refuse `wwan0` or an AP
+netdev as a generic redirect target.
+
+That is a narrower correction than it sounds. The core permitting the redirect
+says nothing about whether `mbim_tx_fixup()` can do anything sensible with the
+skb it is handed, which is untested. What changes is the reason: "the core
+refuses it" is wrong, and "the driver has never been asked" is right.
+
+### 23.8 Status - open, not closed
+
+An earlier revision of this section closed Shape A. That was wrong twice over
+and is withdrawn.
+
+**It rested on 14.3 and 17.2 being taken as settled the moment they were
+found.** 14.3 carries its own instrument warning: its figures come from
+`/proc/stat`, which 18.3 showed does not conserve time on this box, and its
+headline - CPU0 not saturating until near 1 Gbps - is a linear extrapolation
+from 25.8% at roughly 250 Mbps that nothing has tested. My own window ran at
+103.8 Mbps, less than half that rate, so it corroborates a weaker claim than
+14.3 makes, not the same one. "This box is not CPU-bound" is better supported
+than it was and is still not established at the rates that matter.
+
+**And it rested on an explanation with two candidates and no test.** 23.3 gives
+the hardware-offload trap, which is solid, but it does not explain why the
+*download* direction is `NEIGH`. That direction egresses through `br-lan`, so
+the walk should reach `DEV_PATH_BRIDGE` and set `XMIT_DIRECT` at `:154`. One
+mechanism fits and has not been checked:
+
+`nft_dev_path_info()` sets `info->indev` from the `DEV_PATH_ETHERNET` entry -
+the **physical** LAN port - and `nft_dev_forward_path()` then discards the whole
+result unless `nft_flowtable_find_dev(info.indev, ft)` finds that device in the
+flowtable's own hook list (`:202`). This tree's firewall4 patch
+`001-flowtable-fall-back-to-l3-device` builds that list from **L3 devices**, so
+it holds `br-lan` and `wwan0`. If the physical ports are absent, the walk sets
+`XMIT_DIRECT` and the caller throws it away two lines later.
+
+That is read from source, not measured, and it is settled by one command:
+
+```sh
+nft list ruleset | sed -n '/flowtable/,/}/p'
+```
+
+If `devices` names `br-lan` and `wwan0` rather than `lan1`, `lan2` or `eth1`,
+the hypothesis holds - and the fix is a flowtable device-list change, not a
+kernel patch or the `bpf_fib_lookup()` rewrite. It would also mean the patch
+that put `wwan0` into the list is what took the physical ports out, which is a
+regression this tree owns.
+
+### 23.9 The device list, read - and three windows that measured nothing
+
+**Answered, and the hypothesis holds.** The flowtable device list was:
+
+    devices = { "br-lan", "eth0", "wwan0" }
+
+`eth1` absent, and so are `phy0-ap0` and `phy1-ap0`. Those three are the bridge
+ports - the devices `info->indev` resolves to after the walk - and none of them
+was in the list. So the walk reaches `DEV_PATH_BRIDGE`, sets `XMIT_DIRECT`, and
+`nft_dev_forward_path()` discards the result at `:202` because the device it
+landed on is not one `nft_flowtable_find_dev()` can find.
+
+fw4 builds that list from **zone** devices: the wan zone gives `eth0` and
+`wwan0`, the lan zone gives `br-lan`. A bridge port is not a zone device, so it
+is never a candidate. That is the same gap
+`001-flowtable-fall-back-to-l3-device` already fixed from the other direction -
+and it means this tree's own patch, which added `wwan0` because it had only an
+`l3_device`, sits beside a case nobody looked for.
+
+Worth stating plainly about `br-lan`: it is a real `net_device` - bridge master,
+own ifindex, `ARPHRD_ETHER`, valid MAC - so it is a legitimate entry for hook
+registration, which is the list's first job. The list's second job at `:202` is
+to answer "is the device this packet will physically leave on in here", and the
+answer for a bridged client is always a port, never the bridge. One list, two
+jobs, and `br-lan` can only satisfy the first.
+
+**Three windows measured nothing before one measured this.** Each failure mode
+is a live trap and none announced itself:
+
+| window | what it showed | why it was worthless |
+|---|---|---|
+| dry run after adding `eth1` | `parse_skip` 145880 of 146062 | the download resolved AAAA; this program is IPv4-only |
+| `curl -4` on the router | 66108 `lookup_err` of 66114 | `curl` ran *on the box*, so those connections terminated locally and never entered the flowtable, which only holds forwarded flows |
+| both | `hit` 6 and 16 | with the table empty of the traffic, `not_direct` had nothing to count |
+
+The preconditions, in order: **IPv4**, **forwarded through the box**, and
+**flows created after the flowtable change** - the route is computed once, at
+flow creation, so existing conntrack entries keep their old verdict. The dry
+run's counters now name all three failures separately rather than pooling them
+into one slot, which is what made the first of these take a whole cycle to
+diagnose.
+
+### 23.10 Box state, 2026-09-14, and what it contradicts
+
+Captured with `boxstate.sh`, which exists because none of the windows above
+recorded the configuration they ran under:
+
+- **No shaper on `wwan0`.** `qdisc fq_codel 0: root`, no rate limit, and no
+  ingress qdisc. fq_codel does not shape; it manages a queue that only forms if
+  the bottleneck is local, and on a cellular link it is not. A download's
+  bufferbloat is downstream, which needs ingress shaping through an IFB, and
+  there is none. This tree carries `cake-wan.init` and 55 KB of
+  `qos-latency-research.md`, and **cake is not running**. That is the most
+  likely source of the 33.5 ms average and 124 ms tail in 23.4, and it is a
+  configuration problem rather than a kernel one. It also empties W0006, which
+  exists to preserve cake through an XDP redirect.
+- **`packet_steering` is 2, and every interface reads `rps_cpus 3`** - both
+  CPUs. Section 14.3 records this box as `packet_steering='1'` with
+  `packet-steering.uc` assigning `wwan0` to CPU1. The configuration has changed
+  since that measurement, so 14.3's legs were taken under a steering setup this
+  box no longer runs.
+- **Every MHI interrupt lands on CPU0 despite an affinity mask of `3`** - irq 90
+  at 94895/0, irq 91 at 114834/0. The mask permits both CPUs and the hardware
+  uses one. That is a *measured* confirmation of the `MSI_FLAG_NO_AFFINITY`
+  behaviour W0001 rests on, which had been read from source only. It also fixes
+  what W0001 actually does: `threadirqs` works because it turns the handler into
+  a schedulable thread, not because it moves an interrupt. Rewriting the mask
+  alone would do nothing.
+- **`irqbalance` is running**, managing those masks live. Any IRQ-placement
+  test has to account for it or it will be fought mid-window.
+- **`eth0` is down.** The wired WAN is inert, so its flowtable entry does
+  nothing and every wired result on this box is `eth1` only.
+- **`threaded=0` on every interface**, so W0002 is not applied. GRO on
+  everywhere, LRO off, `gro_max_size` at the 65536 default,
+  `netdev_max_backlog` at the 1000 default.
+
+### 23.11 This link is 464XLAT, and IPv4 is 0.8% of it
+
+The single most important fact about this WAN, and it was not in any document
+until now.
+
+`wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1`. That is the
+RFC 7335 IPv4 Service Continuity prefix - the standard CLAT address in a
+464XLAT deployment. There is no `nat46` module, no `clatd`, no separate
+interface: **the CLAT is inside the modem**. Linux hands IPv4 to `192.0.0.1`
+and the RM520N translates it to IPv6 before it goes over the air.
+
+So the XDP program is on the right interface and sees genuine IPv4 for IPv4
+flows. That part is fine.
+
+The resolvers are `192.0.0.30` and `fd00:976a::9`, carrier DNS doing **DNS64**.
+Confirmed by decoding an answer: `ipv4.download.thinkbroadband.com`, a host
+whose entire naming convention promises IPv4-only, resolved to
+`2607:7700:0:40::50f9:6394` - and the low 32 bits of that address are
+`0x50f9:0x6394` = `80.249.99.148`, its own A record. The prefix is the NAT64
+prefix and the address is synthesized.
+
+The consequence is that every dual-stack-capable client picks IPv6 for
+essentially everything. Measured over a 30-second speedtest:
+
+| | |
+|---|---|
+| `wwan0` rx_packets | 340418 |
+| IPv4 `InReceives` | 44 |
+| IPv6 `Ip6InReceives` | 5329 |
+| **IPv4 share** | **0.8%** |
+
+**This caps W0038 at under one percent of traffic**, independently of every
+other blocker. The program is IPv4-only by an explicit decision in its own
+header - "the rewrite for v6 is a different function and getting one right is
+worth more than getting two nearly right" - which was a reasonable call made
+without knowing the link is 464XLAT with DNS64. On this network it is backwards.
+
+Two things make the correction cheap rather than costly:
+
+- **The kfunc already handles IPv6.** `bpf_xdp_flow_lookup()` has a
+  `case AF_INET6:` arm filling `src_v6`/`dst_v6` (`nf_flow_table_bpf.c`). Same
+  lookup, no kernel change.
+- **The IPv6 fast path is simpler, not harder.** Native IPv6 has no NAT, so the
+  address and port rewrite and all of its checksum arithmetic disappear.
+  Decrement `hop_limit`, build L2, redirect. The single most dangerous part of
+  the IPv4 program - a wrong checksum silently breaking connections - does not
+  exist in the v6 version.
+
+One anomaly recorded and deliberately not chased: 340418 raw datagrams against
+5373 IP-layer receives is about 63x aggregation, where MTU-sized packets into a
+65536-byte `gro_max_size` would cap near 43x. That implies a mean datagram
+around 1040 bytes, which is small for a speedtest. It does not affect the
+family ratio, since both families take the same path, but it is unexplained and
+it bears on the GRO work rather than on this section.
+
+**Open questions, in the order they should be answered:**
+
+0. Should the program be made IPv6-capable before anything else? On the measured
+   mix, every other question here is about 0.8% of the traffic.
+1. Does adding the three bridge ports produce `XMIT_DIRECT` on a forwarded IPv4
+   download? The device list now reads
+   `br-lan, eth0, eth1, phy0-ap0, phy1-ap0, wwan0`; the window needs a LAN
+   client, not this router.
+2. Why is cake not running on `wwan0`, and what does
+   `qos-latency-research.md` already conclude about it? This is the only
+   genuinely poor measurement on the box and it is not an XDP question.
+3. Independently of Shape A: is 14.3 still true at the rates this link reaches,
+   and under the steering this box actually runs today?
+   A saturating window with `time_squeeze` - a count, not a `/proc/stat` time -
+   is the instrument 18.3 says to use, and nothing has run one at ~277 Mbps.
+
+**What is settled:** the lookup half, at 98.8% hit, and both techniques in 23.5.
+Any future program wanting NAT state for a modem flow can have it.
+
+The harness stays: `xdp-ft-wwan.sh check | probe | dryrun | status | off`. The
+dry run in particular is worth reusing - it decides everything and writes
+nothing, so the next idea of this shape can be costed before it is trusted with
+a packet.

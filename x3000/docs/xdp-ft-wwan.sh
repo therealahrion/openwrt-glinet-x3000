@@ -34,7 +34,7 @@ case "${1:-check}" in
 dryrun)
 	OBJNAME=xdp_ft_wwan.bpf
 	PROGNAME=xdp_ft_dryrun
-	SLOTS="seen parse_skip miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+	SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
 	;;
 *)
 	OBJNAME=xdp_ft_probe.bpf
@@ -196,9 +196,17 @@ legend() {
 	case "$PROGNAME" in
 	xdp_ft_dryrun)
 		say "  seen            packets the program looked at"
-		say "  parse_skip      not IPv4, fragmented, optioned, not TCP/UDP, short,"
-		say "                  or a TCP FIN/RST that has to reach conntrack"
-		say "  miss            the flowtable did not know the flow"
+		say "  not_ipv4        version nibble was not 4. If this dominates, the"
+		say "                  traffic was IPv6 and nothing below it means anything"
+		say "  frag_or_opts    fragmented, or IP options present"
+		say "  not_tcp_udp     another L4 protocol"
+		say "  short           truncated before the ports"
+		say "  low_ttl         ttl 1 - forwarding would take it to 0"
+		say "  tcp_teardown    FIN or RST, which has to reach conntrack"
+		say "  miss            the flowtable did not know the flow. If this"
+		say "                  dominates, the traffic is not being offloaded -"
+		say "                  a connection terminating ON this router never"
+		say "                  enters the flowtable at all"
 		say "  hit             it did"
 		say "  bad_dir         tuple.dir outside 0..1, which should never happen"
 		say "  torn_down       the flow is being retired"
@@ -211,7 +219,10 @@ legend() {
 		say "  redirect        unused in a dry run"
 		say ""
 		say "  would_redirect over seen is the number that decides whether the"
-		say "  rewrite is worth attaching at all."
+		say "  rewrite is worth attaching at all - but only once not_ipv4 and"
+		say "  miss are both small. Three windows were thrown away for want of"
+		say "  that check: two measured IPv6, one measured traffic that"
+		say "  terminated on the router and was never a flowtable candidate."
 		;;
 	*)
 		say "  seen          packets the program looked at"
@@ -231,14 +242,14 @@ legend() {
 
 # `status` has no way of knowing which program left the map behind, and naming
 # twelve slots with the probe's eight labels would print confident nonsense. The
-# map itself says which: the probe declares eight entries, the dry run twelve.
+# map itself says which: the probe declares eight entries, the dry run seventeen.
 adopt_slots_from_map() {
 	ents=$(bpftool map show pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null \
 	       | sed -n 's/.*max_entries \([0-9][0-9]*\).*/\1/p' | head -1)
 	case "${ents:-}" in
-	12)
+	17)
 		PROGNAME=xdp_ft_dryrun
-		SLOTS="seen parse_skip miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+		SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
 		;;
 	8)
 		PROGNAME=xdp_ft_probe
