@@ -2293,7 +2293,10 @@ skb mode here.
   `[PATCH net-next 1/2]` gro_cells and `[PATCH net-next 2/2]` the XDP hook. See
   `992-upstream-submission.md`, section 2 onward.
 
-## 23. Shape A built, run, and closed - 2026-09-14
+## 23. Shape A built and run - open - 2026-09-14
+
+This heading said "and closed" for a revision. 23.8 withdraws that closure and
+the heading now agrees with it.
 
 Section 16.5 named Shape A as the one result on this box buildable with no
 kernel patch, and 16.6 asked for a measurement to decide it. Both halves are now
@@ -2302,7 +2305,8 @@ nothing at all, and the reason is structural rather than a bug in the program.
 
 Built as `x3000/docs/bpf/xdp_ft_wwan.bpf.c` with three programs - a counting
 probe, a dry run that decides everything and writes nothing, and the fastpath -
-driven by `x3000/docs/xdp-ft-wwan.sh`.
+driven by `x3000/docs/xdp-ft-wwan.sh`. 23.12 records the IPv6 arm, which came
+later and corrects two claims made in 23.11.
 
 ### 23.1 The kfunc works on a raw-IP interface
 
@@ -2650,11 +2654,14 @@ Two things make the correction cheap rather than costly:
 - **The kfunc already handles IPv6.** `bpf_xdp_flow_lookup()` has a
   `case AF_INET6:` arm filling `src_v6`/`dst_v6` (`nf_flow_table_bpf.c`). Same
   lookup, no kernel change.
-- **The IPv6 fast path is simpler, not harder.** Native IPv6 has no NAT, so the
-  address and port rewrite and all of its checksum arithmetic disappear.
-  Decrement `hop_limit`, build L2, redirect. The single most dangerous part of
-  the IPv4 program - a wrong checksum silently breaking connections - does not
-  exist in the v6 version.
+- **The IPv6 fast path is simpler, not harder.** ~~Native IPv6 has no NAT, so
+  the address and port rewrite and all of its checksum arithmetic disappear.~~
+  **Wrong, corrected in 23.12:** the flowtable implements NAT66
+  (`nf_flow_snat_ipv6()` at `nf_flow_table_ip.c:516`), so the address and port
+  rewrite is needed and is implemented. What is true is the narrower claim -
+  IPv6 has no *header* checksum and `hop_limit` is not in the L4
+  pseudo-header, so the decrement is bare and only the L4 checksum is ever
+  repaired. Simpler, not absent.
 
 One anomaly recorded and deliberately not chased: 340418 raw datagrams against
 5373 IP-layer receives is about 63x aggregation, where MTU-sized packets into a
@@ -2665,10 +2672,11 @@ it bears on the GRO work rather than on this section.
 
 **Open questions, in the order they should be answered:**
 
-0. Should the program be made IPv6-capable before anything else? On the measured
-   mix, every other question here is about 0.8% of the traffic.
-1. Does adding the three bridge ports produce `XMIT_DIRECT` on a forwarded IPv4
-   download? The device list now reads
+0. ~~Should the program be made IPv6-capable before anything else?~~ **Answered
+   and done - 23.12.** Both programs now parse both families.
+1. Does adding the three bridge ports produce `XMIT_DIRECT` on a forwarded
+   download? This no longer needs manufactured IPv4 traffic: with the v6 arm
+   built, an ordinary download measures it. The device list now reads
    `br-lan, eth0, eth1, phy0-ap0, phy1-ap0, wwan0`; the window needs a LAN
    client, not this router.
 2. Why is cake not running on `wwan0`, and what does
@@ -2686,3 +2694,186 @@ The harness stays: `xdp-ft-wwan.sh check | probe | dryrun | status | off`. The
 dry run in particular is worth reusing - it decides everything and writes
 nothing, so the next idea of this shape can be costed before it is trusted with
 a packet.
+
+### 23.12 The IPv6 arm, built - 2026-09-14
+
+23.11 measured this link as 0.8% IPv4 and named the IPv4-only scope as the
+thing to fix first. Both objects now parse both families. Nothing has been run
+yet: this section records what was built and what building it turned up, and
+`would_redirect` is still 0 for the reason 23.3 gives, which is not a family
+question.
+
+New checksums, and the build reproduces byte for byte with
+`-fdebug-compilation-dir=.`:
+
+```
+99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c  bpf/xdp_ft_probe.bpf
+f8684e26d7d2009f981083d401d1aa6ff3d8e9515242b87e136fee1aba023b1d  bpf/xdp_ft_wwan.bpf
+```
+
+The probe's old object rebuilt to its recorded `c4371b7a...` before the source
+was touched, which is the first end-to-end confirmation that the reproducibility
+claim in `xdp-ft-wwan-sources.md` is true rather than argued.
+
+#### What is cheaper about v6, read from source
+
+- `bpf_xdp_flow_lookup()` already has the family. `case AF_INET6:` fills
+  `src_v6`/`dst_v6` from `fib_tuple->ipv6_src`/`ipv6_dst`
+  (`nf_flow_table_bpf.c:84-88`). No kernel change of any kind.
+- No header checksum. IPv6 has none and `hop_limit` is not covered by the L4
+  pseudo-header, so the kernel decrements it bare at `nf_flow_table_ip.c:682`
+  and so does this program. The v4 arm has to repair `iph->check` after both
+  the address change and the TTL decrement.
+- No extension-header walk to write, because there is none to match.
+  `nf_flow_tuple_ipv6()` switches on `nexthdr` and returns −1 on anything that
+  is not TCP, UDP or GRE (`:593-608`), so a packet behind a hop-by-hop or
+  fragment header is not in the flowtable at all and walking past it could only
+  produce a lookup that cannot hit.
+- The kfunc ignores `tos` and `tot_len` entirely. It builds its
+  `flow_offload_tuple` from `iifidx`, `l3proto`, `l4proto`, the two ports and
+  the addresses (`nf_flow_table_bpf.c:63-92`) and reads neither field.
+  `struct bpf_fib_lookup` is a carrier here, not a FIB request.
+
+#### Correction to 23.11: IPv6 does have NAT here
+
+23.11 said "native IPv6 has no NAT, so the address and port rewrite and all of
+its checksum arithmetic disappear." That is wrong, and it is corrected in place
+above as well as here, because it was the load-bearing reason the v6 arm was
+called the easy one.
+
+The flowtable implements NAT66 for v6 exactly as it does for v4:
+`nf_flow_snat_ipv6()` at `nf_flow_table_ip.c:516`, `nf_flow_dnat_ipv6()` at
+`:539`, both reading the same peer-tuple fields, with
+`inet_proto_csum_replace16()` (`net/core/utils.c`) repairing the L4 checksum
+across four 32-bit words. A program that ignored `NF_FLOW_SNAT` on a v6 flow
+would forward it untranslated - which is a silent wrong-destination bug, not a
+missed optimisation.
+
+The rewrite is implemented. A `nat66` counter records whether it ever fires on
+this box; on a routed prefix it should stay at zero, and now that is a
+measurement rather than an assumption.
+
+What survives of the original claim is the narrower version: **the v6 rewrite is
+the simpler one, not the absent one.**
+
+#### A defect in the shipped IPv4 rewrite, found by reading its v6 twin
+
+Modelling `xlate6()` on `nf_flow_nat_ipv6_udp()` meant reading the v4 original,
+which does this and the program did not:
+
+```c
+	if (udph->check || skb->ip_summed == CHECKSUM_PARTIAL) {
+		inet_proto_csum_replace4(&udph->check, skb, addr, new_addr, true);
+		if (!udph->check)
+			udph->check = CSUM_MANGLED_0;
+	}
+```
+
+A UDP checksum that lands on `0x0000` after a rewrite reads on the wire as *no
+checksum present*, so the kernel writes the numerically identical `0xffff`
+instead. The program wrote the zero. That is a one-in-65536 corruption per
+rewritten datagram, in a path no test would ever have reached, and the same
+guard is in `nf_flow_nat_port_udp()` for the port rewrite. Both arms have it
+now. TCP is excepted on purpose: `0x0000` is a legal TCP checksum.
+
+It is worth naming what found this. Not a test, not a review of the v4 code, and
+not the compiler - reading the kernel function that the *other* family's code had
+to match. The pattern generalises: the cheapest audit of a hand-written kernel
+imitation is writing a second one against the same reference.
+
+#### Two traps in writing it, both worth keeping
+
+**A field name that is a macro cannot be relocated.** The obvious way to read a
+v6 address out of the peer tuple is `other->tuple.src_v6.s6_addr`. That does not
+load. `s6_addr` is a `#define` over `in6_u.u6_addr8`
+(`include/uapi/linux/in6.h`), so there is no BTF field of that name for CO-RE to
+resolve against, and the local mirror declaring one would not change the target.
+The fix is to relocate only as far as the enclosing field and read the bytes:
+`bpf_core_read(dst, 16, &other->tuple.src_v6)` needs the offset of `src_v6`,
+which exists, and nothing inside `struct in6_addr`, which does not. The general
+rule: **CO-RE relocates BTF field names, and a macro is not one** - if the
+kernel header defines the name you are reaching for, check it is a member and
+not a `#define` before assuming a relocation exists.
+
+**Two families cannot share a typed header pointer across the branch.** Holding
+`struct iphdr *` and `struct ipv6hdr *` in one `struct parsed` and setting the
+unused one to NULL does not verify: the two arms spill different types into one
+stack slot, the merge marks the slot scalar, and the next dereference is
+rejected outright. The shape that works is to keep only scalars across the
+branch - `data`, `data_end`, `family`, `l4proto` - and re-derive the header with
+its own bounds check at each use site. Two compares per use, and every access is
+locally provable. The same reasoning covers the port pointer: both arms compute
+it at a *constant* offset, so both produce the same pointer type and the merge
+is fine, where a variable offset would not be.
+
+That is the third distinct verifier-shape rule this program has produced, after
+the `container_of()` branch in 23.5. They have a common root: **the verifier
+reasons per path, and anything that merges two paths' pointer provenance loses
+what it knew about both.**
+
+#### Counters
+
+Twenty slots, up from seventeen, and three of them are observations rather than
+exits:
+
+| slot | |
+|---|---|
+| `not_ip` | was `not_ipv4`; now means the version nibble was neither 4 nor 6 |
+| `v4`, `v6` | observations - what the window contained |
+| `nat66` | observation - a v6 flow carrying SNAT or DNAT |
+
+`v4` and `v6` do not sum with the rest: a packet counted in `v6` is counted
+again in whichever exit it took. They exist because three windows in 23.9 were
+thrown away for measuring the wrong family or the wrong scope, and the family
+split on this link changes hour to hour. Reading it from the same dump as the
+result removes one whole class of misreading, rather than requiring a separate
+`boxstate.sh mix` run alongside.
+
+The probe object declares ten slots and the fastpath object twenty, which is how
+`status` knows which program left the map behind when nothing is attached.
+
+#### What is verified and what is not
+
+Verified, statically:
+
+- Both objects compile with no warnings under
+  `-Wall -Wextra`, and the probe rebuild reproduced its recorded sha256.
+- The fastpath carries 62 CO-RE relocations, all `FIELD_*` or `TYPE_SIZE`, and
+  **no `TYPE_ID_TARGET`** - the relocation class 23.5 showed cannot resolve
+  against a type present in four BTFs. A rebuild that produces one has
+  reintroduced that bug.
+- The probe still carries **zero** relocations, which is the whole reason it
+  stays a separate object now that the original reason is gone.
+- No multiply appears anywhere in the generated code, so the
+  `check_reg_sane_offset()` rejection in 23.5 cannot recur.
+- The generated code was read back for the three things most likely to be
+  silently wrong: the `0xffff` mangled-zero guard gated on `IPPROTO_UDP`, the
+  `hop_limit` decrement at offset 7 with no checksum arithmetic after it, and
+  the EtherType select between `0x0800` and `0x86dd`.
+- The harness's counter parser was re-tested against twenty slots in all four
+  output shapes it handles - JSON with `formatted`, JSON pretty-printed, JSON
+  without BTF, and plain text - and agrees with the fixture in every one.
+
+Not verified, and this is the whole of it:
+
+- **Neither object has been loaded on the box at this revision.** Relocation and
+  verification are both claims about a kernel this container does not have.
+- **The rewrite has still never executed, in either family.** `not_direct`
+  accounts for every hit, so the dry run has never reached the commit stage.
+  Every checksum path in this program has been through a compiler and a
+  disassembler and nothing else.
+- **Whether the flowtable holds IPv6 flows on this box at all is unmeasured.**
+  Everything measured so far was IPv4. `probe` answers it in one window and
+  should be the first thing run.
+
+#### Next, in order
+
+1. `xdp-ft-wwan.sh check`, then `probe 30` under an ordinary download. This
+   answers whether the kfunc hits for IPv6 - the one fact the whole v6 arm
+   assumes and nothing has tested.
+2. `dryrun 30` under the same load. The first window on this link that measures
+   the traffic that is there rather than 0.8% of it. Watch `not_direct` against
+   `hit`: this re-runs 23.9's device-list question without needing manufactured
+   IPv4 traffic.
+3. Only if `would_redirect` is non-zero does anything about the fastpath matter.
+   If it is still 0, the blocker is 23.3 and no amount of program work moves it.

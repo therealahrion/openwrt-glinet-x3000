@@ -13,11 +13,21 @@
 # so a failure names the reason rather than leaving a program that loads and
 # never hits.
 #
-# Only the probe is here. The fastpath - NAT rewrite, L2 build, redirect - is a
-# separate object, because reading fields out of struct flow_offload_tuple needs
-# CO-RE relocations this kernel's BTF resolves ambiguously, and bpftool loadall
-# fails the whole object when any single program fails to relocate. Keeping the
-# probe apart means the measurement does not wait on that.
+# Neither action writes to a packet. The fastpath - NAT rewrite, L2 build,
+# redirect - is built and sits in the same object, but nothing here attaches it,
+# because the dry run measured every flow on this box as FLOW_OFFLOAD_XMIT_NEIGH
+# and a redirect would fire on none of them. See xdp-methods-tested.md 23.8.
+#
+# Two objects, for one reason that is still good. xdp_ft_probe.bpf reads nothing
+# out of struct flow_offload_tuple and so carries no CO-RE relocations at all,
+# while xdp_ft_wwan.bpf carries sixty-two. If a kernel bump breaks the struct
+# mirrors, the probe still answers whether the kfunc itself works. The original
+# reason - that a relocation in the fastpath could not resolve and bpftool
+# loadall fails a whole object when one program fails - no longer applies.
+#
+# Both programs count IPv4 and IPv6. On this link that is the difference between
+# a measurement and a flat line: the WAN is 464XLAT with DNS64 upstream and IPv4
+# was 0.8% of a measured window.
 
 set -eu
 
@@ -34,12 +44,12 @@ case "${1:-check}" in
 dryrun)
 	OBJNAME=xdp_ft_wwan.bpf
 	PROGNAME=xdp_ft_dryrun
-	SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect"
 	;;
 *)
 	OBJNAME=xdp_ft_probe.bpf
 	PROGNAME=xdp_ft_probe
-	SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err"
+	SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short miss hit lookup_err"
 	;;
 esac
 OBJ="$D/$OBJNAME"
@@ -73,9 +83,38 @@ BPF_URL=${BPF_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-gline
 case "$0" in */*) _here=${0%/*} ;; *) _here=. ;; esac
 BPF_DIR=${BPF_DIR:-$_here/bpf}
 
+# The sha256 of each object as committed, so a copy cached in $D from an earlier
+# revision cannot be used silently. That is not hypothetical: this script updates
+# the moment the tree is pulled and the cached object does not, and a window run
+# that way reports the previous program's counters under the current program's
+# labels. The build is byte-reproducible - see xdp-ft-wwan-sources.md - so an
+# exact match is the right test. These two lines and the checksums in that file
+# are the same values and are updated together.
+case "$OBJNAME" in
+xdp_ft_wwan.bpf)
+	WANT_SHA=f8684e26d7d2009f981083d401d1aa6ff3d8e9515242b87e136fee1aba023b1d ;;
+xdp_ft_probe.bpf)
+	WANT_SHA=99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c ;;
+*)	WANT_SHA= ;;
+esac
+
+obj_sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
 fetch_obj() {
 	mkdir -p "$D"
+
+	# A cached object that does not match is discarded rather than reported,
+	# because the recovery is always the same and doing it by hand is a step
+	# that gets skipped.
+	if [ -s "$OBJ" ] && [ -n "$WANT_SHA" ]; then
+		have=$(obj_sha "$OBJ")
+		if [ -n "$have" ] && [ "$have" != "$WANT_SHA" ]; then
+			say "cached $OBJNAME is from another revision - refetching"
+			rm -f "$OBJ"
+		fi
+	fi
 	[ -s "$OBJ" ] && return 0
+
 	if [ -s "$BPF_DIR/$OBJNAME" ]; then
 		cat "$BPF_DIR/$OBJNAME" > "$OBJ"
 	elif command -v curl >/dev/null 2>&1; then
@@ -88,6 +127,24 @@ fetch_obj() {
 		say "$BPF_URL"
 		exit 1
 	}
+
+	# A mismatch here is the script and the object coming from different
+	# revisions, which is fatal: the slot labels would name the wrong
+	# counters. An image without sha256sum loses the check and says so,
+	# rather than failing a box that is otherwise fine.
+	if [ -n "$WANT_SHA" ]; then
+		got=$(obj_sha "$OBJ")
+		if [ -z "$got" ]; then
+			say "note: no sha256sum on this image - object not verified"
+		elif [ "$got" != "$WANT_SHA" ]; then
+			say "FATAL: $OBJNAME does not match this script."
+			say "  want $WANT_SHA"
+			say "  got  $got"
+			say "  Pull the tree again so the script and the object come"
+			say "  from the same revision, then rm -rf $D"
+			exit 1
+		fi
+	fi
 }
 
 check() {
@@ -196,12 +253,14 @@ legend() {
 	case "$PROGNAME" in
 	xdp_ft_dryrun)
 		say "  seen            packets the program looked at"
-		say "  not_ipv4        version nibble was not 4. If this dominates, the"
-		say "                  traffic was IPv6 and nothing below it means anything"
-		say "  frag_or_opts    fragmented, or IP options present"
+		say "  not_ip          version nibble was neither 4 nor 6"
+		say "  v4              of those, IPv4         (observation, see below)"
+		say "  v6              of those, IPv6         (observation, see below)"
+		say "  frag_or_opts    v4 fragmented or carrying options; v6 carrying an"
+		say "                  extension header. The flowtable declines all of them"
 		say "  not_tcp_udp     another L4 protocol"
 		say "  short           truncated before the ports"
-		say "  low_ttl         ttl 1 - forwarding would take it to 0"
+		say "  low_ttl         ttl or hop limit 1 - forwarding would take it to 0"
 		say "  tcp_teardown    FIN or RST, which has to reach conntrack"
 		say "  miss            the flowtable did not know the flow. If this"
 		say "                  dominates, the traffic is not being offloaded -"
@@ -214,26 +273,37 @@ legend() {
 		say "                  program cannot do, so those stay on the stack"
 		say "  no_out_ifidx    DIRECT but no egress ifindex recorded"
 		say "  read_err        a probe read of the flow failed"
+		say "  nat66           a v6 flow carrying SNAT or DNAT    (observation)"
 		say "  would_redirect  everything checked out; the rewrite would have run"
 		say "  no_headroom     unused in a dry run"
 		say "  redirect        unused in a dry run"
 		say ""
+		say "  v4, v6 and nat66 are observations, not exits. They describe the"
+		say "  window rather than accounting for it, and they do not sum with"
+		say "  the rest: every packet counted in v4 or v6 is counted again in"
+		say "  whichever exit it took."
+		say ""
 		say "  would_redirect over seen is the number that decides whether the"
-		say "  rewrite is worth attaching at all - but only once not_ipv4 and"
-		say "  miss are both small. Three windows were thrown away for want of"
-		say "  that check: two measured IPv6, one measured traffic that"
-		say "  terminated on the router and was never a flowtable candidate."
+		say "  rewrite is worth attaching at all - but only once miss is small."
+		say "  Three windows were thrown away for want of that check: two"
+		say "  measured IPv6 with an IPv4-only program, one measured traffic"
+		say "  that terminated on the router and was never a flowtable"
+		say "  candidate. The v4 and v6 slots exist so the first of those"
+		say "  mistakes is visible in the same dump as the result."
 		;;
 	*)
 		say "  seen          packets the program looked at"
-		say "  not_ipv4      version nibble was not 4"
-		say "  frag_or_opts  fragmented, or IP options present - the flowtable declines both"
+		say "  not_ip        version nibble was neither 4 nor 6"
+		say "  v4            of those, IPv4    (observation - does not sum)"
+		say "  v6            of those, IPv6    (observation - does not sum)"
+		say "  frag_or_opts  v4 fragmented or with options; v6 with an extension"
+		say "                header. The flowtable declines all of them"
 		say "  not_tcp_udp   another L4 protocol"
 		say "  short         truncated before the ports"
 		say "  miss          looked up, no such flow"
 		say "  hit           the flowtable knew the flow"
 		say "  lookup_err    the kfunc returned NULL. Note that an ordinary miss sets"
-		say "                opts.error too (nf_flow_table_bpf.c:47), so this counts"
+		say "                opts.error too (nf_flow_table_bpf.c:49), so this counts"
 		say "                misses as well as refusals and the miss slot stays 0"
 		;;
 	esac
@@ -241,19 +311,19 @@ legend() {
 }
 
 # `status` has no way of knowing which program left the map behind, and naming
-# twelve slots with the probe's eight labels would print confident nonsense. The
-# map itself says which: the probe declares eight entries, the dry run seventeen.
+# twenty slots with the probe's ten labels would print confident nonsense. The
+# map itself says which: the probe declares ten entries, the dry run twenty.
 adopt_slots_from_map() {
 	ents=$(bpftool map show pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null \
 	       | sed -n 's/.*max_entries \([0-9][0-9]*\).*/\1/p' | head -1)
 	case "${ents:-}" in
-	17)
+	20)
 		PROGNAME=xdp_ft_dryrun
-		SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err would_redirect no_headroom redirect"
+		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short low_ttl tcp_teardown miss hit bad_dir torn_down not_direct no_out_ifidx read_err nat66 would_redirect no_headroom redirect"
 		;;
-	8)
+	10)
 		PROGNAME=xdp_ft_probe
-		SLOTS="seen not_ipv4 frag_or_opts not_tcp_udp short miss hit lookup_err"
+		SLOTS="seen not_ip v4 v6 frag_or_opts not_tcp_udp short miss hit lookup_err"
 		;;
 	esac
 }

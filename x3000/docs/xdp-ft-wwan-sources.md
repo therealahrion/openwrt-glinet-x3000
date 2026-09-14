@@ -14,14 +14,23 @@ reproducible.
 | `bpf/xdp_ft_wwan.bpf.c` | the fastpath source |
 | `xdp-ft-wwan.sh` | preflight, fetch, attach, sample, detach |
 
-Two objects rather than one, and the split is not cosmetic. `bpftool prog
-loadall` fails the whole object when any single program in it fails to relocate,
-so while the fastpath could not relocate it took the probe down with it and the
-measurement could never run. Apart, the probe loads regardless of the fastpath's
-state.
+Two objects rather than one, and the reason has changed. It was that `bpftool
+prog loadall` fails the whole object when any single program in it fails to
+relocate, so while the fastpath could not relocate it took the probe down with
+it. That is fixed. What is still true, and is now the reason, is that
+`xdp_ft_probe.bpf` carries **no CO-RE relocations at all** where
+`xdp_ft_wwan.bpf` carries sixty-two: the probe reads nothing out of `struct
+flow_offload_tuple`, only tests the returned pointer for NULL. If a kernel bump
+breaks the struct mirrors, the probe still answers whether the kfunc itself
+works. It is the canary, and canaries are kept in their own cage.
 
-Kept as separate `.c` files rather than inlined here: the fastpath is roughly 400
+Kept as separate `.c` files rather than inlined here: the fastpath is roughly 700
 lines, where the three objects in `verify-992a-sources.md` are a dozen each.
+
+Both programs handle IPv4 and IPv6. The first revision was IPv4 only; on this
+link that made every counter a flat line, for the reason set out under
+[The scope was wrong for this link](#the-scope-was-wrong-for-this-link-and-the-fix-was-the-easier-program)
+below.
 
 ## Build
 
@@ -49,14 +58,18 @@ Without it clang records the absolute source path in `.BTF`, which survives
 different files — identical bytecode, different sha256. With it the embedded
 path is `./bpf/<name>.bpf.c` and the build reproduces byte for byte anywhere.
 
-sha256 of the committed objects:
+sha256 of the committed objects. `xdp-ft-wwan.sh` carries the same two values
+and checks the object it is about to load against them, because the script
+updates the moment the tree is pulled and a copy cached in `/tmp/xdp-ft-wwan`
+does not — a window run that way reports the previous program's counters under
+the current program's labels. Update both places together:
 
 ```
-c4371b7a76baf9e6eb99bad111cdbb64b416bbcf701f71eaf30fb61bbc276602  bpf/xdp_ft_probe.bpf
-d667bb5d327078f90aa99d8d253b92a3654841c6db5cc0e9c4e78e75faaacb52  bpf/xdp_ft_wwan.bpf
+99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c  bpf/xdp_ft_probe.bpf
+f8684e26d7d2009f981083d401d1aa6ff3d8e9515242b87e136fee1aba023b1d  bpf/xdp_ft_wwan.bpf
 ```
 
-## What the two programs do
+## What the three programs do
 
 `xdp_ft_probe` parses the packet, calls `bpf_xdp_flow_lookup()`, counts the
 result in a per-CPU array and returns `XDP_PASS`. It changes nothing, and it
@@ -85,10 +98,17 @@ drift into measuring different things.
 **Every rejection has its own counter, and that is not cosmetic.** An earlier
 revision pooled six parse failures into one `parse_skip` slot. A window then
 returned 145880 of 146062 in that slot and it took a full cycle to work out the
-traffic had been IPv6 — a `not_ipv4` counter would have said so on sight. The
-parser now returns the slot that rejected the packet and the caller bumps it, so
-seventeen slots account for every packet and any window that measured the wrong
-thing says which wrong thing it measured.
+traffic had been IPv6 — a family counter would have said so on sight. The parser
+now returns the slot that rejected the packet and the caller bumps it, so twenty
+slots account for every packet and any window that measured the wrong thing says
+which wrong thing it measured.
+
+Three of the twenty — `v4`, `v6` and `nat66` — are **observations rather than
+exits**. They describe the window instead of accounting for it and do not sum
+with the rest: a packet counted in `v6` is counted again in whichever exit it
+took. `v4` and `v6` exist so that the family split, which on this link changes
+hour to hour and decides whether a window means anything, is readable in the
+same dump as the result rather than from a separate run of `boxstate.sh mix`.
 
 **Reads are gathered before anything is written.** Every read through the flow is
 a probe read of a computed address and can fail. `decide()` reads all of them,
@@ -118,8 +138,8 @@ The split between what survives that and what does not is the useful part:
   BTF, so two BTFs give two different IDs for the same struct by construction.
   There is nothing for libbpf to reconcile and it refuses to guess.
 
-Dumping the object's `.BTF.ext` showed 28 CO-RE relocations, of which exactly one
-was a type-id relocation, and it was relo #7:
+Dumping the object's `.BTF.ext` showed, at that revision, 28 CO-RE relocations,
+of which exactly one was a type-id relocation, and it was relo #7:
 
 ```
 relo #7   insn 300   TYPE_ID_TARGET   type_id 60   access '0'
@@ -134,7 +154,10 @@ never needed to be trusted. `bpf_probe_read_kernel` is reachable from XDP under
 `CAP_PERFMON` (`kernel/bpf/helpers.c`, `bpf_base_func_proto`), which root has.
 
 Removing the cast removes the object's only `TYPE_ID_TARGET` relocation. The
-remaining 27 are all `FIELD_*` and resolve unchanged.
+remaining 27 were all `FIELD_*` and resolved unchanged. The current object, with
+both families, carries 62 — 40 `FIELD_BYTE_OFFSET`, 20 more for the two bitfield
+reads, and 2 `TYPE_SIZE` — and still not one type-id relocation. A rebuild that
+produces one has reintroduced the bug.
 
 The general rule worth keeping: **a program that reads kernel structs through
 `bpf_core_read()` can be relocated against a type that appears in several BTFs;
@@ -244,7 +267,7 @@ sample with a download in flight:
 | `seen` | 26043 | equal to the `rx_packets` delta, exactly |
 | `hit` | 25619 | 98.37% |
 | `lookup_err` | 423 | 1.62% |
-| `not_ipv4` | 1 | |
+| `not_ipv4` (as the slot was then named) | 1 | |
 | everything else | 0 | |
 
 25619 + 423 + 1 = 26043, so every packet is accounted for. `seen` matching the
@@ -254,8 +277,8 @@ path rather than a sample of it. This is the measurement section 16.5 asked for:
 
 **One correction to the probe's own counters.** The split between `miss` and
 `lookup_err` is wrong. `bpf_xdp_flow_tuple_lookup()` returns `ERR_PTR(-ENOENT)`
-when `flow_offload_lookup()` finds nothing (`nf_flow_table_bpf.c:47-48`), and the
-caller then sets `opts->error` from it (`:94-97`), so an ordinary miss sets the
+when `flow_offload_lookup()` finds nothing (`nf_flow_table_bpf.c:48-49`), and the
+caller then sets `opts->error` from it (`:95-96`), so an ordinary miss sets the
 error too. `ST_MISS` is unreachable, and the 423 are flow misses, not kfunc
 refusals. The other two error codes the kfunc can set — `-EINVAL` for a bad
 `opts_len`, `-EAFNOSUPPORT` for a family that is neither v4 nor v6 — do not
@@ -290,26 +313,84 @@ in the kernel's own BTF, which is what the local mirror computes, so the old
 142 + 2784 + 27 + 233093 = 236046, so every packet is accounted for. Every flow
 on this box is `FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
 
-### The scope is wrong for this link, and the fix is the easier program
+### The scope was wrong for this link, and the fix was the easier program
 
-Measured 2026-09-14, and it caps everything below: **this WAN is 464XLAT and
-IPv4 is 0.8% of its traffic.**
+Measured 2026-09-14, and it caps everything the IPv4-only revision could ever
+have shown: **this WAN is 464XLAT and IPv4 is 0.8% of its traffic.**
 
-`wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1` - the RFC 7335
-service-continuity prefix - and there is no `nat46` module, `clatd` or separate
+`wwan0` carries `inet 192.0.0.2/27` with `default via 192.0.0.1` — the RFC 7335
+service-continuity prefix — and there is no `nat46` module, `clatd` or separate
 device, so the CLAT is inside the modem. Linux sees genuine IPv4 and the program
-is on the right interface. There is simply almost none of it: the carrier
+was on the right interface. There is simply almost none of it: the carrier
 resolvers do DNS64, so every dual-stack client picks IPv6 for everything. Over a
 30-second speedtest, 44 IPv4 `InReceives` against 5329 IPv6.
 
-So this object, working perfectly, reaches under one percent of the link.
+So the IPv4-only object, working perfectly, reached under one percent of the
+link. Both programs now handle both families.
 
-The correction is cheaper than the original: `bpf_xdp_flow_lookup()` already has
-a `case AF_INET6:` arm filling `src_v6`/`dst_v6`, so the lookup needs no kernel
-change, and native IPv6 has no NAT - the entire address-and-port rewrite and all
-of its checksum arithmetic disappear. Decrement `hop_limit`, build L2, redirect.
-The single failure mode that can silently break a connection is not present in
-the v6 version.
+**Three things made the v6 arm cheaper than the v4 one, and one made it dearer
+than I said it would be.**
+
+Cheaper:
+
+- The kfunc already speaks it. `bpf_xdp_flow_lookup()` has a `case AF_INET6:`
+  arm filling `src_v6`/`dst_v6` from `fib_tuple->ipv6_src`/`ipv6_dst`
+  (`nf_flow_table_bpf.c:84-88`), so the lookup needed no kernel change.
+- No header checksum to repair. IPv6 has none, and `hop_limit` is not covered by
+  the L4 pseudo-header either, so the decrement is bare — which is exactly what
+  the kernel does at `nf_flow_table_ip.c:682`. The v4 arm has to fix `iph->check`
+  after both the address change and the TTL decrement; the v6 arm fixes nothing.
+- No extension-header walk. `nf_flow_tuple_ipv6()` switches on `nexthdr` and
+  returns −1 on anything that is not TCP, UDP or GRE (`:593-608`), so a packet
+  carrying a hop-by-hop or fragment header is not in the flowtable at all and
+  walking past it could only produce a lookup that cannot hit. The program
+  declines them for the same reason, and counts them apart from ICMPv6 so
+  "not TCP or UDP" does not quietly hide "TCP behind an option header".
+
+Dearer, and this is a **correction to what the previous revision of this file
+asserted**. It said "native IPv6 has no NAT — the entire address-and-port rewrite
+and all of its checksum arithmetic disappear." That is wrong. The flowtable
+implements NAT66 for v6 exactly as it does for v4: `nf_flow_snat_ipv6()` at
+`nf_flow_table_ip.c:516` and `nf_flow_dnat_ipv6()` at `:539`, both reaching the
+same peer-tuple fields, with `inet_proto_csum_replace16()` repairing the L4
+checksum across four 32-bit words. A program that ignored `NF_FLOW_SNAT` on a v6
+flow would forward it untranslated. The rewrite is implemented, and a `nat66`
+counter records whether it ever fires here — expected to stay at zero on a
+routed prefix, but measured rather than assumed.
+
+What survives of the original claim is the narrower and still useful version:
+**the v6 rewrite is the simpler one, not the absent one.**
+
+### A defect the v6 work turned up in the v4 rewrite
+
+Reading `nf_flow_nat_ip_udp()` to model the v6 equivalent showed the v4 arm
+missing a guard the kernel has:
+
+```c
+	if (udph->check || skb->ip_summed == CHECKSUM_PARTIAL) {
+		inet_proto_csum_replace4(&udph->check, skb, addr, new_addr, true);
+		if (!udph->check)
+			udph->check = CSUM_MANGLED_0;
+	}
+```
+
+A UDP checksum that lands on `0x0000` after a rewrite reads as *no checksum* on
+the wire, so the kernel writes the numerically equivalent `0xffff` instead. This
+file did not. That is a silent one-in-65536 corruption per rewritten datagram,
+in a path no test would ever have reached, and it applies to both the address
+and the port rewrite (`nf_flow_nat_port_udp()` does the same). Both arms now do
+it, TCP excepted — `0x0000` is a legal TCP checksum and must be written as it
+stands.
+
+The guard is visible in the generated code:
+
+```
+2527: w3 = -0x1              <- 0xffff, the mangled-zero default
+2528: if w4 == 0xffff goto   <- the folded sum whose complement is zero
+2529: w3 = w2                <- otherwise the computed value
+2530: if w8 == 0x11 goto     <- and only for IPPROTO_UDP
+2533: *(u16 *)(r2 + 0x0) = r3
+```
 
 ### Three windows that measured nothing, and what they cost
 
@@ -318,14 +399,20 @@ this and none of them announced themselves:
 
 | window | what it showed | why it was worthless |
 |---|---|---|
-| dry run after adding `eth1` | `parse_skip` 145880 of 146062 | the download resolved AAAA. This program is IPv4-only, so every packet failed the version nibble before the flowtable was ever consulted |
+| dry run after adding `eth1` | `parse_skip` 145880 of 146062 | the download resolved AAAA. That revision was IPv4-only, so every packet failed the version nibble before the flowtable was ever consulted |
 | `curl -4` on the router | 66108 `lookup_err` of 66114 IPv4 packets | `curl` ran *on the box*, so the connections terminated locally. The flowtable only ever holds **forwarded** flows, so it correctly knew none of them |
 | both of the above | `hit` 6 and 16 | with the flow table empty of the traffic, `not_direct` had nothing to count |
 
-The preconditions a valid window needs, in order: **IPv4** (or `not_ipv4`
-dominates), **forwarded through the box** (or `miss` dominates), and **flows
-created after any flowtable change** (the route is computed once, at flow
-creation). The legend in `xdp-ft-wwan.sh` now states all three.
+The preconditions a valid window needs, in order: **traffic the program can
+parse** (the `v4` and `v6` slots say what arrived, and `not_ip` plus
+`frag_or_opts` say what was declined), **forwarded through the box** (or `miss`
+dominates), and **flows created after any flowtable change** (the route is
+computed once, at flow creation). The legend in `xdp-ft-wwan.sh` states all
+three.
+
+Only the first of these is fixed by the v6 work. A window still measures nothing
+if the traffic terminates on the router, and still measures the wrong thing if
+the flows predate a flowtable change.
 
 ### Why nothing is XMIT_DIRECT, and it is structural
 
@@ -375,9 +462,21 @@ particular has been through a compiler and nothing else. A wrong checksum shows
 up as clients losing connectivity, so `probe` comes first and `off` stays to
 hand.
 
-Known and deliberately not yet fixed, because one change at a time: the reads
-that feed the packet rewrite are unchecked. `flags` is checked, since a silent
-zero there would redirect with no translation at all, but the address and port
-reads are not, and a failed probe read would write a zero into the packet. The
-fix is to gather every value before mutating anything, and it is worth doing
-before the program is ever left attached.
+**Fixed since that was written**, and the paragraph that used to sit here said
+otherwise for a revision longer than it should have: the reads that feed the
+packet rewrite were unchecked, so a failed probe read would have written a zero
+into the packet. `decide()` now gathers every value — both translated addresses,
+both ports, the egress ifindex and both MAC addresses — and checks every read
+before `commit()` touches a byte, which is the property described under *Reads
+are gathered before anything is written* above.
+
+Still open, in order of how much they matter:
+
+- **The rewrite has never executed.** Not once, in either family. `not_direct`
+  accounts for every hit, so the dry run has never reached the commit stage and
+  the checksum arithmetic has been through a compiler and nothing else.
+- **`XMIT_DIRECT` is unreachable while the kfunc works** — see *Why nothing is
+  XMIT_DIRECT* above. That is the blocker, and it is not an IPv4 or IPv6
+  question.
+- **The IPv6 dry run has never been run.** It is the first window on this link
+  that will measure the traffic that is actually there rather than 0.8% of it.

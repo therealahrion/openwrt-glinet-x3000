@@ -2,18 +2,28 @@
 /*
  * Flowtable-driven XDP fast path for the modem interface.
  *
- * Two programs. Attach the probe first: it answers the question this tree has
- * asked since section 16.5 and never tested, which is whether
- * bpf_xdp_flow_lookup() actually hits on wwan0. Only once it does is the
- * fastpath worth loading.
+ * Three programs, meant to be attached in this order:
  *
  *   xdp_ft_probe     lookup, count, XDP_PASS. Changes nothing.
+ *   xdp_ft_dryrun    every decision the fastpath makes, no byte written.
  *   xdp_ft_fastpath  lookup, NAT rewrite, build L2, XDP_REDIRECT.
+ *
+ * Both address families. The first revision was IPv4 only, on the reasoning
+ * that one family done right beats two done nearly right. That was sound and
+ * it picked the wrong family: measured 2026-09-14, this WAN is 464XLAT with
+ * the CLAT inside the modem and the carrier resolvers doing DNS64, so every
+ * dual-stack client chooses IPv6. Over a 30-second speedtest IPv4 was 44 of
+ * 5373 IP-layer receives - 0.8%. An IPv4-only program here, working perfectly,
+ * accelerates under one percent of the link and leaves every counter in the
+ * dry run reading as a flat line. See xdp-methods-tested.md section 23.11.
  *
  * Why this can work here at all, each point read from v6.12.103:
  *
  *   - The kfunc exists. nf_flow_table_bpf.o is gated on DEBUG_INFO_BTF_MODULES
  *     (net/netfilter/Makefile) and this build sets it.
+ *   - It already speaks both families. bpf_xdp_flow_lookup() has a case
+ *     AF_INET6 arm filling src_v6/dst_v6 from fib_tuple->ipv6_src/ipv6_dst
+ *     (nf_flow_table_bpf.c:84), so the v6 lookup needs no kernel change.
  *   - The device is in the XDP hashtable. nf_flow_table_offload_setup() takes
  *     the nf_flow_offload_xdp_setup() branch only while hardware offload is
  *     OFF (nf_flow_table_offload.c:1258), so keep the firewall dropdown on
@@ -35,30 +45,31 @@
  * 0, and 991 anchors mac_header at skb->data, so do_xdp_generic() computes
  * mac_len 0 and the IP header sits at ctx->data. A program written against
  * ethhdr - including the in-tree selftest this is modelled on - reads the first
- * two octets of the source address as an EtherType here.
+ * two octets of the source address as an EtherType here. With no EtherType on
+ * the wire the version nibble is the only thing naming the family, which is why
+ * parse_rawip() switches on it rather than on ctx->protocol.
  *
- * NAT semantics are taken from nf_flow_snat_ip() / nf_flow_dnat_ip() in
- * net/netfilter/nf_flow_table_ip.c, not from reasoning about conntrack.
+ * Two corrections to what the first revision of this file asserted, both found
+ * by reading nf_flow_table_ip.c rather than reasoning about it:
  *
- * IPv4 only, deliberately: the rewrite for v6 is a different function and
- * getting one right is worth more than getting two nearly right.
+ *   - It said native IPv6 has no NAT, so the v6 rewrite "simply does not
+ *     exist". Wrong. The flowtable implements NAT66 for v6 exactly as it does
+ *     for v4 - nf_flow_snat_ipv6() at :516, nf_flow_dnat_ipv6() at :539 - and a
+ *     program that ignored NF_FLOW_SNAT on a v6 flow would forward it
+ *     untranslated. What is true is the narrower claim: v6 needs no *header*
+ *     checksum repair, because IPv6 has none and hop_limit is not covered by
+ *     the L4 pseudo-header. The kernel decrements it bare at :682. So the v6
+ *     rewrite is the simpler one, not the absent one, and it is implemented
+ *     below.
+ *   - The v4 rewrite was missing the UDP zero-checksum guard. A UDP checksum
+ *     that lands on 0x0000 after a rewrite reads as "no checksum" on the wire,
+ *     so nf_flow_nat_ip_udp() writes CSUM_MANGLED_0 (0xffff) instead. This file
+ *     did not, which is a one-in-65536 corruption per rewritten datagram and
+ *     was never going to show up in a test. Both arms now do it.
  *
- * That decision was sound and, on this link, it picked the wrong family.
- * Measured 2026-09-14: this WAN is 464XLAT with the CLAT inside the modem, the
- * carrier resolvers do DNS64, and every dual-stack client therefore chooses
- * IPv6. Over a 30-second speedtest IPv4 was 44 of 5373 IP-layer receives -
- * 0.8%. So this program, working perfectly, would accelerate under one percent
- * of what crosses the link.
- *
- * The v6 version is also the easier one, which is the part that makes this
- * worth fixing rather than regretting. bpf_xdp_flow_lookup() already has a
- * case AF_INET6 arm filling src_v6/dst_v6, so the lookup needs no change; and
- * native IPv6 has no NAT, so the whole address and port rewrite below - and
- * every checksum it has to repair - simply does not exist. Decrement
- * hop_limit, build L2, redirect. The one failure mode that can silently break
- * a user's connections is absent from it.
- *
- * See xdp-methods-tested.md section 23.11.
+ * NAT semantics are taken from nf_flow_snat_ip() / nf_flow_dnat_ip() and their
+ * v6 counterparts in net/netfilter/nf_flow_table_ip.c, not from reasoning about
+ * conntrack.
  */
 
 #define BPF_NO_KFUNC_PROTOTYPES
@@ -69,12 +80,35 @@
 #include <bpf/bpf_core_read.h>
 
 #define ETH_P_IP	0x0800
+#define ETH_P_IPV6	0x86dd
 #define ETH_ALEN	6
 #define IP_MF		0x2000
 #define IP_OFFSET	0x1fff
 #define AF_INET		2
+#define AF_INET6	10
 #define IPPROTO_TCP	6
 #define IPPROTO_UDP	17
+
+/* IPv6 extension headers, so "TCP behind a hop-by-hop option" is counted apart
+ * from "ICMPv6". Both are unacceleratable, but only one of them is traffic
+ * anybody expected to go fast.
+ */
+#define IPPROTO_HOPOPTS		0
+#define IPPROTO_ROUTING		43
+#define IPPROTO_FRAGMENT	44
+#define IPPROTO_ESP		50
+#define IPPROTO_AH		51
+#define IPPROTO_DSTOPTS		60
+#define IPPROTO_MH		135
+
+/* A UDP checksum of zero means "not computed", so a rewrite that lands there
+ * has to be written as the equivalent 0xffff instead. net/netfilter has the
+ * same constant as CSUM_MANGLED_0.
+ */
+#define CSUM_MANGLED_0	0xffff
+
+#define V4_HLEN		20
+#define V6_HLEN		40
 
 #define FLOW_OFFLOAD_DIR_ORIGINAL	0
 #define FLOW_OFFLOAD_DIR_REPLY		1
@@ -104,13 +138,23 @@ struct iphdr_ {
 	__be32	daddr;
 } __attribute__((packed));
 
+/* The version lives in the high nibble of the first octet on the wire in both
+ * families, so priority_version is read the same way as iphdr_.ihl_version and
+ * the kernel's endian-conditional bitfield does not have to be mirrored.
+ */
+struct ipv6hdr_ {
+	__u8	priority_version;
+	__u8	flow_lbl[3];
+	__be16	payload_len;
+	__u8	nexthdr;
+	__u8	hop_limit;
+	__u8	saddr[16];
+	__u8	daddr[16];
+} __attribute__((packed));
+
 struct ports_ {
 	__be16	source;
 	__be16	dest;
-} __attribute__((packed));
-
-struct tcpflags_ {
-	__be32	seq_ack[4];	/* seq, ack_seq, then the flags word */
 } __attribute__((packed));
 
 /* Kernel types, matched by name for CO-RE. Only the fields this program reads
@@ -119,7 +163,16 @@ struct tcpflags_ {
  * not silent corruption.
  */
 struct in_addr___local { __be32 s_addr; };
-struct in6_addr___local { __u8 s6_addr[16]; };
+
+/* Not a mirror of struct in6_addr, and deliberately so. The kernel's s6_addr
+ * is a macro over in6_u.u6_addr8 (include/uapi/linux/in6.h), so there is no BTF
+ * field of that name to relocate against and an access written as
+ * tuple.src_v6.s6_addr would fail to load. Nothing below names a field inside
+ * this type: the v6 reads take the address of src_v6 / dst_v6 and pull 16
+ * bytes, which needs only the enclosing tuple's field offsets. All this
+ * declaration has to get right is the size.
+ */
+struct in6_addr___local { __u8 __addr8[16]; };
 
 /* Mirrors struct flow_offload_tuple field for field, including the anonymous
  * unions and the bitfield word, because CO-RE relocates by name and a name that
@@ -196,18 +249,25 @@ bpf_xdp_flow_lookup(struct xdp_md *, struct bpf_fib_lookup *,
 /* Every exit the decision path can take gets its own slot, so a dry run
  * accounts for all of seen rather than leaving a remainder to guess at.
  *
+ * Three slots are observations rather than exits - v4, v6 and nat66 - and are
+ * marked as such in the harness legend. They do not sum with the rest.
+ *
  * The parse failures are split rather than pooled, and that is not cosmetic: a
  * run where the traffic turned out to be IPv6 showed 145880 of 146062 in a
- * single parse_skip slot and took a whole cycle to diagnose, when a not_ipv4
- * counter would have said so on sight.
+ * single parse_skip slot and took a whole cycle to diagnose. That is also why
+ * v4 and v6 are counted at all: the family split is a property of the window,
+ * it changes hour to hour on this link, and reading it from the same dump as
+ * the result removes an entire class of misreading.
  */
 enum stat_slot {
 	ST_SEEN = 0,
-	ST_NOT_IPV4,
+	ST_NOT_IP,		/* version nibble is neither 4 nor 6 */
+	ST_V4,			/* observation */
+	ST_V6,			/* observation */
 	ST_FRAG_OR_OPTS,
 	ST_NOT_TCP_UDP,
 	ST_SHORT,
-	ST_LOW_TTL,
+	ST_LOW_TTL,		/* TTL or hop limit at 1 */
 	ST_TCP_TEARDOWN,
 	ST_MISS,
 	ST_HIT,
@@ -216,6 +276,7 @@ enum stat_slot {
 	ST_NOT_DIRECT,
 	ST_NO_OUT_IFIDX,
 	ST_READ_ERR,
+	ST_NAT66,		/* observation: a v6 flow carrying SNAT or DNAT */
 	ST_WOULD_REDIRECT,
 	ST_NO_HEADROOM,
 	ST_REDIRECT,
@@ -267,53 +328,157 @@ static __always_inline __u16 csum_replace2(__u16 old_csum, __be16 from, __be16 t
 	return csum_fold(sum);
 }
 
+/* Only scalars survive the v4/v6 branch.
+ *
+ * An earlier shape of this struct held a typed header pointer, which does not
+ * verify once there are two families: the two arms would spill different
+ * pointer types into one stack slot, the merge marks the slot scalar, and the
+ * next dereference is rejected outright. So parsed carries data, data_end and
+ * three bytes of description, and each use site re-derives its header with its
+ * own bounds check. That costs two compares and makes every access locally
+ * provable.
+ */
 struct parsed {
-	struct iphdr_	*iph;
-	struct ports_	*ports;
-	void		*data_end;
+	void	*data;
+	void	*data_end;
+	__u8	family;		/* AF_INET or AF_INET6 */
+	__u8	l4proto;	/* already narrowed to TCP or UDP */
 };
 
-/* Parse a raw-IP packet at ctx->data. Returns 0 on "worth looking up". */
-/* Returns 0, or the counter slot naming which check rejected the packet. The
- * caller bumps it, so every rejection is attributable rather than pooled.
+static __always_inline struct iphdr_ *v4hdr(struct parsed *p)
+{
+	struct iphdr_ *iph = p->data;
+
+	if ((void *)(iph + 1) > p->data_end)
+		return 0;
+	return iph;
+}
+
+static __always_inline struct ipv6hdr_ *v6hdr(struct parsed *p)
+{
+	struct ipv6hdr_ *ip6h = p->data;
+
+	if ((void *)(ip6h + 1) > p->data_end)
+		return 0;
+	return ip6h;
+}
+
+/* Both arms yield the same pointer type at a constant offset, so the merge is
+ * a plain packet pointer and the bounds check below covers either.
+ */
+static __always_inline struct ports_ *l4ports(struct parsed *p)
+{
+	struct ports_ *ports;
+
+	if (p->family == AF_INET6)
+		ports = (struct ports_ *)((__u8 *)p->data + V6_HLEN);
+	else
+		ports = (struct ports_ *)((__u8 *)p->data + V4_HLEN);
+
+	if ((void *)(ports + 1) > p->data_end)
+		return 0;
+	return ports;
+}
+
+/* Where the L4 checksum sits, measured from the start of the port pair.
+ * TCP: seq 4, ack 4, offset and flags 2, window 2, so +16.
+ * UDP: length 2, so +6.
+ */
+static __always_inline __u16 *l4csum(struct parsed *p, struct ports_ *ports)
+{
+	__u16 *c = (p->l4proto == IPPROTO_TCP)
+		 ? (__u16 *)((__u8 *)ports + 16)
+		 : (__u16 *)((__u8 *)ports + 6);
+
+	if ((void *)(c + 1) > p->data_end)
+		return 0;
+	return c;
+}
+
+/* Parse a raw-IP packet at ctx->data. Returns 0 on "worth looking up", or the
+ * counter slot naming which check rejected it. The caller bumps it, so every
+ * rejection is attributable rather than pooled.
+ *
+ * The order of the protocol and TTL checks matches nf_flow_tuple_ipv6()
+ * (:593 then :610) in both arms, so a packet the flowtable would have declined
+ * is declined here for the same stated reason. The previous revision tested
+ * the v4 TTL first, which booked a hop-limit-1 ICMP packet as low_ttl rather
+ * than not_tcp_udp; the counters are comparable across the change for every
+ * packet except that one combination.
  */
 static __always_inline int parse_rawip(struct xdp_md *ctx, struct parsed *p)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
-	struct iphdr_ *iph = data;
-	struct ports_ *ports;
+	struct ipv6hdr_ *ip6h;
+	struct iphdr_ *iph;
+	__u8 *v = data;
 
-	if ((void *)(iph + 1) > data_end)
+	if ((void *)(v + 1) > data_end)
 		return ST_SHORT;
 
-	/* Raw IP: the version nibble is the only thing identifying the family.
-	 * This is the counter that says a window measured IPv6 and nothing else.
-	 */
-	if ((iph->ihl_version >> 4) != 4)
-		return ST_NOT_IPV4;
-
-	/* Options change the L4 offset; the flowtable declines these too. */
-	if ((iph->ihl_version & 0x0f) != 5)
-		return ST_FRAG_OR_OPTS;
-
-	if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
-		return ST_FRAG_OR_OPTS;
-
-	/* Forwarding decrements; 1 would have to become 0. */
-	if (iph->ttl <= 1)
-		return ST_LOW_TTL;
-
-	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-		return ST_NOT_TCP_UDP;
-
-	ports = (struct ports_ *)(iph + 1);
-	if ((void *)(ports + 1) > data_end)
-		return ST_SHORT;
-
-	p->iph = iph;
-	p->ports = ports;
+	p->data = data;
 	p->data_end = data_end;
+
+	if ((*v >> 4) == 4) {
+		p->family = AF_INET;
+		iph = v4hdr(p);
+		if (!iph)
+			return ST_SHORT;
+		bump(ST_V4);
+
+		/* Options change the L4 offset; the flowtable declines these
+		 * too, in ip_has_options() at nf_flow_table_ip.c:136.
+		 */
+		if ((iph->ihl_version & 0x0f) != 5)
+			return ST_FRAG_OR_OPTS;
+		if (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+			return ST_FRAG_OR_OPTS;
+		if (iph->protocol != IPPROTO_TCP &&
+		    iph->protocol != IPPROTO_UDP)
+			return ST_NOT_TCP_UDP;
+		/* Forwarding decrements; 1 would have to become 0. */
+		if (iph->ttl <= 1)
+			return ST_LOW_TTL;
+		p->l4proto = iph->protocol;
+	} else if ((*v >> 4) == 6) {
+		p->family = AF_INET6;
+		ip6h = v6hdr(p);
+		if (!ip6h)
+			return ST_SHORT;
+		bump(ST_V6);
+
+		/* No extension-header walk, because the flowtable does not do
+		 * one either: nf_flow_tuple_ipv6() switches on nexthdr and
+		 * returns -1 on anything that is not TCP, UDP or GRE
+		 * (:593-608). A packet carrying a hop-by-hop or fragment
+		 * header is therefore not in the flowtable at all, and looking
+		 * past it would only produce a lookup that cannot hit.
+		 */
+		switch (ip6h->nexthdr) {
+		case IPPROTO_TCP:
+		case IPPROTO_UDP:
+			break;
+		case IPPROTO_HOPOPTS:
+		case IPPROTO_ROUTING:
+		case IPPROTO_FRAGMENT:
+		case IPPROTO_ESP:
+		case IPPROTO_AH:
+		case IPPROTO_DSTOPTS:
+		case IPPROTO_MH:
+			return ST_FRAG_OR_OPTS;
+		default:
+			return ST_NOT_TCP_UDP;
+		}
+		if (ip6h->hop_limit <= 1)
+			return ST_LOW_TTL;
+		p->l4proto = ip6h->nexthdr;
+	} else {
+		return ST_NOT_IP;
+	}
+
+	if (!l4ports(p))
+		return ST_SHORT;
 	return 0;
 }
 
@@ -323,22 +488,48 @@ do_lookup(struct xdp_md *ctx, struct parsed *p)
 	struct bpf_flowtable_opts___local opts = {};
 	struct bpf_fib_lookup tuple = {
 		.ifindex	= ctx->ingress_ifindex,
-		.family		= AF_INET,
 	};
+	struct ports_ *ports = l4ports(p);
 
-	tuple.tos		= p->iph->tos;
-	tuple.l4_protocol	= p->iph->protocol;
-	tuple.tot_len		= bpf_ntohs(p->iph->tot_len);
-	tuple.ipv4_src		= p->iph->saddr;
-	tuple.ipv4_dst		= p->iph->daddr;
-	tuple.sport		= p->ports->source;
-	tuple.dport		= p->ports->dest;
+	if (!ports)
+		return 0;
+
+	tuple.l4_protocol	= p->l4proto;
+	tuple.sport		= ports->source;
+	tuple.dport		= ports->dest;
+
+	/* tos and tot_len are filled for v4 only, and only because they are
+	 * free: bpf_xdp_flow_lookup() builds its flow_offload_tuple from
+	 * ifindex, family, l4_protocol, the ports and the addresses
+	 * (nf_flow_table_bpf.c:63-92) and never reads either field. This
+	 * struct is a carrier here, not a FIB request.
+	 */
+	if (p->family == AF_INET6) {
+		struct ipv6hdr_ *ip6h = v6hdr(p);
+
+		if (!ip6h)
+			return 0;
+		tuple.family = AF_INET6;
+		__builtin_memcpy(tuple.ipv6_src, ip6h->saddr, 16);
+		__builtin_memcpy(tuple.ipv6_dst, ip6h->daddr, 16);
+	} else {
+		struct iphdr_ *iph = v4hdr(p);
+
+		if (!iph)
+			return 0;
+		tuple.family	= AF_INET;
+		tuple.tos	= iph->tos;
+		tuple.tot_len	= bpf_ntohs(iph->tot_len);
+		tuple.ipv4_src	= iph->saddr;
+		tuple.ipv4_dst	= iph->daddr;
+	}
 
 	return bpf_xdp_flow_lookup(ctx, &tuple, &opts, sizeof(opts));
 }
 
 /* Everything the commit stage needs, gathered while the packet is still
- * untouched.
+ * untouched. The address pair is 16 bytes wide for both families; a v4
+ * translation uses element 0 and leaves the rest zero.
  */
 struct decision {
 	struct flow_offload_tuple_rhash___local *other;
@@ -346,38 +537,114 @@ struct decision {
 	__u32		out_ifidx;
 	__u8		h_dest[ETH_ALEN];
 	__u8		h_source[ETH_ALEN];
-	__be32		snat_addr, dnat_addr;
+	__be32		snat_addr[4], dnat_addr[4];
 	__be16		snat_port, dnat_port;
 	__u8		dir;
 };
 
-/* Rewrite one address and port pair and repair both checksums.
+/* Fold a repaired L4 checksum back into the packet.
+ *
+ * The zero case is the whole reason this is a function. A UDP checksum that
+ * computes to 0x0000 has to be written as 0xffff, which is numerically
+ * equivalent in one's complement but does not read as "no checksum present".
+ * nf_flow_nat_ip_udp() and nf_flow_nat_ipv6_udp() both do this; the first
+ * revision of this file did not, and that is a silent one-in-65536 corruption
+ * per rewritten datagram. TCP has no such case: 0x0000 is a legal TCP checksum
+ * and must be written as it stands.
+ */
+static __always_inline void put_l4csum(struct parsed *p, __u16 *l4c, __u16 c)
+{
+	if (p->l4proto == IPPROTO_UDP && c == 0)
+		c = CSUM_MANGLED_0;
+	*l4c = c;
+}
+
+/* True when the L4 checksum is one this program may touch. A UDP checksum of
+ * zero means "not computed" and stays that way; TCP always has one.
+ */
+static __always_inline int l4csum_live(struct parsed *p, __u16 *l4c)
+{
+	return p->l4proto == IPPROTO_TCP || *l4c != 0;
+}
+
+/* Which end of the packet a translation rewrites.
+ *
+ * Named rather than passed as a pointer to the field, because the header
+ * mirrors are packed and taking the address of a member of a packed struct is
+ * both a warning and a genuine unaligned-pointer hazard on any target that
+ * cares. Selecting the field inside the function keeps every access a direct
+ * member reference, which the compiler is free to split into byte loads.
+ */
+#define XF_SRC	0
+#define XF_DST	1
+
+/* IPv4: rewrite one address and port pair and repair both checksums.
  *
  * The L4 checksum covers the pseudo-header address as well as the port, so
- * both deltas apply to it. A UDP checksum of zero means "not computed" and has
- * to stay zero; TCP has no such case.
+ * both deltas apply to it, and the IPv4 header checksum covers the address.
  */
-static __always_inline void xlate(struct parsed *p, __be32 *addr_field,
-				  __be16 *port_field, __be32 new_addr,
-				  __be16 new_port)
+static __always_inline void xlate4(struct parsed *p, struct iphdr_ *iph,
+				   struct ports_ *ports, __u16 *l4c,
+				   int which, __be32 new_addr, __be16 new_port)
 {
-	__be32 old_addr = *addr_field;
-	__be16 old_port = *port_field;
-	__u16 *l4c;
+	__be32 old_addr;
+	__be16 old_port;
 
-	*addr_field = new_addr;
-	*port_field = new_port;
-	p->iph->check = csum_replace4(p->iph->check, old_addr, new_addr);
+	if (which == XF_SRC) {
+		old_addr = iph->saddr;
+		old_port = ports->source;
+		iph->saddr = new_addr;
+		ports->source = new_port;
+	} else {
+		old_addr = iph->daddr;
+		old_port = ports->dest;
+		iph->daddr = new_addr;
+		ports->dest = new_port;
+	}
 
-	l4c = (p->iph->protocol == IPPROTO_TCP)
-	    ? (__u16 *)((__u8 *)p->ports + 16)
-	    : (__u16 *)((__u8 *)p->ports + 6);
+	iph->check = csum_replace4(iph->check, old_addr, new_addr);
 
-	if ((void *)(l4c + 1) <= p->data_end &&
-	    (p->iph->protocol == IPPROTO_TCP || *l4c)) {
+	if (l4csum_live(p, l4c)) {
 		__u16 c = csum_replace4(*l4c, old_addr, new_addr);
 
-		*l4c = csum_replace2(c, old_port, new_port);
+		put_l4csum(p, l4c, csum_replace2(c, old_port, new_port));
+	}
+}
+
+/* IPv6: rewrite one address and port pair and repair the L4 checksum.
+ *
+ * Shorter than the v4 case by exactly one checksum. IPv6 has no header
+ * checksum, so the only repair is the L4 one, and a 128-bit address is four
+ * applications of the same 32-bit delta - which is all
+ * inet_proto_csum_replace16() does (net/core/utils.c).
+ */
+static __always_inline void xlate6(struct parsed *p, struct ipv6hdr_ *ip6h,
+				   struct ports_ *ports, __u16 *l4c,
+				   int which, const __be32 *new_addr,
+				   __be16 new_port)
+{
+	__be32 old_addr[4];
+	__be16 old_port;
+	int i;
+
+	if (which == XF_SRC) {
+		__builtin_memcpy(old_addr, ip6h->saddr, 16);
+		__builtin_memcpy(ip6h->saddr, new_addr, 16);
+		old_port = ports->source;
+		ports->source = new_port;
+	} else {
+		__builtin_memcpy(old_addr, ip6h->daddr, 16);
+		__builtin_memcpy(ip6h->daddr, new_addr, 16);
+		old_port = ports->dest;
+		ports->dest = new_port;
+	}
+
+	if (l4csum_live(p, l4c)) {
+		__u16 c = *l4c;
+
+		for (i = 0; i < 4; i++)
+			c = csum_replace4(c, old_addr[i], new_addr[i]);
+		put_l4csum(p, l4c, csum_replace2(c, old_port, new_port));
 	}
 }
 
@@ -399,6 +666,7 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 {
 	struct flow_offload_tuple_rhash___local *th, *other;
 	struct flow_offload___local *flow;
+	struct ports_ *ports;
 	__u8 xmit;
 	__u32 hsz;
 	int rc;
@@ -409,13 +677,19 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 		return -1;
 	}
 
+	ports = l4ports(p);
+	if (!ports) {
+		bump(ST_SHORT);
+		return -1;
+	}
+
 	/* TCP teardown must reach conntrack, so hand FIN and RST to the stack.
 	 * nf_flow_state_check() does the same and additionally tears the flow
 	 * down; this program cannot, so the stack's copy of the check is what
 	 * retires it.
 	 */
-	if (p->iph->protocol == IPPROTO_TCP) {
-		__u8 *flagsb = (__u8 *)p->ports + 13;
+	if (p->l4proto == IPPROTO_TCP) {
+		__u8 *flagsb = (__u8 *)ports + 13;
 
 		if ((void *)(flagsb + 1) > p->data_end) {
 			bump(ST_SHORT);
@@ -541,84 +815,157 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 		return -1;
 	}
 
+	/* NAT66 is not hypothetical - the flowtable implements it - but on a
+	 * plain routed IPv6 prefix it should never fire. Counted so that "it
+	 * never fires here" is a measurement rather than an assumption.
+	 */
+	if (p->family == AF_INET6 &&
+	    (d->flags & ((1UL << NF_FLOW_SNAT) | (1UL << NF_FLOW_DNAT))))
+		bump(ST_NAT66);
+
 	/* The translated address and port for whichever directions apply, taken
 	 * from the peer tuple exactly as nf_flow_snat_ip() and nf_flow_dnat_ip()
-	 * do it.
+	 * do it, and their v6 counterparts at :516 and :539, which read the same
+	 * peer fields.
+	 *
+	 * The v6 reads take the address of src_v6 / dst_v6 and pull 16 bytes
+	 * rather than naming a field inside struct in6_addr, because s6_addr is
+	 * a macro and not a BTF field name. See in6_addr___local above.
 	 */
 	if (d->flags & (1UL << NF_FLOW_SNAT)) {
+		int err;
+
 		if (d->dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
-			if (bpf_core_read(&d->snat_addr, sizeof(d->snat_addr),
-					  &other->tuple.dst_v4.s_addr) ||
-			    bpf_core_read(&d->snat_port, sizeof(d->snat_port),
-					  &other->tuple.dst_port)) {
-				bump(ST_READ_ERR);
-				return -1;
-			}
+			err = (p->family == AF_INET6)
+			    ? bpf_core_read(d->snat_addr, 16,
+					    &other->tuple.dst_v6)
+			    : bpf_core_read(d->snat_addr, sizeof(__be32),
+					    &other->tuple.dst_v4.s_addr);
+			err |= bpf_core_read(&d->snat_port, sizeof(d->snat_port),
+					     &other->tuple.dst_port);
 		} else {
-			if (bpf_core_read(&d->snat_addr, sizeof(d->snat_addr),
-					  &other->tuple.src_v4.s_addr) ||
-			    bpf_core_read(&d->snat_port, sizeof(d->snat_port),
-					  &other->tuple.src_port)) {
-				bump(ST_READ_ERR);
-				return -1;
-			}
+			err = (p->family == AF_INET6)
+			    ? bpf_core_read(d->snat_addr, 16,
+					    &other->tuple.src_v6)
+			    : bpf_core_read(d->snat_addr, sizeof(__be32),
+					    &other->tuple.src_v4.s_addr);
+			err |= bpf_core_read(&d->snat_port, sizeof(d->snat_port),
+					     &other->tuple.src_port);
+		}
+		if (err) {
+			bump(ST_READ_ERR);
+			return -1;
 		}
 	}
 
 	if (d->flags & (1UL << NF_FLOW_DNAT)) {
+		int err;
+
 		if (d->dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
-			if (bpf_core_read(&d->dnat_addr, sizeof(d->dnat_addr),
-					  &other->tuple.src_v4.s_addr) ||
-			    bpf_core_read(&d->dnat_port, sizeof(d->dnat_port),
-					  &other->tuple.src_port)) {
-				bump(ST_READ_ERR);
-				return -1;
-			}
+			err = (p->family == AF_INET6)
+			    ? bpf_core_read(d->dnat_addr, 16,
+					    &other->tuple.src_v6)
+			    : bpf_core_read(d->dnat_addr, sizeof(__be32),
+					    &other->tuple.src_v4.s_addr);
+			err |= bpf_core_read(&d->dnat_port, sizeof(d->dnat_port),
+					     &other->tuple.src_port);
 		} else {
-			if (bpf_core_read(&d->dnat_addr, sizeof(d->dnat_addr),
-					  &other->tuple.dst_v4.s_addr) ||
-			    bpf_core_read(&d->dnat_port, sizeof(d->dnat_port),
-					  &other->tuple.dst_port)) {
-				bump(ST_READ_ERR);
-				return -1;
-			}
+			err = (p->family == AF_INET6)
+			    ? bpf_core_read(d->dnat_addr, 16,
+					    &other->tuple.dst_v6)
+			    : bpf_core_read(d->dnat_addr, sizeof(__be32),
+					    &other->tuple.dst_v4.s_addr);
+			err |= bpf_core_read(&d->dnat_port, sizeof(d->dnat_port),
+					     &other->tuple.dst_port);
+		}
+		if (err) {
+			bump(ST_READ_ERR);
+			return -1;
 		}
 	}
 
 	return 0;
 }
 
-/* Apply the translation and decrement the TTL. Nothing here can fail, because
- * every value it uses was read by decide() before the packet was touched.
+/* Apply the translation and decrement the TTL or hop limit.
+ *
+ * Every header pointer is re-derived and checked here, before the first byte is
+ * written, so that a failure can still return without having touched the
+ * packet. Once past the guard clause nothing can fail: the values all came from
+ * decide(), and the bounds all came from these three checks.
  */
-static __always_inline void commit(struct parsed *p, struct decision *d)
+static __always_inline int commit4(struct parsed *p, struct decision *d)
 {
-	if (d->flags & (1UL << NF_FLOW_SNAT)) {
-		if (d->dir == FLOW_OFFLOAD_DIR_ORIGINAL)
-			xlate(p, &p->iph->saddr, &p->ports->source,
-			      d->snat_addr, d->snat_port);
-		else
-			xlate(p, &p->iph->daddr, &p->ports->dest,
-			      d->snat_addr, d->snat_port);
-	}
+	struct iphdr_ *iph = v4hdr(p);
+	struct ports_ *ports = l4ports(p);
+	__u16 *l4c;
 
-	if (d->flags & (1UL << NF_FLOW_DNAT)) {
-		if (d->dir == FLOW_OFFLOAD_DIR_ORIGINAL)
-			xlate(p, &p->iph->daddr, &p->ports->dest,
-			      d->dnat_addr, d->dnat_port);
-		else
-			xlate(p, &p->iph->saddr, &p->ports->source,
-			      d->dnat_addr, d->dnat_port);
-	}
+	if (!iph || !ports)
+		return -1;
+	l4c = l4csum(p, ports);
+	if (!l4c)
+		return -1;
 
-	/* TTL, per ip_decrease_ttl(): decrement and repair the header checksum. */
+	/* Which end moves depends on the direction, and the pairing is not
+	 * symmetric: SNAT rewrites the source on an ORIGINAL packet and the
+	 * destination on a REPLY, DNAT the other way about. Straight out of
+	 * nf_flow_snat_ip() and nf_flow_dnat_ip().
+	 */
+	if (d->flags & (1UL << NF_FLOW_SNAT))
+		xlate4(p, iph, ports, l4c,
+		       d->dir == FLOW_OFFLOAD_DIR_ORIGINAL ? XF_SRC : XF_DST,
+		       d->snat_addr[0], d->snat_port);
+
+	if (d->flags & (1UL << NF_FLOW_DNAT))
+		xlate4(p, iph, ports, l4c,
+		       d->dir == FLOW_OFFLOAD_DIR_ORIGINAL ? XF_DST : XF_SRC,
+		       d->dnat_addr[0], d->dnat_port);
+
+	/* TTL, per ip_decrease_ttl(): decrement and repair the header
+	 * checksum, which covers the TTL and protocol octets as one word.
+	 */
 	{
-		__be16 old_ttl_proto = *(__be16 *)&p->iph->ttl;
+		__be16 old_ttl_proto = *(__be16 *)&iph->ttl;
 
-		p->iph->ttl -= 1;
-		p->iph->check = csum_replace2(p->iph->check, old_ttl_proto,
-					      *(__be16 *)&p->iph->ttl);
+		iph->ttl -= 1;
+		iph->check = csum_replace2(iph->check, old_ttl_proto,
+					   *(__be16 *)&iph->ttl);
 	}
+	return 0;
+}
+
+static __always_inline int commit6(struct parsed *p, struct decision *d)
+{
+	struct ipv6hdr_ *ip6h = v6hdr(p);
+	struct ports_ *ports = l4ports(p);
+	__u16 *l4c;
+
+	if (!ip6h || !ports)
+		return -1;
+	l4c = l4csum(p, ports);
+	if (!l4c)
+		return -1;
+
+	/* Same pairing as the v4 arm, from nf_flow_snat_ipv6() at :516 and
+	 * nf_flow_dnat_ipv6() at :539.
+	 */
+	if (d->flags & (1UL << NF_FLOW_SNAT))
+		xlate6(p, ip6h, ports, l4c,
+		       d->dir == FLOW_OFFLOAD_DIR_ORIGINAL ? XF_SRC : XF_DST,
+		       d->snat_addr, d->snat_port);
+
+	if (d->flags & (1UL << NF_FLOW_DNAT))
+		xlate6(p, ip6h, ports, l4c,
+		       d->dir == FLOW_OFFLOAD_DIR_ORIGINAL ? XF_DST : XF_SRC,
+		       d->dnat_addr, d->dnat_port);
+
+	/* No checksum repair, and this is the one place the v6 path is
+	 * genuinely simpler rather than merely different: IPv6 has no header
+	 * checksum, and the hop limit is not part of the L4 pseudo-header. The
+	 * kernel decrements it bare at nf_flow_table_ip.c:682.
+	 */
+	ip6h->hop_limit -= 1;
+	return 0;
 }
 
 SEC("xdp.frags")
@@ -670,13 +1017,22 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 	struct ethhdr_ *eth;
 	struct parsed p;
 	void *data_end;
+	int rc;
 
 	bump(ST_SEEN);
 
 	if (decide(ctx, &p, &d))
 		return XDP_PASS;
 
-	commit(&p, &d);
+	rc = (p.family == AF_INET6) ? commit6(&p, &d) : commit4(&p, &d);
+	if (rc) {
+		/* Cannot happen: decide() established every one of these
+		 * bounds. Counted and passed rather than asserted, because the
+		 * alternative to being wrong about that is a dropped packet.
+		 */
+		bump(ST_SHORT);
+		return XDP_PASS;
+	}
 
 	/* Grow an Ethernet header in front. XDP_PACKET_HEADROOM is 256 and
 	 * do_xdp_generic() guarantees it before running the program, so this
@@ -688,6 +1044,9 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
+	/* p.data and p.data_end are stale from here on - adjust_head moved the
+	 * start of the packet - so only the scalar p.family is read below.
+	 */
 	data_end = (void *)(long)ctx->data_end;
 	eth = (void *)(long)ctx->data;
 	if ((void *)(eth + 1) > data_end)
@@ -695,7 +1054,7 @@ int xdp_ft_fastpath(struct xdp_md *ctx)
 
 	__builtin_memcpy(eth->h_dest, d.h_dest, ETH_ALEN);
 	__builtin_memcpy(eth->h_source, d.h_source, ETH_ALEN);
-	eth->h_proto = bpf_htons(ETH_P_IP);
+	eth->h_proto = bpf_htons(p.family == AF_INET6 ? ETH_P_IPV6 : ETH_P_IP);
 
 	bump(ST_REDIRECT);
 	return bpf_redirect(d.out_ifidx, 0);
