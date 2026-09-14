@@ -1,6 +1,7 @@
 #!/bin/sh
 # Load, attach and measure the flowtable-driven XDP path on wwan0.
 #
+#   xdp-ft-wwan.sh fetch          put the program at $OBJ, from bpf/ or the repo
 #   xdp-ft-wwan.sh check          preflight only, changes nothing
 #   xdp-ft-wwan.sh probe [secs]   attach the counting program, sample, detach
 #   xdp-ft-wwan.sh fastpath       attach the redirecting program and leave it on
@@ -14,7 +15,7 @@
 set -eu
 
 IFACE=${IFACE:-wwan0}
-OBJ=${OBJ:-/root/xdp_ft_wwan.bpf.o}
+OBJ=${OBJ:-/tmp/xdp_ft_wwan.o}
 PINDIR=/sys/fs/bpf/xdp_ft
 MAPDIR=/sys/fs/bpf/xdp_ft_maps
 SECS=${2:-20}
@@ -105,7 +106,7 @@ check() {
 load() {
 	prog=$1
 	mount | grep -q '/sys/fs/bpf' || mount -t bpf bpf /sys/fs/bpf
-	[ -f "$OBJ" ] || { say "object not found: $OBJ"; exit 1; }
+	fetch_obj
 	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 	bpftool prog loadall "$OBJ" "$PINDIR" pinmaps "$MAPDIR"
 	ip link set dev "$IFACE" xdp pinned "$PINDIR/$prog"
@@ -146,8 +147,31 @@ for e in json.load(sys.stdin):
 	fi
 }
 
+# ---- BPF object -----------------------------------------------------------
+# Fetched or read from disk, never base64 in the script: OpenWrt's busybox
+# ships without the base64 applet, so an embedded blob cannot be decoded on the
+# router. Same reasoning and same layout as verify-992a.sh, whose objects this
+# sits beside. Named .bpf rather than .o because the repo's .gitignore has a
+# blanket *.o rule.
+BPF_URL=${BPF_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/bpf}
+case "$0" in */*) _here=${0%/*} ;; *) _here=. ;; esac
+BPF_DIR=${BPF_DIR:-$_here/bpf}
+
+fetch_obj() {
+	[ -s "$OBJ" ] && return 0
+	if [ -s "$BPF_DIR/xdp_ft_wwan.bpf" ]; then
+		cat "$BPF_DIR/xdp_ft_wwan.bpf" > "$OBJ"
+	elif command -v curl >/dev/null 2>&1; then
+		curl -fsSL -o "$OBJ" "$BPF_URL/xdp_ft_wwan.bpf"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q -O "$OBJ" "$BPF_URL/xdp_ft_wwan.bpf"
+	fi
+	[ -s "$OBJ" ] || { say "no object: put xdp_ft_wwan.bpf in $BPF_DIR, or let the router reach $BPF_URL"; exit 1; }
+}
+
 case "${1:-check}" in
 check)    check ;;
+fetch)    fetch_obj && say "object at $OBJ" ;;
 probe)    check && load xdp_ft_probe && say "sampling ${SECS}s..." && sleep "$SECS" && dump ;;
 fastpath) check && load xdp_ft_fastpath && say "" &&
           say "Attached. Watch for trouble: a client losing connectivity means the" &&
