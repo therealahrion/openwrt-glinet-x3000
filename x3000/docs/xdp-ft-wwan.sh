@@ -54,22 +54,48 @@ dryrun)
 esac
 OBJ="$D/$OBJNAME"
 
-say()  { printf '%s\n' "$*"; }
-ok()   { printf '  ok    %s\n' "$*"; }
-bad()  { printf '  FAIL  %s\n' "$*"; FAILED=1; }
-warn() { printf '  note  %s\n' "$*"; }
+case "$0" in */*) _here=${0%/*} ;; *) _here=. ;; esac
 
-# Busybox provides an `ip` that does not understand xdp, so the binary has to be
-# chosen by capability rather than by name. Same pick() and same candidate list
-# as verify-992a.sh.
-pick() {
-	for c in "$@"; do
-		[ -x "$c" ] || continue
-		"$c" link help 2>&1 | grep -qi xdp && { echo "$c"; return; }
-	done
-	echo ""
-}
-IP=$(pick /usr/libexec/ip-full /sbin/ip /usr/sbin/ip /bin/ip)
+# boxstate.sh is the shared preflight: it owns every reader this script used to
+# carry its own copy of, and it is the only place a gate's wording lives. Fetch
+# it the same way the objects are fetched, because this script is normally run
+# from /tmp after a curl and has no tree beside it.
+BOXSTATE_URL=${BOXSTATE_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/boxstate.sh}
+BOXSTATE=${BOXSTATE:-$_here/boxstate.sh}
+if [ ! -r "$BOXSTATE" ]; then
+	BOXSTATE=/tmp/boxstate.sh
+	if [ ! -s "$BOXSTATE" ]; then
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsSL -o "$BOXSTATE" "$BOXSTATE_URL" || true
+		elif command -v wget >/dev/null 2>&1; then
+			wget -q -O "$BOXSTATE" "$BOXSTATE_URL" || true
+		fi
+	fi
+fi
+if [ ! -s "$BOXSTATE" ]; then
+	echo "FATAL: boxstate.sh not found beside this script and could not be" >&2
+	echo "       fetched from $BOXSTATE_URL" >&2
+	exit 1
+fi
+BOXSTATE_LIB=1 . "$BOXSTATE"
+
+# A stale boxstate.sh cached in /tmp from an older revision is the same trap the
+# object checksum guards against, and it fails less obviously: a renamed reader
+# is "not found" three screens into a run.
+BOXSTATE_NEED=1
+if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
+	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
+	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again so the" >&2
+	echo "       two come from the same revision." >&2
+	exit 1
+fi
+
+say()  { bs_say "$@"; }
+ok()   { bs_ok "$@"; }
+bad()  { bs_bad "$@"; FAILED=1; }
+warn() { bs_note "$@"; }
+
+IP=$(bs_pick_ip)
 if [ -z "$IP" ]; then
 	echo "FATAL: no iproute2 'ip' that understands xdp." >&2
 	echo "       install ip-full (CONFIG_PACKAGE_ip-full=y) and re-run." >&2
@@ -157,13 +183,7 @@ check() {
 	# parsing iproute2's label: an ip predating ARPHRD_RAWIP prints link/[519]
 	# and the label then says nothing. 519 RAWIP, 65534 NONE, 1 ETHER.
 	if "$IP" link show "$IFACE" >/dev/null 2>&1; then
-		AT=$(cat "/sys/class/net/$IFACE/type" 2>/dev/null || echo "")
-		case "$AT" in
-		519|65534) ok "$IFACE type $AT - no L2 header, IP at offset 0 as the parser assumes" ;;
-		1)         bad "$IFACE type 1 (ARPHRD_ETHER) - carries an Ethernet header this parser would misread" ;;
-		"")        bad "cannot read /sys/class/net/$IFACE/type" ;;
-		*)         warn "$IFACE type $AT - unexpected; confirm there is no L2 header first" ;;
-		esac
+		bs_require_rawip "$IFACE"
 	else
 		bad "$IFACE does not exist"
 	fi
@@ -172,45 +192,26 @@ check() {
 		warn "$IFACE already has a program attached; run 'off' first"
 	fi
 
-	if [ -r /sys/kernel/btf/vmlinux ]; then
-		ok "vmlinux BTF present ($(( $(wc -c < /sys/kernel/btf/vmlinux) / 1024 )) KB)"
-	else
-		bad "no /sys/kernel/btf/vmlinux - CO-RE programs cannot load"
-	fi
+	bs_require_btf
 
 	# nf_flow_table is a module here, so the kfunc's BTF is the module's and
 	# not vmlinux - the same place verify-992a.sh looks.
 	modprobe nf_flow_table 2>/dev/null || true
-	if [ -r /sys/kernel/btf/nf_flow_table ]; then
-		if bpftool btf dump file /sys/kernel/btf/nf_flow_table format raw 2>/dev/null \
-		   | grep -q bpf_xdp_flow_lookup; then
-			ok "bpf_xdp_flow_lookup is in the nf_flow_table module BTF"
-		else
-			bad "bpf_xdp_flow_lookup not in nf_flow_table BTF - nf_flow_table_bpf.o was not built"
-		fi
-	else
-		bad "no BTF for nf_flow_table - module not loaded, or DEBUG_INFO_BTF_MODULES off"
-	fi
+	bs_require_kfunc nf_flow_table bpf_xdp_flow_lookup
 
-	# Software flow offload on, hardware off. Hardware offload sends
-	# nf_flow_table_offload_setup() down the other branch, so the device is
-	# never inserted into the XDP hashtable and every lookup returns -ENOENT.
-	FT=$(nft list ruleset 2>/dev/null | sed -n '/flowtable/,/}/p' || true)
-	if [ -n "$FT" ]; then
-		ok "a flowtable exists"
-		if printf '%s' "$FT" | grep -q "\"$IFACE\""; then
-			ok "$IFACE is in the flowtable device list"
-		else
-			bad "$IFACE is NOT in the flowtable - needs the firewall4 l3_device patch"
-		fi
-		if printf '%s' "$FT" | grep -q 'flags offload'; then
-			bad "hardware offload is ON - every lookup will miss. Set flow_offloading_hw=0"
-		else
-			ok "hardware offload is off, so the XDP hashtable is populated"
-		fi
-	else
-		bad "no flowtable in the ruleset - enable software flow offloading"
-	fi
+	# Software flow offload on, hardware off, and the interface in the device
+	# list. Neither is changed automatically: both need `fw4 reload`, which
+	# empties the flowtable and would destroy the state about to be measured.
+	bs_require_flowtable "$IFACE"
+	bs_require_hfo_off
+	bs_note_bridge_ports
+
+	# State that does not invalidate the window but changes how to read it.
+	bs_has_shaper "$IFACE" || warn "no shaper on $IFACE - a redirect would bypass"\
+" the qdisc anyway, but the baseline latency is unshaped (17.2)"
+	pgrep irqbalance >/dev/null 2>&1 && warn "irqbalance is running - it can move"\
+" IRQ masks mid-window"
+	FAILED=$((FAILED + BS_FAILED))
 
 	if [ "${FAILED:-0}" -eq 0 ]; then
 		say ""

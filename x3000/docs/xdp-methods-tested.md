@@ -3024,3 +3024,87 @@ the program was still attached, so a packet arriving mid-dump could bump `hit`
 after that slot had been read and bump its exit slot before that one was. Small,
 and it is exactly the kind of discrepancy that gets blamed on the program.
 `unhook` is now split out of `detach` and runs before the dump.
+
+### 23.14 The impossible counter, answered - 2026-09-14
+
+23.13 recorded 41-50% of lookups reading `tuple.dir` back as a value the kernel
+cannot hold, and declined to explain it. The diagnostic build answers it, and
+the answer is the good one.
+
+One window, 456173 packets, 99.99% IPv6:
+
+| | |
+|---|---|
+| `hit` | 444040 |
+| `l3_ok` / `l3_bad` | **444040 / 0** |
+| `iif_ok` / `iif_bad` | **444040 / 0** |
+| `dir2` / `dir3` | **0 / 186297** |
+| `baddir_xmit_direct` / `baddir_xmit_other` | **0 / 186297** |
+| `not_direct` | 17 |
+| `would_redirect` | **257706** |
+
+`186297 + 20 + 17 + 257706 = 444040`, so every hit is accounted for.
+
+**The returned tuplehash is the right one.** `l3proto` agreed with the packet's
+own family and `iifidx` agreed with the ingress ifindex on every one of 444040
+lookups, with not a single disagreement. Both are part of the lookup key, so a
+tuplehash that came back disagreeing with either would not be the one that was
+asked for. It always was. **`th` is sound, the `FIELD_BYTE_OFFSET` relocations
+are sound, and `would_redirect` is not void** - which was the outcome to rule
+out first and is now ruled out by measurement rather than by argument.
+
+**The wrong value is a constant.** `dir2` is zero and `dir3` is all of it. Not a
+race, not random bits: the same wrong answer every time. A race would have split
+between 2 and 3.
+
+**And `iif_ok` pins what the right answer must have been.** Every matched
+tuplehash has `iifidx` equal to the `wwan0` ingress ifindex. For a
+LAN-initiated flow that is `tuplehash[FLOW_OFFLOAD_DIR_REPLY]`, so `dir` should
+read 1 on essentially all 444040. 186297 of them read 3.
+
+So: the pointer is right, the plain-field reads through it are right, and the
+two-bit bitfield extraction beside them is wrong in a fixed way. That is a bug
+in this program, in one expression, and it is fixable.
+
+#### What it costs, and what it does not
+
+The 257706 packets counted as `would_redirect` read `dir` as 0 or 1 and
+`xmit_type` as `DIRECT`. Those are not proven correct - a read that is
+systematically wrong can land on a legal value - but they are no longer
+suspected of coming from the wrong memory. The honest statement is that
+**`would_redirect` is a floor, not a figure**: 186297 packets were rejected on
+a `dir` value that should have been 1, and had the extraction been right they
+would have gone on to the `xmit_type` test like the rest.
+
+`baddir_xmit_other` being all 186297 is consistent with that and with nothing
+else obvious: on the packets whose `dir` came back 3, `xmit_type` read as
+something other than `DIRECT`, even though `not_direct` on the packets with a
+good `dir` is 17 out of 257723. Two reads out of the same byte disagreeing that
+sharply is the signature of the extraction, not of the data.
+
+#### Not yet explained, and deliberately not guessed at
+
+Why the extraction is wrong is still open. What is now excluded, by
+measurement rather than by reasoning:
+
+- the pointer (`l3_ok`, `iif_ok`)
+- a race (`dir2` is exactly zero)
+- the `FIELD_BYTE_OFFSET` relocation class (the same class carries `l3proto`
+  and `iifidx`)
+
+What remains is the bitfield relocation quartet -
+`BYTE_OFFSET`/`BYTE_SIZE`/`LSHIFT_U64`/`RSHIFT_U64` as libbpf patches them
+against this kernel's BTF - and the eight-byte probe read the macro builds from
+them. The next build reports those four patched constants and the raw byte, so
+the arithmetic can be checked against the kernel's real layout instead of
+inferred from the local mirror's.
+
+#### The measurement that settled it, as a method
+
+Worth keeping separately from the result. The question was "is `th` wrong or is
+the extraction wrong", and the instrument was two ordinary scalar reads of
+fields that are *part of the lookup key*. A field the caller supplied and the
+kernel matched on is a free self-check: if it comes back different from what
+was asked for, the answer is not about the question. That works for any kfunc
+or map lookup that takes a key, costs two probe reads, and needs no knowledge
+of the bug being chased.
