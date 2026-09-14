@@ -37,19 +37,44 @@ for a in "$@"; do
 	esac
 done
 
-# OpenWrt ships busybox's cut-down `ip`/`tc` as well as the real ones. Busybox
-# ip cannot do `xdp`, so pick a capable binary or say so plainly.
-pick() {
-	for c in "$@"; do
-		[ -x "$c" ] || continue
-		case "$1" in *ip*) "$c" link help 2>&1 | grep -qi xdp && { echo "$c"; return; } ;;
-		            *)     "$c" -V >/dev/null 2>&1 && { echo "$c"; return; } ;;
-		esac
-	done
-	echo ""
-}
-IP=$(pick /usr/libexec/ip-full /sbin/ip /usr/sbin/ip /bin/ip)
-TC=$(pick /usr/libexec/tc-bpf /sbin/tc /usr/sbin/tc)
+# boxstate.sh is the shared preflight and owns every reader this script used to
+# carry its own copy of. Fetched the same way the BPF objects are, because this
+# script is normally run from /tmp after a curl with no tree beside it.
+case "$0" in */*) _bshere=${0%/*} ;; *) _bshere=. ;; esac
+BOXSTATE_URL=${BOXSTATE_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/boxstate.sh}
+BOXSTATE=${BOXSTATE:-$_bshere/boxstate.sh}
+if [ ! -r "$BOXSTATE" ]; then
+	BOXSTATE=/tmp/boxstate.sh
+	if [ ! -s "$BOXSTATE" ]; then
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsSL -o "$BOXSTATE" "$BOXSTATE_URL" || true
+		elif command -v wget >/dev/null 2>&1; then
+			wget -q -O "$BOXSTATE" "$BOXSTATE_URL" || true
+		fi
+	fi
+fi
+if [ ! -s "$BOXSTATE" ]; then
+	echo "FATAL: boxstate.sh not found beside this script and could not be" >&2
+	echo "       fetched from $BOXSTATE_URL" >&2
+	exit 2
+fi
+BOXSTATE_LIB=1 . "$BOXSTATE"
+BOXSTATE_NEED=1
+if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
+	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
+	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again." >&2
+	exit 2
+fi
+
+# The library's gates report through bs_ok/bs_bad/bs_note. Point those at this
+# script's own counters, or every gate that moved into the library would stop
+# being counted in the summary at the end.
+bs_ok()   { ok   "$1"; }
+bs_bad()  { bad  "$1"; BS_FAILED=1; }
+bs_note() { skip "$1"; }
+
+IP=$(bs_pick_ip)
+TC=$(bs_pick_tc)
 if [ -z "$IP" ]; then
 	echo "FATAL: no iproute2 'ip' that understands xdp." >&2
 	echo "       install ip-full (CONFIG_PACKAGE_ip-full=y) and re-run." >&2
@@ -164,26 +189,9 @@ else
 fi
 
 hdr "2. BTF, and the flowtable XDP kfunc it gates"
-if [ -r /sys/kernel/btf/vmlinux ]; then
-	ok "/sys/kernel/btf/vmlinux present ($(( $(wc -c < /sys/kernel/btf/vmlinux) / 1024 )) KB)"
-else
-	bad "/sys/kernel/btf/vmlinux missing — CO-RE programs cannot load"
-fi
+bs_require_btf
 modprobe nf_flow_table 2>/dev/null
-if [ -r /sys/kernel/btf/nf_flow_table ]; then
-	ok "module BTF for nf_flow_table present (DEBUG_INFO_BTF_MODULES working)"
-	if command -v bpftool >/dev/null 2>&1; then
-		if bpftool btf dump file /sys/kernel/btf/nf_flow_table format raw 2>/dev/null | grep -q bpf_xdp_flow_lookup; then
-			ok "bpf_xdp_flow_lookup kfunc IS present"
-		else
-			bad "bpf_xdp_flow_lookup kfunc NOT found in nf_flow_table BTF"
-		fi
-	else
-		skip "bpftool absent — cannot dump BTF"
-	fi
-else
-	bad "no BTF for nf_flow_table (module not loaded, or BTF_MODULES off)"
-fi
+bs_require_kfunc nf_flow_table bpf_xdp_flow_lookup
 
 hdr "3. $WANIF exists and advertises the new feature set"
 if $IP link show "$WANIF" >/dev/null 2>&1; then

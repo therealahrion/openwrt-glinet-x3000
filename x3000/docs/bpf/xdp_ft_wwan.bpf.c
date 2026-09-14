@@ -329,6 +329,78 @@ struct {
 	__uint(max_entries, ST__MAX);
 } xdp_ft_stats SEC(".maps");
 
+/* The relocation constants libbpf actually patched in, reported rather than
+ * inferred.
+ *
+ * 23.14 established that the pointer is right and the two-bit dir extraction
+ * beside it is wrong in a fixed way, and then stopped, because every mechanism
+ * I could construct from the local mirror's layout predicted something the
+ * data denied. The local mirror is the wrong thing to reason from: CO-RE
+ * patches these values from the running kernel's BTF at load time, and what
+ * they become is the only thing that matters. So the program reports them.
+ *
+ * l3proto and iifidx are in here as a control. Their reads are known good -
+ * 444040 agreements, no disagreements - so their offsets say what a correct
+ * relocation looks like on this kernel, and the dir window can be checked
+ * against them rather than against my mirror.
+ *
+ * A plain array, not per-CPU: these are constants, and a per-CPU array would
+ * report each one multiplied by however many CPUs ran the program.
+ */
+enum relo_slot {
+	RL_DIR_OFF = 0,		/* byte offset of dir's containing unit, from th */
+	RL_DIR_SZ,		/* how many bytes the macro reads */
+	RL_DIR_LSHIFT,
+	RL_DIR_RSHIFT,
+	RL_XMIT_OFF,
+	RL_XMIT_SZ,
+	RL_XMIT_LSHIFT,
+	RL_XMIT_RSHIFT,
+	RL_L3_OFF,		/* control: known-good plain field */
+	RL_IIF_OFF,		/* control: known-good plain field */
+	RL_TUPLE_OFF,		/* control: offset of tuple within the rhash */
+	RL_RHASH_SZ,		/* control: TYPE_SIZE, measured at 88 */
+	RL_RAW_LO,		/* the 8 bytes the dir read returns, last seen */
+	RL_RAW_HI,
+	RL__MAX,
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, RL__MAX);
+} xdp_ft_relo SEC(".maps");
+
+/* Every distinct value of the byte the dir bits are supposed to live in. One
+ * value dominating says the extraction is reading a real field and taking the
+ * wrong bits out of it; a spread says it is not reading that field at all.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 256);
+} xdp_ft_dirbyte SEC(".maps");
+
+static __always_inline void relo_set(__u32 slot, __u64 v)
+{
+	__u64 *p = bpf_map_lookup_elem(&xdp_ft_relo, &slot);
+
+	if (p)
+		*p = v;
+}
+
+static __always_inline void bump_byte(__u32 b)
+{
+	__u64 *v;
+
+	b &= 0xff;
+	v = bpf_map_lookup_elem(&xdp_ft_dirbyte, &b);
+	if (v)
+		*v += 1;
+}
+
 static __always_inline void bump(__u32 slot)
 {
 	__u64 *v = bpf_map_lookup_elem(&xdp_ft_stats, &slot);
@@ -765,6 +837,48 @@ static __always_inline int decide(struct xdp_md *ctx, struct parsed *p,
 			bump(ST_IIF_BAD);
 		else
 			bump(iif == ctx->ingress_ifindex ? ST_IIF_OK : ST_IIF_BAD);
+	}
+
+	/* What CO-RE patched in, and the bytes it reads with them. Written on
+	 * every packet rather than once, because there is nowhere in an XDP
+	 * program to do one-time setup and the values are constants anyway.
+	 */
+	{
+		__u32 off = bpf_core_field_offset(th->tuple.dir);
+		__u64 raw = 0;
+
+		relo_set(RL_DIR_OFF, off);
+		relo_set(RL_DIR_SZ, bpf_core_field_size(th->tuple.dir));
+		relo_set(RL_DIR_LSHIFT,
+			 __builtin_preserve_field_info(th->tuple.dir,
+						       BPF_FIELD_LSHIFT_U64));
+		relo_set(RL_DIR_RSHIFT,
+			 __builtin_preserve_field_info(th->tuple.dir,
+						       BPF_FIELD_RSHIFT_U64));
+		relo_set(RL_XMIT_OFF, bpf_core_field_offset(th->tuple.xmit_type));
+		relo_set(RL_XMIT_SZ, bpf_core_field_size(th->tuple.xmit_type));
+		relo_set(RL_XMIT_LSHIFT,
+			 __builtin_preserve_field_info(th->tuple.xmit_type,
+						       BPF_FIELD_LSHIFT_U64));
+		relo_set(RL_XMIT_RSHIFT,
+			 __builtin_preserve_field_info(th->tuple.xmit_type,
+						       BPF_FIELD_RSHIFT_U64));
+		relo_set(RL_L3_OFF, bpf_core_field_offset(th->tuple.l3proto));
+		relo_set(RL_IIF_OFF, bpf_core_field_offset(th->tuple.iifidx));
+		relo_set(RL_TUPLE_OFF, bpf_core_field_offset(th->tuple));
+		relo_set(RL_RHASH_SZ,
+			 bpf_core_type_size(struct flow_offload_tuple_rhash___local));
+
+		/* The same eight bytes BPF_CORE_READ_BITFIELD_PROBED reads,
+		 * from the same relocated offset. Histogramming the low byte
+		 * says whether that window holds the bitfield or something
+		 * else entirely.
+		 */
+		if (!bpf_core_read(&raw, sizeof(raw), (char *)th + off)) {
+			relo_set(RL_RAW_LO, raw & 0xffffffff);
+			relo_set(RL_RAW_HI, raw >> 32);
+			bump_byte((__u32)(raw & 0xff));
+		}
 	}
 
 	d->dir = BPF_CORE_READ_BITFIELD_PROBED(&th->tuple, dir);

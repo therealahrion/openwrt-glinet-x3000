@@ -44,6 +44,18 @@ MIX_SECS=${MIX_SECS:-${2:-30}}
 bs_say() { printf '%s\n' "$*"; }
 bs_kv()  { printf '  %-26s %s\n' "$1" "$2"; }
 bs_hdr() { bs_say ""; bs_say "== $*"; }
+# The gate functions below report through these three by name, not by value,
+# so a caller that keeps its own tally redefines them after sourcing and the
+# gates then feed that tally instead of this one:
+#
+#   BOXSTATE_LIB=1 . boxstate.sh
+#   bs_ok()   { ok   "$1"; }        # ok/bad being the caller's own counters
+#   bs_bad()  { bad  "$1"; }
+#   bs_note() { skip "$1"; }
+#
+# verify-992a.sh does exactly that. Without it its summary would have
+# under-reported, because a gate that moved out of the script stopped moving
+# the script's FAIL count with it.
 bs_ok()   { printf '  ok    %s\n' "$*"; }
 bs_bad()  { printf '  FAIL  %s\n' "$*"; BS_FAILED=1; }
 bs_note() { printf '  note  %s\n' "$*"; }
@@ -61,6 +73,20 @@ bs_pick_ip() {
   for c in /usr/libexec/ip-full /sbin/ip /usr/sbin/ip /bin/ip; do
     [ -x "$c" ] || continue
     "$c" link help 2>&1 | grep -qi xdp && { echo "$c"; return 0; }
+  done
+  echo ""
+  return 0
+}
+
+# Likewise for tc: busybox tc cannot load a BPF classifier. verify-992a.sh
+# picked both binaries with one function that switched on "$1" rather than on
+# the candidate it was testing - so it chose the right branch only because the
+# first entry of each list happened to decide it, and reordering either list
+# would have silently picked the wrong test. Two functions, no switch.
+bs_pick_tc() {
+  for c in /usr/libexec/tc-bpf /sbin/tc /usr/sbin/tc; do
+    [ -x "$c" ] || continue
+    "$c" -V >/dev/null 2>&1 && { echo "$c"; return 0; }
   done
   echo ""
   return 0

@@ -49,7 +49,36 @@ STREAMS=${STREAMS:-4}
 WINDOW=${WINDOW:-12}
 PINGTGT=${PINGTGT:-1.1.1.1}
 
-say() { printf '%s\n' "$*"; }
+# boxstate.sh is the shared preflight and owns the state readers, the setters
+# and the restore. Fetched the same way everything else here is, because this
+# script is normally run from /tmp after a curl with no tree beside it.
+case "$0" in */*) _bshere=${0%/*} ;; *) _bshere=. ;; esac
+BOXSTATE_URL=${BOXSTATE_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/boxstate.sh}
+BOXSTATE=${BOXSTATE:-$_bshere/boxstate.sh}
+if [ ! -r "$BOXSTATE" ]; then
+	BOXSTATE=/tmp/boxstate.sh
+	if [ ! -s "$BOXSTATE" ]; then
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsSL -o "$BOXSTATE" "$BOXSTATE_URL" || true
+		elif command -v wget >/dev/null 2>&1; then
+			wget -q -O "$BOXSTATE" "$BOXSTATE_URL" || true
+		fi
+	fi
+fi
+if [ ! -s "$BOXSTATE" ]; then
+	echo "FATAL: boxstate.sh not found beside this script and could not be" >&2
+	echo "       fetched from $BOXSTATE_URL" >&2
+	exit 1
+fi
+BOXSTATE_LIB=1 . "$BOXSTATE"
+BOXSTATE_NEED=1
+if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
+	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
+	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again." >&2
+	exit 1
+fi
+
+say() { bs_say "$@"; }
 
 # ---- guards ---------------------------------------------------------------
 [ -d /sys/class/net/$WANIF ] || { say "FATAL: $WANIF does not exist"; exit 1; }
@@ -58,22 +87,25 @@ grep -q up /sys/class/net/$WANIF/operstate 2>/dev/null ||
 command -v ethtool >/dev/null 2>&1 || { say "FATAL: ethtool not installed"; exit 1; }
 command -v wget    >/dev/null 2>&1 || { say "FATAL: wget not installed"; exit 1; }
 
-ORIG_BACKLOG=$(cat /proc/sys/net/core/netdev_max_backlog)
-ORIG_THREADED=$(cat /sys/class/net/$WANIF/threaded 2>/dev/null || echo 0)
-ORIG_GRO=$(ethtool -k $WANIF 2>/dev/null | awk '/^generic-receive-offload:/{print $2}')
-say "starting state: netdev_max_backlog=$ORIG_BACKLOG threaded=$ORIG_THREADED gro=$ORIG_GRO"
+# Starting state, read through the library so it is read the same way every
+# other script reads it. There are no ORIG_ variables any more: bs_set_*
+# records each target's original the first time that target is touched, which
+# is the difference between restoring the value this run started with and
+# restoring whatever the previous A/B leg happened to leave behind. With three
+# knobs the hand-rolled version was correct; it was the fourth knob somebody
+# adds that it was going to get wrong.
+say "starting state: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro $WANIF)"
+say "time_squeeze so far: $(bs_squeeze)"
 
 PIDS=""
 cleanup() {
 	for p in $PIDS; do kill $p 2>/dev/null; done
 	pkill -f "wget -qO /dev/null" 2>/dev/null
-	sysctl -w net.core.netdev_max_backlog=$ORIG_BACKLOG >/dev/null 2>&1
-	echo "$ORIG_THREADED" > /sys/class/net/$WANIF/threaded 2>/dev/null
-	[ "$ORIG_GRO" = on ] && ethtool -K $WANIF gro on 2>/dev/null
 	rm -f /tmp/.gro_ab_ping
 	[ -s "$LOADLOG" ] && say "fetcher errors were logged to $LOADLOG"
+	bs_restore
 	say ""
-	say "restored: netdev_max_backlog=$(cat /proc/sys/net/core/netdev_max_backlog) threaded=$(cat /sys/class/net/$WANIF/threaded 2>/dev/null) gro=$(ethtool -k $WANIF 2>/dev/null | awk '/^generic-receive-offload:/{print $2}')"
+	say "now: netdev_max_backlog=$(bs_backlog) threaded=$(bs_threaded $WANIF) gro=$(bs_gro $WANIF)"
 }
 trap 'say ""; say "interrupted - restoring"; cleanup; exit 130' INT TERM
 
@@ -244,11 +276,13 @@ if [ "$1" = --baseline ]; then
 fi
 
 for B in 1000 2000 4000; do
-	sysctl -w net.core.netdev_max_backlog=$B >/dev/null
+	bs_set_sysctl net.core.netdev_max_backlog "$B"
 	meas "backlog-$B"
 done
 
-sysctl -w net.core.netdev_max_backlog=$ORIG_BACKLOG >/dev/null
+# No explicit put-back here: bs_restore in cleanup() holds the value this run
+# started with, and re-setting it by hand was how the old code could restore a
+# leg's value rather than the original.
 
 # The threaded-NAPI window is OFF by default, and not because it is dangerous to
 # the box - it restores cleanly - but because it cannot give a valid answer while
@@ -269,7 +303,7 @@ if [ "$1" = --threaded ]; then
 	say "WARNING: threaded NAPI under an on-box load generator measures CPU"
 	say "         starvation of the NAPI kthread, not the driver. See the comment"
 	say "         in this script. Expect a throughput collapse."
-	echo 1 > /sys/class/net/$WANIF/threaded 2>/dev/null
+	bs_set_sysfs /sys/class/net/$WANIF/threaded 1
 	_nt=0
 	for _c in /proc/[0-9]*/comm; do
 		grep -q "^napi/$WANIF" "$_c" 2>/dev/null && _nt=$((_nt+1))

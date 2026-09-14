@@ -118,7 +118,7 @@ BPF_DIR=${BPF_DIR:-$_here/bpf}
 # are the same values and are updated together.
 case "$OBJNAME" in
 xdp_ft_wwan.bpf)
-	WANT_SHA=557f1559a0bbeb001a043b4d8c185248b2ee913696202368ca7936ee7442f6f4 ;;
+	WANT_SHA=e0be6afa2703f6385d5dc1ec110c211586ddee4aaf4f00767bc36caaa992ceb4 ;;
 xdp_ft_probe.bpf)
 	WANT_SHA=99851352f1cf32ae71987f5de58fcc99ee44bfff262e7fba67731cd98179419c ;;
 *)	WANT_SHA= ;;
@@ -346,17 +346,23 @@ adopt_slots_from_map() {
 	esac
 }
 
-dump() {
-	[ -e "$MAPDIR/xdp_ft_stats" ] || { say "not loaded"; return 1; }
-	adopt_slots_from_map
-	legend
+# Read one array map and print "label value" per slot. One parser, three
+# callers: the counters, the relocation constants and the byte histogram. A
+# second parser written for the simpler maps would reintroduce the bugs this
+# one already has fixed - the silent doubling when BTF adds a "formatted"
+# object, and the whole-map-on-one-line token walk.
+#
+#   dump_slots <map name> <space-separated labels>
+dump_slots() {
+	_map=$1
+	[ -e "$MAPDIR/$_map" ] || { say "  $_map not pinned"; return 1; }
 	# Ask for JSON explicitly rather than taking whatever this build's bpftool
 	# prints by default. A bpftool too old for -j fails here, leaves raw empty
 	# and the plain dump is parsed instead.
-	raw=$(bpftool -j map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null) || raw=
-	[ -n "$raw" ] || raw=$(bpftool map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null) || raw=
+	raw=$(bpftool -j map dump pinned "$MAPDIR/$_map" 2>/dev/null) || raw=
+	[ -n "$raw" ] || raw=$(bpftool map dump pinned "$MAPDIR/$_map" 2>/dev/null) || raw=
 	if [ -z "$raw" ]; then
-		say "  bpftool printed nothing for $MAPDIR/xdp_ft_stats"
+		say "  bpftool printed nothing for $MAPDIR/$_map"
 		return 1
 	fi
 
@@ -379,7 +385,7 @@ dump() {
 	# line: bpftool without -p emits the whole map on one line, and a
 	# line-oriented rule reading that collapses every digit in the map into
 	# one number.
-	out=$(printf '%s\n' "$raw" | awk -v slots="$SLOTS" '
+	out=$(printf '%s\n' "$raw" | awk -v slots="$2" '
 	function h2d(x,   i, d, v) {
 		v = 0; x = tolower(x)
 		for (i = 1; i <= length(x); i++) {
@@ -482,17 +488,61 @@ dump() {
 	')
 	printf '%s\n' "$out"
 
-	# Eight zeros against a pinned map means the parser is the likelier
+	# Every slot zero against a pinned map means the parser is the likelier
 	# suspect, not the program. Reading zeros off live counters cost a whole
 	# debugging round once, so show what bpftool actually printed instead of
 	# leaving the next reader to discover the format the hard way.
 	if ! printf '%s\n' "$out" | grep -qv ' 0$'; then
 		say ""
-		say "  every slot reads zero. If traffic did cross $IFACE while the"
-		say "  program was attached, suspect this parser before the program."
+		say "  every slot of $_map reads zero. If traffic did cross $IFACE while"
+		say "  the program was attached, suspect this parser before the program."
 		say "  bpftool printed:"
 		printf '%s\n' "$raw" | cut -c1-200 | head -4 | sed 's/^/    /'
 	fi
+}
+
+# The relocation constants CO-RE patched in, and the bytes read with them.
+# Diagnostic, and it comes out with the slots it explains - see 23.14.
+RELO_SLOTS="dir_off dir_sz dir_lshift dir_rshift xmit_off xmit_sz xmit_lshift xmit_rshift l3_off iif_off tuple_off rhash_sz raw_lo raw_hi"
+
+dump_relo() {
+	[ -e "$MAPDIR/xdp_ft_relo" ] || return 0
+	say ""
+	say "relocation constants, as libbpf patched them against this kernel:"
+	dump_slots xdp_ft_relo "$RELO_SLOTS" || return 0
+	say ""
+	say "  l3_off and iif_off are the controls. Their reads agreed with the"
+	say "  packet on every lookup, so whatever they say a correct offset looks"
+	say "  like on this kernel is the yardstick for dir_off. Check by hand:"
+	say "    l3proto and iifidx sit at tuple+40 and tuple+36, so with tuple_off"
+	say "    added they pin the layout. dir's containing unit should land on the"
+	say "    bitfield byte, and dir_lshift/dir_rshift should select two bits of"
+	say "    it. raw_lo and raw_hi are the eight bytes actually read."
+}
+
+dump_dirbyte() {
+	[ -e "$MAPDIR/xdp_ft_dirbyte" ] || return 0
+	_l=""; _i=0
+	while [ "$_i" -lt 256 ]; do _l="$_l b$_i"; _i=$((_i + 1)); done
+	_out=$(dump_slots xdp_ft_dirbyte "${_l# }" 2>/dev/null | awk '$2 != 0') || return 0
+	[ -n "$_out" ] || return 0
+	say ""
+	say "byte at dir_off, every value seen (index is the byte, decimal):"
+	printf '%s\n' "$_out"
+	say ""
+	say "  One value dominating means the read lands on a real field and takes"
+	say "  the wrong bits out of it. A spread means it is not reading that"
+	say "  field at all. For a REPLY flow with no encapsulation the bitfield"
+	say "  byte should be (xmit_type << 2) | 1 - so 5 for NEIGH, 13 for DIRECT."
+}
+
+dump() {
+	[ -e "$MAPDIR/xdp_ft_stats" ] || { say "not loaded"; return 1; }
+	adopt_slots_from_map
+	legend
+	dump_slots xdp_ft_stats "$SLOTS" || return 1
+	dump_relo
+	dump_dirbyte
 }
 
 detach() {
