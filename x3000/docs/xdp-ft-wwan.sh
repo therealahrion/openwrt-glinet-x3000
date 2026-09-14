@@ -55,11 +55,15 @@ check() {
 
 	# 1. The interface exists and is the raw-IP device we think it is.
 	if "$IP" link show "$IFACE" >/dev/null 2>&1; then
-		if "$IP" link show "$IFACE" | grep -q 'link/none'; then
-			ok "$IFACE is ARPHRD_NONE (raw IP, no L2 header) - as the program assumes"
-		else
-			bad "$IFACE is not link/none; this program parses IP at offset 0"
-		fi
+		LT=$("$IP" link show "$IFACE" | sed -n 's|.*link/\([a-z]*\).*|\1|p' | head -1)
+		case "$LT" in
+		rawip|none|void)
+			ok "$IFACE is link/$LT - no L2 header, IP at offset 0 as the parser assumes" ;;
+		ether)
+			bad "$IFACE is link/ether - it carries an Ethernet header this parser would misread" ;;
+		*)
+			warn "$IFACE is link/${LT:-unknown} - unexpected; check hard_header_len before trusting the parse" ;;
+		esac
 	else
 		bad "$IFACE does not exist"
 	fi
@@ -74,7 +78,7 @@ check() {
 
 	# 3. BTF, without which the kfunc object was never compiled.
 	if [ -r /sys/kernel/btf/vmlinux ]; then
-		ok "vmlinux BTF present ($(( $(stat -c %s /sys/kernel/btf/vmlinux) / 1024 )) KB)"
+		ok "vmlinux BTF present ($(( $(wc -c < /sys/kernel/btf/vmlinux) / 1024 )) KB)"
 	else
 		bad "no /sys/kernel/btf/vmlinux - DEBUG_INFO_BTF is off, the kfunc cannot exist"
 	fi
@@ -142,26 +146,41 @@ dump() {
 	say "  no_headroom could not grow an Ethernet header"
 	say "  redirect    rewritten and sent"
 	say ""
-	# Sum the per-CPU values. python3 if the image has it, raw dump if not -
-	# a lean build may well not, and a raw dump is still readable.
-	if command -v python3 >/dev/null 2>&1; then
-		bpftool -j map dump pinned "$MAPDIR/xdp_ft_stats" | python3 -c '
-import json,sys
-names=["seen","parse_skip","miss","hit","not_direct","torn_down","no_headroom","redirect"]
-def as_int(x):
-    if isinstance(x,list): return int.from_bytes(bytes(int(b,16) for b in x),"little")
-    if isinstance(x,str):  return int(x,16)
-    return int(x)
-for e in json.load(sys.stdin):
-    k=e.get("key"); k=as_int(k) if not isinstance(k,int) else k
-    vals=e.get("values") or []
-    tot=sum(as_int(v.get("value") if isinstance(v,dict) else v) for v in vals)
-    if k < len(names): print("  %-12s %d" % (names[k], tot))
-'
-	else
-		say "  (no python3 - raw per-CPU dump, keys 0..7 in the order above)"
-		bpftool map dump pinned "$MAPDIR/xdp_ft_stats"
-	fi
+	# Sum the per-CPU values with awk. Not python3, which a lean image may lack,
+	# and no strtonum, which is a gawk extension busybox does not have. bpftool's
+	# key/value layout varies between versions, so both forms are handled.
+	bpftool map dump pinned "$MAPDIR/xdp_ft_stats" 2>/dev/null | awk '
+	function h2d(s,   i, c, d, v) {
+		v = 0; s = tolower(s)
+		for (i = 1; i <= length(s); i++) {
+			d = index("0123456789abcdef", substr(s, i, 1)) - 1
+			if (d >= 0) v = v * 16 + d
+		}
+		return v
+	}
+	BEGIN {
+		split("seen parse_skip miss hit not_direct torn_down no_headroom redirect", n, " ")
+		k = -1; want_key = 0
+	}
+	/key:/ {
+		line = $0; sub(/.*key:[ \t]*/, "", line)
+		if (line ~ /^[0-9a-fA-F][0-9a-fA-F]/) { split(line, a, " "); k = h2d(a[1]) }
+		else want_key = 1
+		# an inline "value:" may follow on the same line
+		if ($0 ~ /value/) { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); acc(v) }
+		next
+	}
+	want_key && /^[ \t]*[0-9a-fA-F][0-9a-fA-F]/ { split($0, a, " "); k = h2d(a[1]); want_key = 0; next }
+	/value/ { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); if (v ~ /[0-9a-fA-F]/) acc(v); next }
+	/^[ \t]*[0-9a-fA-F][0-9a-fA-F]([ \t]+[0-9a-fA-F][0-9a-fA-F])*[ \t]*$/ { acc($0) }
+	function acc(s,   i, m, v) {
+		if (k < 0) return
+		m = split(s, b, " "); v = 0
+		for (i = m; i >= 1; i--) if (b[i] ~ /^[0-9a-fA-F][0-9a-fA-F]$/) v = v * 256 + h2d(b[i])
+		tot[k] += v
+	}
+	END { for (i = 0; i <= 7; i++) printf "  %-12s %d\n", n[i+1], tot[i] + 0 }
+	'
 }
 
 # ---- BPF object -----------------------------------------------------------

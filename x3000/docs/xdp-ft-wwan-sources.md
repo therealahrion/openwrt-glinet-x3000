@@ -52,7 +52,7 @@ via `bpf_xdp_adjust_head()` and `XDP_REDIRECT` to a wired port.
   `do_xdp_generic()`, whose rxq comes from `netif_get_rxqueue(skb)`
   (`dev.c:5079`). On the wired ports it is `eth->dummy_dev` and every lookup
   misses — which is why this program is for `wwan0` and nowhere else.
-- The packet has no Ethernet header. `wwan0` is `ARPHRD_NONE` with
+- The packet has no Ethernet header. `wwan0` is `ARPHRD_RAWIP` with
   `hard_header_len` 0, and 991 anchors `mac_header` at `skb->data`, so
   `mac_len` is 0 and the IP header is at `ctx->data`. The in-tree selftest this
   is modelled on parses `ethhdr` and would read the first two octets of the

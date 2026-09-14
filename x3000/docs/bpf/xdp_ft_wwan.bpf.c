@@ -31,7 +31,7 @@
  *     (devmap.c:488). The mtk netdevs do; wwan0 and the AP netdevs do not.
  *     So eth1 and eth0 are legal targets and each other's peers are not.
  *
- * The packet has no Ethernet header. wwan0 is ARPHRD_NONE with hard_header_len
+ * The packet has no Ethernet header. wwan0 is ARPHRD_RAWIP with hard_header_len
  * 0, and 991 anchors mac_header at skb->data, so do_xdp_generic() computes
  * mac_len 0 and the IP header sits at ctx->data. A program written against
  * ethhdr - including the in-tree selftest this is modelled on - reads the first
