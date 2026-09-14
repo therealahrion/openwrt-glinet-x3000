@@ -3635,3 +3635,92 @@ needs no encap sacrifice at all and survives a reboot. What it does not change
 is whether W0038 is worth attaching: 14.3 and 18 still say this box is not
 cycles-bound, 17.2 still says a generic-mode redirect bypasses the qdisc, and
 latency is still the only poor number here.
+
+### 23.20 Threaded NAPI took the WAN down, and gro_cells says why - 2026-09-14
+
+**Do not run `gro-backlog-ab.sh --napi` or `--threaded` without reading this.**
+Both are gated behind `NAPI_I_ACCEPT_A_REBOOT=1` now.
+
+W0002 asks whether threading the gro_cells NAPI helps. The test toggled
+`/sys/class/net/wwan0/threaded` under a LAN-driven download. The first
+transition killed the downlink. It did not recover when `threaded` went back to
+0, five subsequent windows measured a dead link, and the box needed a reboot.
+
+#### What the windows showed
+
+| window | throughput | rx_dropped | rtt |
+|---|---|---|---|
+| softirq #1 | 157.2 Mbit/s, 14069 dgram/s | 0 | 32.2 / 50.2 / 107.8 ms |
+| thread #1 | 0.0 | 88 | n/a |
+| thread-pin #1 | 0.0 | 50 | 100% loss |
+| softirq #2 | 0.0 | 78 | 100% loss |
+| thread #2 | 0.0 | 48 | 100% loss |
+| thread-pin #2 | 0.0 | 44 | 100% loss |
+
+`softirq #2` is the important row: `threaded` was back at 0 and the link was
+still dead. Whatever broke was not the mode.
+
+#### The mechanism, read from source
+
+`gro_cells_receive()` schedules its NAPI **only on the 0 to 1 queue
+transition**:
+
+```c
+__skb_queue_tail(&cell->napi_skbs, skb);
+if (skb_queue_len(&cell->napi_skbs) == 1)
+        napi_schedule(&cell->napi);
+```
+
+So **a single missed poll is permanent.** The queue stays non-empty, the edge
+never recurs, nothing re-arms it, and once the queue passes `max_backlog` every
+later packet is dropped at:
+
+```c
+if (skb_queue_len(&cell->napi_skbs) > READ_ONCE(net_hotdata.max_backlog)) {
+drop:
+        dev_core_stats_rx_dropped_inc(dev);
+```
+
+That is exactly the observed signature - `rx_dropped` climbing while throughput
+is zero - and it is why putting `threaded` back did nothing: the wedge is the
+missing re-arm, not the mode.
+
+**The fragility is in `gro_cells` itself, not in 991.** Any missed poll wedges
+it the same way, for every driver that uses it.
+
+#### What is NOT established
+
+Why the poll was missed during the transition. `dev_set_threaded()` does **not**
+disable NAPI - it creates the kthreads, sets `dev->threaded`, and flips
+`NAPI_STATE_THREADED` on each instance - and it carries an explicit upstream
+comment that the switch "should not cause hiccups/stalls to the live traffic".
+So either that does not hold for the per-CPU gro_cells NAPIs, or something else
+swallowed the poll. **My first explanation for this was that `dev_set_threaded()`
+disables and re-enables NAPI. It does not. That was wrong and is withdrawn.**
+
+The evidence that would settle it is gone: `logread` is a ring buffer and the
+reboot cleared it. **Capture `logread` before rebooting next time.**
+
+One confound worth naming rather than burying: this radio runs marginal - a
+reading taken after the reboot showed `rsrp=-107 dBm`, one bar - and a marginal
+link can drop on its own. That reading describes the radio in general and **not**
+the failure window, which nothing measured; it is context, not evidence.
+
+What does argue against a radio outage is `rx_dropped`. Had the modem lost the
+link, no packets would have arrived and `rx_dropped` could not have moved. It
+moved in all five dead windows. Packets arriving and being dropped by the host
+queue is the wedge signature, not a dead radio.
+
+#### What this changes
+
+- **W0002 is unmeasured and now expensive to measure.** Any attempt costs a
+  reboot if it wedges again, on the box that is also the house router.
+- **The pre-existing `--threaded` mode's warning was probably wrong.** It said
+  the throughput collapse it produced was the on-box `curl` starving the NAPI
+  kthread of CPU. The same collapse just happened with nothing competing on the
+  box. A symptom attributed to contention may have been this all along.
+- **It may bear on the 993 downlink stall.** A wedged gro_cells queue stops
+  draining, the MHI ring fills, and the modem stalls - which is the
+  `dl_qd=127` / `dl_free=0` signature `downlink-stall.md` records. Whether the
+  stall 993 works around is ever this rather than a doorbell problem is
+  untested, and worth knowing before 993 is offered upstream as a modem fix.

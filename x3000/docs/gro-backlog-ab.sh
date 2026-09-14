@@ -75,7 +75,7 @@ if [ ! -s "$BOXSTATE" ]; then
 	exit 1
 fi
 BOXSTATE_LIB=1 . "$BOXSTATE"
-BOXSTATE_NEED=1
+BOXSTATE_NEED=2
 if [ "${BOXSTATE_API:-0}" != "$BOXSTATE_NEED" ]; then
 	echo "FATAL: boxstate.sh is API ${BOXSTATE_API:-none}, this script needs $BOXSTATE_NEED." >&2
 	echo "       rm -f /tmp/boxstate.sh and re-run, or pull the tree again." >&2
@@ -285,6 +285,38 @@ meas() {
 # latency problem, which is exactly what moving the work to a pinned kthread
 # addresses - and why rtt under load, not throughput, is the number to read.
 if [ "$1" = --napi ]; then
+	say "REFUSED - this mode took the WAN down and needed a reboot."
+	say ""
+	say "Run 2026-09-14: toggling /sys/class/net/$WANIF/threaded under sustained"
+	say "load killed the downlink on the first transition. It did not recover"
+	say "when threaded went back to 0, and it did not recover with ifdown/ifup."
+	say "The box needed a reboot. Five subsequent windows measured a dead link."
+	say ""
+	say "The mechanism, read from source. gro_cells_receive() schedules its"
+	say "NAPI ONLY on the 0->1 queue transition:"
+	say ""
+	say "    __skb_queue_tail(&cell->napi_skbs, skb);"
+	say "    if (skb_queue_len(&cell->napi_skbs) == 1)"
+	say "            napi_schedule(&cell->napi);"
+	say ""
+	say "So a single missed poll is PERMANENT: the queue stays non-empty, the"
+	say "edge never recurs, nothing re-arms it, and every later packet is"
+	say "dropped once the queue passes max_backlog. That is the rx_dropped"
+	say "climbing at 0.0 Mbit/s that was observed, and it is why setting"
+	say "threaded back to 0 did not recover - the wedge is the missing re-arm,"
+	say "not the mode."
+	say ""
+	say "What is NOT established is why the poll was missed during the"
+	say "transition. dev_set_threaded() does not disable NAPI and carries an"
+	say "explicit comment that the switch should not stall live traffic, so"
+	say "either that does not hold for the gro_cells NAPIs or something else"
+	say "swallowed the poll. Establish that before re-enabling this."
+	say ""
+	say "The fragility is in gro_cells itself rather than in 991: any missed"
+	say "poll wedges it the same way, for every driver that uses it."
+	say ""
+	say "Set NAPI_I_ACCEPT_A_REBOOT=1 to run it anyway."
+	[ "${NAPI_I_ACCEPT_A_REBOOT:-0}" = 1 ] || exit 1
 	say "W0002: threaded NAPI on $WANIF, load driven from a LAN client"
 	say ""
 
@@ -391,9 +423,17 @@ done
 # client, where nothing on the router competes for CPU, and it becomes a real
 # test. Until then it measures the harness.
 if [ "$1" = --threaded ]; then
-	say "WARNING: threaded NAPI under an on-box load generator measures CPU"
-	say "         starvation of the NAPI kthread, not the driver. See the comment"
-	say "         in this script. Expect a throughput collapse."
+	say "REFUSED - same hazard as --napi, and the same toggle."
+	say ""
+	say "This mode's own warning used to say the throughput collapse it produced"
+	say "was the on-box curl starving the NAPI kthread of CPU. That explanation"
+	say "is now in doubt: on 2026-09-14 the same toggle, under a LAN-driven load"
+	say "with nothing competing on the box, took the WAN down hard enough to"
+	say "need a reboot. A collapse attributed to contention may have been this"
+	say "all along."
+	say ""
+	say "Set NAPI_I_ACCEPT_A_REBOOT=1 to run it anyway."
+	[ "${NAPI_I_ACCEPT_A_REBOOT:-0}" = 1 ] || exit 1
 	bs_set_sysfs /sys/class/net/$WANIF/threaded 1
 	_nt=0
 	for _c in /proc/[0-9]*/comm; do
