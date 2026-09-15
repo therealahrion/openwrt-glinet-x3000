@@ -1,0 +1,202 @@
+From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
+Subject: net: gro_cells: opt out of threaded NAPI
+
+Writing 1 to /sys/class/net/<dev>/threaded on a gro_cells device corrupts
+the receive path. This makes those NAPIs decline to be threaded, so the
+write becomes inert on them instead: it still threads whatever NAPIs the
+driver registered itself, and leaves the gro_cells ones in softirq
+context where they are safe.
+
+gro_cells (net/core/gro_cells.c) carries no lock at 6.12.103. The
+producer takes the running CPU's cell at :28 with this_cpu_ptr() and
+enqueues at :38 with the unlocked __skb_queue_tail(); gro_cell_poll()
+dequeues at :58 with the unlocked __skb_dequeue(). Neither takes
+napi_skbs.lock. So the entire mutual exclusion between producer and
+consumer is that both run on one CPU with BH disabled, which is what the
+"called under BH context" comment at :50 is asserting. Sebastian Andrzej
+Siewior states the same invariant in 25718fdcbdd2 ("net: gro_cells: Use
+nested-BH locking for gro_cell", v6.18): "The gro_cell data structure is
+per-CPU variable and relies on disabled BH for its locking." That commit
+adds a local_lock_t for lockdep and PREEMPT_RT and says it "does not
+alter the functional behaviour for !PREEMPT_RT", so it is not a fix for
+this, and backporting it would change nothing here.
+
+Threading breaks the invariant because the kthread is not bound.
+gro_cells_init() puts its per-CPU NAPIs on the real netdev's
+dev->napi_list with netif_napi_add() at :85. dev_set_threaded()
+(net/core/dev.c:6688) then walks that list with no filter of any kind,
+and napi_kthread_create() (:1500) starts each thread with a plain
+kthread_run(). One CPU's cell can therefore be drained by a kthread the
+scheduler placed on another, mid-enqueue: an unlocked __skb_queue_tail()
+racing an unlocked __skb_dequeue() on the same sk_buff_head from two
+cores. The NAPI SCHED bit serialises pollers against each other; it
+never serialises a poller against the producer, because the producer
+does not take it.
+
+Nor does the work fall back to softirq once the bit is set.
+____napi_schedule() (:4637) takes the threaded arm, calls
+wake_up_process() and returns without ever reaching sd->poll_list, so no
+ksoftirqd path is left to catch it. The one carve-out there, at :4653,
+is for the backlog NAPI -- and that one is CPU-bound: backlog_napi_setup()
+(:12282) does not create a thread at all, it adopts one from the smpboot
+per-CPU pool registered at :12356, and kernel/smpboot.c:184 creates those
+with kthread_create_on_cpu(). So the kernel already treats "per-CPU NAPI"
+and "unbound kthread" as incompatible for its own; it just has no way for
+anyone else to say so.
+
+The mechanism:
+
+  * NAPI_STATE_NO_THREAD, a new state bit appended to the enum so no
+    existing bit is renumbered. gro_cells_init() sets it next to the
+    NAPI_STATE_NO_BUSY_POLL it already sets, before netif_napi_add(),
+    because that call can create the kthread there and then on a device
+    whose threaded flag is already on.
+  * dev_set_threaded() skips such NAPIs in both of its loops -- it
+    creates no kthread for them, and never assigns NAPI_STATE_THREADED
+    to them. Skipping the second loop in both directions is safe
+    precisely because the bit is never set, so there is never one left
+    to clear.
+  * netif_napi_add_weight() (:6765) honours it too. That is the third
+    site, and leaving it out would have left a live hole: a NAPI added
+    to an already-threaded device gets its kthread there rather than
+    from dev_set_threaded().
+
+Those three cover every path. napi_enable() (:6835) is the fourth and
+last place NAPI_STATE_THREADED can be set, and its condition at :6843 is
+"n->dev->threaded && n->thread" -- with no kthread ever created,
+n->thread stays NULL and the bit cannot be set that way either. The two
+remaining references, at :6266 and :11818, are "napi->state &=
+NAPIF_STATE_THREADED" reached only under napi->poll == process_backlog,
+so they cannot clear NO_THREAD on a gro_cell.
+
+What the sysfs file means afterwards: on a device whose every NAPI opts
+out, writing 1 succeeds, reads back 1, and threads nothing -- which is
+exactly what the file already does today on a device with no NAPI at
+all, so no userspace expectation changes. I considered returning
+-EOPNOTSUPP in that case so the write would fail visibly, and did not:
+it would be an ABI change inside a patch whose job is to stop a
+corruption, and it would give a mixed device two different answers
+depending on which NAPIs happen to exist when the write lands.
+
+This is not specific to this board or to my 991. Every gro_cells user at
+6.12.103 -- amt, bareudp, geneve, macsec, pfcp, vxlan, ip_tunnel and
+rmnet_vnd -- exposes the same writable sysfs file with the same exposure
+on any non-RT kernel. rmnet_vnd is Qualcomm's modem netdev in mainline,
+so the hazard is reachable on stock hardware by writing one file, with
+no local patch applied first.
+
+I hit it here because 991 moved wwan0 into that class: stock
+mhi_wwan_mbim registers no NAPI at all (a bare netif_rx() at
+mhi_wwan_mbim.c:348), so the toggle was inert before. Writing 1 to it
+took the WAN down twice on 2026-09-14, silently, with no recovery from
+writing 0 and a reboot needed each time. That is consistent with list
+corruption rather than with an overflow, but I am not grading the fit
+above reasoning: the case against threading here is the source read
+above, not those two outages. x3000/docs/xdp-methods-tested.md section
+23.21 carries the full record, including what the outages do and do not
+establish.
+
+For submission this splits in two, in the usual order: one patch adding
+NAPI_STATE_NO_THREAD and teaching dev_set_threaded() and
+netif_napi_add_weight() to honour it, then one patch setting it in
+gro_cells_init(). Kept as a single patch here because the first half is
+dead code without the second.
+
+Independent of 991, 992, 993 and 995: it touches core net only, no
+driver, and shares no file with them, so the apply order between them
+does not matter. Numbered 996 because 994 is retired -- see 995's
+message and xdp-methods-tested.md section 22.7.
+
+Out-of-tree patch for the GL-X3000 lean build.
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -392,6 +392,7 @@ enum {
+ 	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
+ 	NAPI_STATE_THREADED,		/* The poll is performed inside its own thread*/
+ 	NAPI_STATE_SCHED_THREADED,	/* Napi is currently scheduled in threaded mode */
++	NAPI_STATE_NO_THREAD,		/* Poll must run on the scheduling CPU */
+ };
+ 
+ enum {
+@@ -405,6 +406,7 @@ enum {
+ 	NAPIF_STATE_PREFER_BUSY_POLL	= BIT(NAPI_STATE_PREFER_BUSY_POLL),
+ 	NAPIF_STATE_THREADED		= BIT(NAPI_STATE_THREADED),
+ 	NAPIF_STATE_SCHED_THREADED	= BIT(NAPI_STATE_SCHED_THREADED),
++	NAPIF_STATE_NO_THREAD		= BIT(NAPI_STATE_NO_THREAD),
+ };
+ 
+ enum gro_result {
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6695,6 +6695,8 @@ int dev_set_threaded(struct net_device *
+ 
+ 	if (threaded) {
+ 		list_for_each_entry(napi, &dev->napi_list, dev_list) {
++			if (test_bit(NAPI_STATE_NO_THREAD, &napi->state))
++				continue;
+ 			if (!napi->thread) {
+ 				err = napi_kthread_create(napi);
+ 				if (err) {
+@@ -6718,8 +6720,18 @@ int dev_set_threaded(struct net_device *
+ 	 * softirq mode will happen in the next round of napi_schedule().
+ 	 * This should not cause hiccups/stalls to the live traffic.
+ 	 */
+-	list_for_each_entry(napi, &dev->napi_list, dev_list)
++	list_for_each_entry(napi, &dev->napi_list, dev_list) {
++		/* A NAPI that must poll on the CPU which scheduled it is
++		 * skipped in both directions: the bit is never set on it, so
++		 * there is never one to clear. Writing the sysfs file on a
++		 * device whose every NAPI opts out therefore succeeds and
++		 * changes nothing, exactly as it does today on a device with
++		 * no NAPI at all.
++		 */
++		if (test_bit(NAPI_STATE_NO_THREAD, &napi->state))
++			continue;
+ 		assign_bit(NAPI_STATE_THREADED, &napi->state, threaded);
++	}
+ 
+ 	return err;
+ }
+@@ -6794,8 +6806,14 @@ void netif_napi_add_weight(struct net_de
+ 	/* Create kthread for this napi if dev->threaded is set.
+ 	 * Clear dev->threaded if kthread creation failed so that
+ 	 * threaded mode will not be enabled in napi_enable().
++	 *
++	 * NAPI_STATE_NO_THREAD is honoured here as well as in
++	 * dev_set_threaded(): a NAPI added to an already-threaded device
++	 * takes this path instead, and leaving napi->thread NULL is what
++	 * keeps napi_enable() from setting NAPI_STATE_THREADED later.
+ 	 */
+-	if (dev->threaded && napi_kthread_create(napi))
++	if (dev->threaded && !test_bit(NAPI_STATE_NO_THREAD, &napi->state) &&
++	    napi_kthread_create(napi))
+ 		dev->threaded = false;
+ 	netif_napi_set_irq(napi, -1);
+ }
+--- a/net/core/gro_cells.c
++++ b/net/core/gro_cells.c
+@@ -82,6 +82,23 @@ int gro_cells_init(struct gro_cells *gce
+ 
+ 		set_bit(NAPI_STATE_NO_BUSY_POLL, &cell->napi.state);
+ 
++		/* These NAPIs must poll on the CPU that scheduled them.
++		 * gro_cells_receive() enqueues into this_cpu_ptr()'s cell with
++		 * the unlocked __skb_queue_tail() and gro_cell_poll() dequeues
++		 * with the unlocked __skb_dequeue(), so the whole mutual
++		 * exclusion between producer and consumer is that both run on
++		 * one CPU with BH disabled -- the contract the "called under BH
++		 * context" comment above gro_cell_poll() states. An unbound
++		 * kthread breaks it, and napi_kthread_create() uses a plain
++		 * kthread_run(), so without this bit dev_set_threaded() would
++		 * let one CPU's cell be drained from another mid-enqueue.
++		 *
++		 * Set before netif_napi_add() because that adds the NAPI to
++		 * dev->napi_list and may create the kthread there and then, on
++		 * a device that is already threaded.
++		 */
++		set_bit(NAPI_STATE_NO_THREAD, &cell->napi.state);
++
+ 		netif_napi_add(dev, &cell->napi, gro_cell_poll);
+ 		napi_enable(&cell->napi);
+ 	}

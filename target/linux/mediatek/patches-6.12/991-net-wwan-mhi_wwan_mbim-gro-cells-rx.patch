@@ -4,7 +4,7 @@ Subject: net: wwan: mhi_wwan_mbim: deliver RX datagrams through gro_cells
 The MBIM RX path hands every de-aggregated datagram to the stack with
 netif_rx(): no NAPI context, no GRO. On an RM520N-GL the MHI controller
 sets a 32KB MRU (mhi_quectel_rm5xx_info.mru_default), so one MHI
-transfer carries an NTB of up to ~21 full-size datagrams — each of which
+transfer carries an NTB of up to ~21 full-size datagrams -- each of which
 then walks conntrack/netfilter/IP individually. At 5G downlink rates on
 a dual Cortex-A53 router that per-packet cost is the WAN bottleneck.
 
@@ -13,34 +13,34 @@ for exactly this class of callback-driven virtual driver (used by
 ip_tunnel, vxlan, geneve, macsec, bareudp, amt, pfcp and rmnet_vnd):
 per-CPU NAPI contexts drain a small queue via napi_gro_receive(), giving
 the MBIM path real NAPI instances and GRO batching of the ~21-datagram
-bursts. The MHI DL callback runs in tasklet (BH) context — same context
+bursts. The MHI DL callback runs in tasklet (BH) context -- same context
 tunnels call gro_cells_receive() from.
 
-DO NOT WRITE 1 TO /sys/class/net/<dev>/threaded ON A KERNEL CARRYING
-THIS PATCH. An earlier version of this message listed a working threaded
-toggle as a side benefit of the switch. That was wrong, and it is the
-one behaviour change here that is not an improvement.
+One side effect, and it needed a second patch to make safe. Stock
+mhi_wwan_mbim registers no NAPI at all (a bare netif_rx() at
+mhi_wwan_mbim.c:348), so /sys/class/net/<dev>/threaded is inert on it:
+dev_set_threaded() walks an empty napi_list. This patch puts per-CPU
+gro_cells NAPIs on the netdev, which makes that file live -- and
+gro_cells is not safe to thread. It carries no lock: gro_cells_receive()
+enqueues into this_cpu_ptr()'s cell with the unlocked
+__skb_queue_tail() and gro_cell_poll() dequeues with the unlocked
+__skb_dequeue(), so the only exclusion is that producer and consumer
+share a CPU with BH disabled -- which is what the /* called under BH
+context */ comment above gro_cell_poll() is asserting.
+dev_set_threaded() threaded every NAPI on the list with no filter, and
+napi_kthread_create() uses a plain, unbound kthread_run(), so a cell
+owned by one CPU could be drained from the other mid-enqueue. Writing 1
+to that file took the WAN down twice on 2026-09-14, silently, and cost a
+reboot each time.
 
-Stock mhi_wwan_mbim registers no NAPI at all (a bare netif_rx() at
-mhi_wwan_mbim.c:348), so dev_set_threaded() walks an empty napi_list and
-the toggle is inert. This patch puts per-CPU gro_cells NAPIs on the
-netdev, which makes the toggle live — and gro_cells is not safe to
-thread. It carries no lock: gro_cells_receive() enqueues into
-this_cpu_ptr()'s cell with the unlocked __skb_queue_tail() and
-gro_cell_poll() dequeues with the unlocked __skb_dequeue(), so the only
-exclusion is that producer and consumer share a CPU with BH disabled —
-which is what the /* called under BH context */ comment above
-gro_cell_poll() is asserting. dev_set_threaded() threads every NAPI on
-the list with no filter and napi_kthread_create() uses a plain, unbound
-kthread_run(), so a cell owned by one CPU can be drained from the other
-mid-enqueue.
-
-That hazard is upstream's, not this patch's, and it applies equally to
-every driver in the list above. What this patch does is move an MBIM
-netdev into that class, so it is this patch's business to say so. The
-fix belongs in core net; see x3000/docs/xdp-methods-tested.md §23.21.
-Toggling threaded on this link took the WAN down twice on 2026-09-14 and
-cost a reboot each time.
+That hazard was upstream's rather than this patch's, and it reaches every
+gro_cells user; what this patch did was move an MBIM netdev into the
+class. 996-net-gro_cells-opt-out-of-threaded-napi.patch closes it in core
+net by having gro_cells decline to be threaded, so with both applied the
+file is inert again and this patch costs nothing. Carrying 991 without
+996 means not writing 1 to it. The full reading, including what the two
+outages do and do not establish, is in
+x3000/docs/xdp-methods-tested.md section 23.21.
 
 Details:
   * per-link gro_cells in struct mhi_mbim_link, created in ndo_init and
@@ -53,7 +53,7 @@ Details:
     condition between receive and link delete"); bareudp, macsec and
     ip_tunnel pair the same way. Between hlist_add_head_rcu() and
     ndo_init the cells are not allocated yet, which gro_cells_receive()
-    already handles — it falls back to netif_rx() when !gcells->cells.
+    already handles -- it falls back to netif_rx() when !gcells->cells.
   * newlink additionally un-hashes the link when register_netdevice()
     fails. Upstream left it hashed on that error path, so RX could still
     find a half-dead link; dellink is otherwise untouched by this patch.

@@ -1,0 +1,122 @@
+From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
+Subject: net: let a device decline the forward path walk without failing it
+
+dev_fill_forward_path() treats "this device has no callback" and "this
+device's callback says it has nothing to add" as opposite outcomes, when
+they are the same statement. The first works: the loop never runs, the
+function appends a DEV_PATH_ETHERNET entry for the device and returns 0.
+The second fails: any negative return becomes "return -1", the whole walk
+is discarded, and flow offload silently never engages for that path.
+
+This makes -EOPNOTSUPP mean what the callers that return it mean by it.
+
+It is not a corner case. Only three functions sit behind
+ndo_fill_forward_path in the whole tree, and two of them return
+-EOPNOTSUPP to say "not this instance":
+
+  * ppp_fill_forward_path() (drivers/net/ppp/ppp_generic.c:1591)
+    returns it at :1599 for a multilink bundle, and at :1610 for any
+    channel whose ops lack fill_forward_path. Upstream only
+    drivers/net/ppp/pppoe.c:1008 sets that member, so every other PPP
+    channel type reaches :1610 -- L2TP among them.
+  * mac80211's ieee80211_netdev_fill_forward_path() returns it when the
+    driver has no net_fill_forward_path op, which is most of them.
+
+The third, pppoe_fill_forward_path() (pppoe.c:983), returns a bare -1 on
+its own error path and is untouched by this.
+
+Neither of the two writes to *path before returning, so there is nothing
+partial to clean up -- only the stack slot, which dev_fwd_path() takes
+with "int k = stack->num_paths++" before the callback runs. Hence the
+decrement.
+
+Three details that are load-bearing rather than stylistic:
+
+  * ret must be cleared. Every caller reads a negative return as failure:
+    nft_flow_offload.c:206 gates on ">= 0", and mtk_ppe_offload.c:105-108
+    does "if (err) return err". Leaving ret at -EOPNOTSUPP would
+    reproduce the exact bug this fixes, one layer up.
+  * break, not continue. The callbacks that return -EOPNOTSUPP leave ctx
+    untouched, so continuing would hit the WARN_ON_ONCE(last_dev ==
+    ctx.dev) guard immediately below.
+  * Falling out of the loop is the whole point: ctx.dev is still the
+    declining device, so the tail of the function gives it the same
+    DEV_PATH_ETHERNET entry a device with no callback would have got.
+
+What it buys on this board: a bridged Wi-Fi client can reach
+FLOW_OFFLOAD_XMIT_DIRECT. Today it cannot, because mac80211 returns
+-EOPNOTSUPP, the walk is discarded, and nft_dev_path_info() never sees a
+path to resolve. With the walk completing, info->indev becomes the AP
+netdev -- ARPHRD_ETHER with a real address -- so nft_is_valid_ether_device()
+passes and the flow takes the direct xmit path instead of a neighbour
+lookup. That is the Wi-Fi half of W0038, which has no other route to it.
+
+Evidence: E2 for the source reading above, at v6.12.103. E1 for the
+effect, demonstrated at T0054 by forcing the equivalent state by hand;
+see x3000/docs/xdp-methods-tested.md section 23.18 for why a bridged
+Wi-Fi client never reaches XMIT_DIRECT without this, and section 24 for
+the survey that found the PPP half.
+
+One corroboration worth stating, because it shows the bug bites people
+who are not me. MediaTek's own SDK carries
+999-tnl-07-l2tp-add-fill-forward-path.patch, which implements
+fill_forward_path for L2TP channels. That is a downstream workaround for
+ppp_generic.c:1610 -- the vendor hit this and papered over it for the one
+channel type they cared about rather than fixing the walk. The hook they
+implement is already upstream (include/linux/ppp_channel.h:33); only the
+L2TP implementation is theirs.
+
+Note on which mac80211 this describes: OpenWrt builds mac80211 from
+backports (package/kernel/mac80211, backports 7.2), not from the in-tree
+net/mac80211. The return is at iface.c:939 in pristine v6.12.103 and at
+:1001 in the backports copy this image ships. The behaviour is identical;
+only the line differs.
+
+Not board-specific, and not MediaTek-specific: any bridged Wi-Fi client
+on any driver without a net_fill_forward_path op hits it, as does any
+non-PPPoE PPP channel and any multilink bundle. This is W0040 and it is
+worth sending upstream on its own merits.
+
+Touches core net only. It does share net/core/dev.c with 996, which an
+earlier version of this message wrongly denied, but the two edits are
+about 6000 lines apart -- 996 works on dev_set_threaded() and
+netif_napi_add_weight(), this one on dev_fill_forward_path() -- so they
+do not overlap and apply order between them does not matter. Verified by
+applying the full series to v6.12.103 with OpenWrt's generic patches in
+place: this one applies at --fuzz=0 and at zero offset after 996. No file
+at all is shared with 991, 992, 993 or 995.
+
+Out-of-tree patch for the GL-X3000 lean build.
+
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -746,6 +746,29 @@ int dev_fill_forward_path(const struct n
+ 
+ 		memset(path, 0, sizeof(struct net_device_path));
+ 		ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
++		if (ret == -EOPNOTSUPP) {
++			/* The device implements the callback but has nothing
++			 * special to say about this particular instance. That
++			 * is the same statement as having no callback at all,
++			 * which falls through below to DEV_PATH_ETHERNET and
++			 * works -- so stop walking and let it.
++			 *
++			 * Two of the three implementations in tree depend on
++			 * this: ppp_fill_forward_path() returns -EOPNOTSUPP
++			 * for a multilink bundle and for any channel type
++			 * whose ops lack fill_forward_path -- every type but
++			 * PPPoE -- and mac80211 returns it when the driver has
++			 * no net_fill_forward_path op. Neither writes to *path
++			 * before returning, so nothing partial is left behind.
++			 *
++			 * dev_fwd_path() has already taken a slot, so give it
++			 * back, and clear ret because every caller reads a
++			 * negative return as failure.
++			 */
++			stack->num_paths--;
++			ret = 0;
++			break;
++		}
+ 		if (ret < 0)
+ 			return -1;
+ 

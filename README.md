@@ -66,16 +66,14 @@ and how to read its state on a running router:
   Impact(s):      Gives wwan0 real NAPI contexts, so "ethtool -K wwan0 gro
                   off" becomes a live kill switch. Nothing outside the MBIM
                   receive path changes. It also makes the per-device
-                  "threaded" switch do something, which is a hazard rather
-                  than a feature - see Limitation(s).
+                  "threaded" switch do something on wwan0, which is why 996
+                  exists.
   Limitation(s):  Downlink only; the upload side is untouched. Packets have
                   to arrive close together for there to be anything to
-                  merge, so it does little at low rates. Do not write 1 to
-                  /sys/class/net/wwan0/threaded on a kernel carrying this
-                  patch: gro_cells queues are per-CPU and carry no lock, and
-                  threaded NAPI drains them from unbound kernel threads. That
-                  toggle is inert without this patch and took the WAN down
-                  twice with it.
+                  merge, so it does little at low rates. Carrying it
+                  without 996 means never writing 1 to
+                  /sys/class/net/wwan0/threaded, which killed the WAN
+                  twice.
   Attribution(s): Mine, written for this fork. Background:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
@@ -95,7 +93,10 @@ and how to read its state on a running router:
   Impact(s):      Owning ndo_bpf makes driver mode the default attach mode
                   for wwan0, so "ip link set dev wwan0 xdp ..." lands here.
                   Detaching a generic attach needs "xdpgeneric off"; plain
-                  "xdp off" is a silent no-op.
+                  "xdp off" is a silent no-op. A program that rewrites a
+                  packet is safe to forward behind: the hook repairs the
+                  receive metadata the kernel derives from an Ethernet
+                  header this link does not have.
   Limitation(s):  Needs 991. wwan0 is a raw-IP link, so a program written
                   against an Ethernet header misreads the first bytes of
                   the source address as an EtherType.
@@ -125,6 +126,64 @@ and how to read its state on a running router:
                   draft report for the MHI maintainers:
                       - <a href="x3000/docs/downlink-stall.md">x3000/docs/downlink-stall.md</a>
                       - <a href="x3000/docs/993-upstream-report.md">x3000/docs/993-upstream-report.md</a>
+  </pre>
+
+* **996 — gro_cells declines threaded NAPI**
+  `target/linux/mediatek/patches-6.12/996-net-gro_cells-opt-out-of-threaded-napi.patch`
+
+  <pre>
+  Description:    The kernel's per-device threaded switch moves packet
+                  processing out of software interrupts and into kernel
+                  threads. On an interface built on gro_cells - tunnels,
+                  MACsec, modem links, and wwan0 here - doing that corrupts
+                  the receive queues. This teaches those queues to refuse,
+                  so the switch passes over them and threads only what is
+                  safe to thread.
+  Benefit(s):     /sys/class/net/wwan0/threaded is harmless to write again.
+                  Before this, writing 1 to it took the WAN down silently
+                  and needed a reboot.
+  Impact(s):      Core networking only, no driver. One new NAPI flag and
+                  three places that honour it. A device whose every queue
+                  opts out still accepts the write and reads back 1,
+                  exactly as it does today on a device with no queues at
+                  all - it simply threads nothing. Drivers with receive
+                  queues of their own are untouched and still thread
+                  normally.
+  Limitation(s):  It removes the hazard rather than making threaded
+                  gro_cells work. Binding each thread to the CPU whose
+                  queue it serves would do that, and is the larger change.
+                  Nothing needs it without 991, which is what puts
+                  gro_cells on wwan0 in the first place.
+  Attribution(s): Mine, written for this fork. Background, section 23.21:
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+  </pre>
+
+* **997 — a device may decline the forward path walk**
+  `target/linux/mediatek/patches-6.12/997-net-forward-path-decline-without-failing.patch`
+
+  <pre>
+  Description:    Before offloading a connection the kernel walks the stack
+                  of devices a packet will cross. A device that does not
+                  implement the walk at all is handled fine; a device that
+                  implements it and answers "nothing to add for this one"
+                  throws the whole walk away. This makes the second answer
+                  mean the same as the first.
+  Benefit(s):     Bridged Wi-Fi clients can take the flow table's direct
+                  transmit path, which is the only route to Wi-Fi coverage
+                  for the XDP flowtable work. Without it the offload simply
+                  never engages and nothing reports why.
+  Impact(s):      Core networking, three lines plus a comment. Only changes
+                  behaviour for a device that was already failing the walk,
+                  so nothing that works today can change. The declining
+                  device now gets the same plain-Ethernet entry a device
+                  with no callback would have got.
+  Limitation(s):  It does not make the modem a flow-offload target - wwan0
+                  has no Ethernet device beneath it to resolve down to, so
+                  it stays on the neighbour path either way. Fixes the
+                  walk, not what the walk finds.
+  Attribution(s): Mine, written for this fork. Background, sections 23.18
+                  and 24.12:
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
 * **firewall4 — flow offload on a modem WAN**
@@ -426,6 +485,42 @@ and how to read its state on a running router:
   Attribution(s): Mine. The inventory row, and how to read the theme on a
                   running box:
                       - <a href="x3000/docs/lean-overlay.md">x3000/docs/lean-overlay.md</a>
+  </pre>
+
+* **Physical register reads for frame-engine work**
+  `target/linux/mediatek/filogic/config-6.12`
+
+  <pre>
+  Description:    Three kernel symbols that make /dev/mem exist and be
+                  useful for reading memory-mapped registers. DEVMEM
+                  creates the device node, STRICT_DEVMEM keeps system RAM
+                  unreachable through it, and IO_STRICT_DEVMEM is turned
+                  back off so a range a driver has already claimed can
+                  still be read. OpenWrt's shared config disables the
+                  first and enables the last, and the subtarget config
+                  overrides both.
+  Benefit(s):     Undocumented SoC registers can be read from a shell
+                  rather than from a debug patch and a rebuild. The frame
+                  engine window at 0x15100000 is the case that forced it:
+                  nothing published says whether MT7981 implements the
+                  tables MediaTek's PCE driver drives on MT7988, and the
+                  address either decodes or it does not.
+  Impact(s):      /dev/mem exists on the running router. STRICT_DEVMEM
+                  narrows it to memory-mapped I/O, since
+                  devmem_is_allowed() returns 1 only for a page that is
+                  not RAM, so kernel and process memory stay out of
+                  reach. Root can still write any MMIO register through
+                  it. On by default.
+  Limitation(s):  A read says whether an address decodes, not what the
+                  bits mean. Writing an undocumented frame engine
+                  register takes the WAN down, which is why the probe
+                  script reads and never writes. Leaving IO_STRICT_DEVMEM
+                  off is what makes a driver-claimed range readable; that
+                  is the whole point here, and it is also a wider door
+                  than the upstream default.
+  Attribution(s): Mine. The probe, the offsets it reads and how to read
+                  the result:
+                      - <a href="x3000/docs/fe-probe.sh">x3000/docs/fe-probe.sh</a>
   </pre>
 
 ---

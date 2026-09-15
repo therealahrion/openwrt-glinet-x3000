@@ -198,15 +198,29 @@ Three preconditions the driver must satisfy (all from reading
 
 1. `skb_reset_mac_header()` **before** the call. `mac_len = skb->data -
    skb_mac_header(skb)`; a fresh `netdev_alloc_skb()` leaves the `~0U` sentinel,
-   and that arithmetic would walk off the front of the buffer. 992 currently
-   resets it only *after* the XDP hook.
+   and that arithmetic would walk off the front of the buffer. **Satisfied.**
+   This line read "992 currently resets it only *after* the XDP hook" until the
+   2026-09-09 rework moved it; corrected 2026-09-15, having gone stale in place
+   for six days.
 2. `skb->protocol` set before the call — `generic_xdp_tx()` and
    `dev_map_generic_redirect()` both end in `dev_queue_xmit()` and neither
-   re-derives it. 992 also sets this only after the hook.
+   re-derives it. **Satisfied** since the same rework, and stale in the same
+   way until 2026-09-15.
 3. `do_xdp_generic()` takes `struct sk_buff **`, not `*` —
    `netif_skb_check_for_xdp()` may reallocate. (It won't here: the RX loop
    already reserves `XDP_PACKET_HEADROOM` when a program is attached. Honour the
    contract anyway.)
+
+**And two postconditions, added 2026-09-15.** Method A is not finished when
+`do_xdp_generic()` returns `XDP_PASS`. The core hands the skb back carrying
+receive metadata it derived by reading the first fourteen bytes as an Ethernet
+header -- which on a raw-IP link they are not. `skb->mac_header` may have moved
+(`bpf_xdp_adjust_head()` shifts it at `dev.c:5107`), and `skb->pkt_type` may no
+longer be `PACKET_HOST`, which costs every forwarded datagram at
+`ip_forward.c:93`. 992 now re-anchors both headers and forces `PACKET_HOST`
+before returning. Section 23.28 has the mechanism and the trigger set. Listing
+only preconditions here was itself the mistake: I read the core's requirements
+of the driver and not the driver's requirements of the core.
 
 Known losses vs the hand-rolled hook: per-link `rx_errors`/`rx_dropped`
 accounting for XDP verdicts goes away (the core frees the skb itself), and
@@ -3847,9 +3861,9 @@ reaches shipping modem hardware without anyone applying a local patch first.
 |---|---|
 | `:28` | `cell = this_cpu_ptr(gcells->cells)` - the producer always takes the running CPU's cell |
 | `:30` | `skb_queue_len(&cell->napi_skbs) > max_backlog` - unlocked read |
-| `:37` | `__skb_queue_tail(&cell->napi_skbs, skb)` - the **unlocked** enqueue, not `skb_queue_tail()` |
-| `:38` | `if (skb_queue_len(...) == 1) napi_schedule(...)` - the edge-triggered re-arm |
-| `:49` | `/* called under BH context */` - the contract, written as a comment |
+| `:38` | `__skb_queue_tail(&cell->napi_skbs, skb)` - the **unlocked** enqueue, not `skb_queue_tail()` |
+| `:39` | `if (skb_queue_len(...) == 1) napi_schedule(...)` - the edge-triggered re-arm |
+| `:50` | `/* called under BH context */` - the contract, written as a comment |
 | `:58` | `skb = __skb_dequeue(&cell->napi_skbs)` - the **unlocked** dequeue |
 
 The `__` variants do not take `napi_skbs.lock`. So the entire mutual exclusion
@@ -3903,6 +3917,9 @@ producer never takes it.
 **Evidence grade: E2.** Every line above was read in the tree this build ships,
 `v6.12.103`, not inferred from a counter.
 
+*Four line numbers in this section were off by one and were corrected on
+2026-09-15; see 23.28 for the list. The argument is unaffected.*
+
 #### Two objections worth closing, because both sound reasonable
 
 **"gro_cells NAPIs are dummies - surely `threaded` skips them."** It does not.
@@ -3943,7 +3960,7 @@ It fits, and I am **not** grading that fit above E3. What the race would produce
 is a list whose linkage or `qlen` no longer agree:
 
 - **Silent.** No `WARN`, no `pr_err`, nothing to log. Both runs: `logread` empty.
-- **Permanent.** If `qlen` stops passing through 1, the `:38` re-arm edge never
+- **Permanent.** If `qlen` stops passing through 1, the `:39` re-arm edge never
   recurs, and writing `threaded=0` cannot repair a corrupted list. Both runs: no
   recovery from `threaded=0`, reboot required.
 - **`rx_dropped` either way.** Whether the corrupted `qlen` lands above or below
@@ -3995,7 +4012,7 @@ precisely where this lands.
 
 Pinning the kthreads afterwards does not close the hole. `dev_set_threaded()`
 creates each thread with `kthread_run()`, which **starts it immediately**, and
-sets `NAPI_STATE_THREADED` a few lines later at `:6721`. Between those two
+sets `NAPI_STATE_THREADED` a few lines later at `:6722`. Between those two
 points no userspace `taskset` has run yet, and traffic arriving in that window is
 already being handed to an unbound thread. Both failures happened within seconds
 of the write, which is what that window looks like.
@@ -5039,3 +5056,819 @@ measurement errors this document has had to withdraw - the feature bit read as
 behaviour, the peak-to-peak comparison across drifting runs, the PID count read
 as a working download. Those were all syntactically perfect.
 
+
+### 23.28 W0041 form 2 is written, and the same source read found a live defect in 992 - 2026-09-15
+
+Three changes, all from reading `net/core` rather than from a measurement, and
+none of them yet on the box:
+
+1. **996** makes gro_cells decline threaded NAPI. This is W0041 form 2 exactly
+   as 23.21 proposed it, so writing 1 to `/sys/class/net/wwan0/threaded` is
+   inert again rather than fatal.
+2. **992 had a real bug** on the `XDP_PASS` return path: generic XDP hands the
+   skb back with Ethernet receive metadata derived from the IP header, and on a
+   router that silently drops every forwarded datagram. Fixed with three stores.
+3. **Two things I expected to be bugs are not**, and both are now written down
+   so the next pass does not re-derive them: `bpf_prog_put()` already defers,
+   and `mhi_mbim_ip_proto()` needs no length guard.
+
+**Evidence grade for all of it: E2.** Every claim below was read in
+`v6.12.103`. Nothing here has been built, flashed or reproduced, which is the
+outstanding work.
+
+#### 996: how gro_cells opts out, and why three sites is all of them
+
+23.21 named two possible shapes for W0041 and said form 2 -- have gro_cells opt
+its NAPIs out -- is the one to send first, "because it cannot regress anything
+that works today". That is what 996 is.
+
+`NAPI_STATE_NO_THREAD` is appended to the state enum, so no existing bit is
+renumbered. `gro_cells_init()` sets it beside the `NAPI_STATE_NO_BUSY_POLL` it
+already sets, *before* `netif_napi_add()` -- that ordering is load-bearing, and
+finding out why is what turned a two-site patch into a three-site one.
+
+`NAPI_STATE_THREADED` can be set from exactly four places. Each had to be
+accounted for:
+
+| site | `dev.c` | what it does | how 996 handles it |
+|---|---|---|---|
+| `dev_set_threaded()` kthread loop | `:6688` | creates a kthread per NAPI on `dev->napi_list`, no filter | skipped by the bit |
+| `dev_set_threaded()` assign loop | `:6722` | `assign_bit(NAPI_STATE_THREADED, ...)` on every NAPI | skipped by the bit |
+| `netif_napi_add_weight()` | `:6765` | creates the kthread *there and then* if `dev->threaded` is already set | skipped by the bit |
+| `napi_enable()` | `:6835` | sets the bit if `n->dev->threaded && n->thread` (`:6843`) | closes on its own: `n->thread` is never non-NULL |
+
+The third row is the one I nearly missed, and it is why the `set_bit()` goes
+before `netif_napi_add()` rather than after. A NAPI added to a device whose
+`threaded` flag is *already* on never goes through `dev_set_threaded()` at all
+-- it gets its kthread from `netif_napi_add_weight()`. Guarding only
+`dev_set_threaded()` would have left that path open.
+
+The fourth row then needs no code at all, and that is the whole reason the patch
+is small: with no kthread ever created for these NAPIs, `napi_enable()`'s
+condition can never be true for one.
+
+Two further references to the bit are *not* sites. `dev.c:6266` and `:11818`
+both do `napi->state &= NAPIF_STATE_THREADED`, which would clear `NO_THREAD` --
+but both are reached only under `napi->poll == process_backlog`, so they can
+never see a gro_cell.
+
+**What the sysfs file means afterwards.** On a device whose every NAPI opts out
+-- which is `wwan0` under 991, since the driver registers none of its own --
+writing 1 succeeds, reads back 1, and threads nothing. That is exactly what the
+file already does on a device with no NAPI at all, which is what `wwan0` was
+before 991, so nothing that reads it changes behaviour. I considered returning
+`-EOPNOTSUPP` so the write would fail visibly and did not: it is an ABI change
+inside a patch whose job is to stop a corruption, and on a mixed device it would
+have to answer differently depending on which NAPIs happen to exist when the
+write lands.
+
+**One precedent worth recording, because 23.21 got its mechanism slightly
+wrong.** The kernel's own per-CPU NAPI does get a thread, and that thread is
+CPU-bound -- but `backlog_napi_setup()` (`:12282`) does not create it.
+It adopts one from the smpboot per-CPU thread pool registered at `:12356`, and
+`kernel/smpboot.c:184` is where `kthread_create_on_cpu()` actually runs. So the
+asymmetry 23.21 pointed at is real and is stronger than stated: the kernel does
+not merely bind its per-CPU NAPI thread, it declines to use the unbound
+`kthread_run()` path for it at all.
+
+#### The 992 defect: generic XDP returns an Ethernet verdict on a raw-IP link
+
+This is the part that was not on the list when the session started.
+
+992's commit message already recorded that a program attached here "will
+misparse silently, reading the first two octets of the source address as an
+EtherType". What it did not record is that **the core does the same misparse,
+on the way back, and acts on it.**
+
+`bpf_prog_run_generic_xdp()` snapshots the packet as if it began with an
+Ethernet header:
+
+| `dev.c` | what it reads | what that is on `wwan0` |
+|---|---|---|
+| `:5093-5095` | `eth->h_dest` (bytes 0..5) and `eth->h_proto` (bytes 12..13), before the program runs | IPv4: version/IHL, TOS, total length, ID -- and the top half of the source address |
+| `:5107` | `skb->mac_header += off` after `bpf_xdp_adjust_head()` | shifts the anchor 991 sets, so `mac_len` stops being 0 |
+| `:5128` | compares those same bytes after the program ran | any difference reads as "the program rewrote L2" |
+| `:5132-5134` | `__skb_push(ETH_HLEN)`, `pkt_type = PACKET_HOST`, `skb->protocol = eth_type_trans()` | runs `eth_type_trans()` over the IP header |
+
+**What actually trips it, and what does not.** The comparison only looks at
+bytes 0..5 and 12..13, so the obvious candidates are innocent and the
+non-obvious ones are not:
+
+* A TTL decrement (byte 8) and the checksum fixup it forces (bytes 10..11) land
+  in the unused `h_source` field. **No trigger.**
+* A DSCP remark (byte 1) changes `h_dest` but flips neither the multicast test
+  nor the equality test. **No trigger.**
+* A source-address rewrite touches bytes 12..13 on IPv4 and IPv6 alike.
+  **Triggers.**
+* An IHL change (0x45 -> 0x46) flips the low bit of byte 0, which is the
+  Ethernet multicast bit. **Triggers.**
+* Any `bpf_xdp_adjust_head()` moves what those offsets land on. **Triggers.**
+
+**What it costs when it trips.** `eth_type_trans()` reads the version nibble as
+the first octet of a destination MAC. IPv4's 0x45 has the multicast bit set, so
+the datagram comes out `PACKET_MULTICAST`; IPv6's 0x60 does not, so it comes out
+`PACKET_OTHERHOST`. Neither is `PACKET_HOST`, and `ip_forward()` rejects
+anything that is not, at `net/ipv4/ip_forward.c:93`, under a comment reading
+`/* that should never happen */`. On this box that is the entire WAN-to-LAN
+path, dropped silently, for a program doing something as ordinary as NAT.
+
+**The fix is three stores on the `XDP_PASS` path**: re-anchor the network and
+mac headers, and force `PACKET_HOST`. `mac_len` needs no store of its own,
+because `skb_reset_mac_len()` recomputes it from those two headers at
+`dev.c:5603` and `gro.c:503` and it comes out 0 once they agree. All three are
+unconditional -- testing for the case costs more than redoing them -- and they
+are applied to `*pskb` rather than the entry skb, because `do_xdp_generic()` may
+have replaced it.
+
+The two other raw-IP modem netdevs in tree store `pkt_type` unconditionally on
+receive anyway: `iosm_ipc_wwan.c:233` and `rmnet_handlers.c:48`. Stock
+`mhi_wwan_mbim` never had to, because `netdev_alloc_skb()` zeroes the field and
+`PACKET_HOST` is 0. Adding a hook that lets a program change it is what makes
+the store necessary.
+
+**This was never measured, and the harness would not have caught it.**
+`verify-992a.sh` and `xdp-ft-wwan.sh` both attach counting or redirecting
+programs that do not rewrite bytes 0..5 or 12..13, so every run to date sat on
+the safe side of the trigger set by accident.
+
+#### Two things that are not bugs
+
+Both were on the suspect list and both were cleared by reading, which is worth
+recording so they are not re-derived:
+
+* **`mhi_mbim_xdp_set()` calling `bpf_prog_put(old)` with no grace period is
+  correct.** `__bpf_prog_put()` (`kernel/bpf/syscall.c:2245`) routes the last
+  reference through `__bpf_prog_put_noref(prog, true)`, which frees via
+  `call_rcu_tasks_trace()` or `call_rcu()` at `:2224`/`:2226`. The RX tasklet
+  holds `rcu_read_lock()` across the whole datagram loop, so a concurrent
+  `rcu_dereference()` reader is already covered. No `synchronize_rcu()` is
+  needed and adding one would be wrong.
+* **`mhi_mbim_ip_proto()` needs no length guard.** I expected the post-XDP call
+  to be able to see a zero-length skb. It cannot: generic XDP's own helpers floor
+  the packet at `ETH_HLEN`. `bpf_xdp_adjust_head()` rejects
+  `data > data_end - ETH_HLEN` and `bpf_xdp_adjust_tail()` rejects
+  `data_end < data + ETH_HLEN`, both in `net/core/filter.c`. `skb->data[0]` is
+  therefore in bounds on both call paths. The reason is now a comment in the
+  function so the guard does not get added later.
+
+#### Corrections to 23.21
+
+Line numbers in 23.21's `gro_cells.c` table are off by one in three places, and
+one in the body is off by one as well. Re-read against `v6.12.103`:
+
+| 23.21 said | actually | what is there |
+|---|---|---|
+| `:37` | `:38` | `__skb_queue_tail(&cell->napi_skbs, skb)` |
+| `:38` | `:39` | `if (skb_queue_len(...) == 1)`, the re-arm edge |
+| `:49` | `:50` | `/* called under BH context */` |
+| `dev.c:6721` | `dev.c:6722` | `assign_bit(NAPI_STATE_THREADED, ...)` |
+
+`:28`, `:30`, `:58` and `:85` were right. The argument 23.21 makes is unaffected
+-- every cited line still says what it was quoted as saying -- but a citation
+that sends a reader one line off is the failure mode this document is supposed
+to avoid, so it is corrected in place as well as recorded here.
+
+#### What this changes
+
+* **W0041 moves from proposed to written.** 996 is form 2. Form 1 -- bind each
+  kthread to the CPU whose cell it serves -- remains the better fix if threaded
+  gro_cells is ever wanted, and remains unwritten.
+* **W0002 stays retired.** 996 makes the toggle harmless, not useful: a gro_cells
+  NAPI still never runs in a thread, so there is still no threaded-NAPI latency
+  number to go and get.
+* **W0042 is no longer the price of safety.** 23.21 said the `threaded` control
+  "must stay at 0 until W0042 replaces gro_cells with a driver-owned NAPI". With
+  996 that is no longer true. W0042 stands or falls on its own merits now, which
+  after 23.23 are thin.
+* **991's commit message is rewritten**, and the file is ASCII-clean: it carried
+  five em-dashes and a section sign, which `checkpatch.pl` flags and which have
+  no business in a patch destined for netdev. The diff body is byte-identical
+  (`md5` unchanged).
+* **Three things are still owed**: a build carrying 996, a flash, and a
+  reproduction of the 992 defect -- attach a program that rewrites the source
+  address, confirm forwarded traffic dies without the fix and survives with it.
+  Until that runs, everything in this section is a source read.
+
+## 24. The outside sweep - 2026-09-15
+
+Everything before this section was read inside this tree or inside `v6.12.103`.
+This section is what five parallel investigations found by going outside both:
+mainline `master`, the netdev/bpf/linux-arm-msm archives, and MediaTek's own
+vendor SDK with its sparse checkout materialised.
+
+It was prompted by a fair challenge - that I had never once searched outside the
+tree in this round, and that I had asserted a hardware impossibility from a line
+in my own patch header. Both were true. The sweep overturned one of my claims,
+confirmed two, and produced a maintainer statement a month old that changes the
+calculus for the whole XDP-on-the-modem question.
+
+### 24.1 The position that matters: upstream has declined to make XDP work on non-Ethernet devices, in August 2026
+
+`[PATCH net-next] net: xdp: don't assume an Ethernet header in generic XDP`,
+Jiayuan Chen, posted 2026-08-13, is the closest thing to this tree's whole
+problem that anyone has sent upstream. It was refused.
+
+Jakub Kicinski, 2026-08-14:
+
+> Let's try. There is no native XDP on any non-ether device, making generic xdp
+> work on those is silly. Just attach the BPF in TC. [...] Please don't send
+> fixes to net-next :| -- pw-bot: cr
+
+Alexander Lobakin, 2026-08-18:
+
+> Most XDP programs expect Ethernet header at the beginning of a frame. Unless
+> you write a custom one which doesn't. But then you may face that XDP_TX,
+> XDP_REDIRECT won't work properly -- cpumap Rx, each .ndo_xdp_xmit()
+> implementation -- all expect Ethernet header at the beginning.
+
+Toke Hoiland-Jorgensen, 2026-08-18:
+
+> Yeah, I don't think we should start messing with the "XDP is Ethernet only"
+> assumption at this point...
+
+Status: `pw-bot: cr`, no v2 found. **E4** for the archive read, **E2** for the
+quotes being verbatim from the page I opened.
+
+Three things follow, and they are uncomfortable.
+
+* **The 992 defect from 23.28 is the exact bug upstream declined to fix.**
+  Generic XDP reading bytes 0..5 and 12..13 as an Ethernet header on a raw-IP
+  link is precisely what that patch addressed. So the repair 992 now carries is
+  not a local nicety: it is the workaround for something the core will not do,
+  by explicit decision, a month ago.
+* **"Just attach the BPF in TC" is Method D**, which this document tested and
+  recorded as working at section 4. The maintainers' recommendation and this
+  tree's own fallback are the same thing.
+* **Any native-XDP-on-cellular submission walks into this.** Not as a technical
+  objection but as a stated position from three maintainers, one of whom runs
+  the tree.
+
+### 24.2 I was wrong about headroom, and the real hazard is `frame_sz`
+
+In conversation I reasoned that native XDP over an NTB is blocked because the
+datagrams are packed with no headroom between them, so `data_hard_start` for
+datagram N would point into datagram N-1. **That is wrong, and it is wrong in a
+way worth recording precisely.**
+
+Zero headroom does not stop a native XDP program running. `xdp_prepare_buff()`
+(`include/net/xdp.h:121-139`) is pure pointer arithmetic - no assert, no clamp,
+no `WARN`. `bpf_prog_run_xdp()` validates nothing. And the verifier never lets a
+program reach `data_hard_start` at all: `xdp_is_valid_access()`
+(`net/core/filter.c:9133-9158`) permits only `data_meta`, `data` and `data_end`.
+**E2.**
+
+What zero headroom actually costs is narrower and sharper than "it cannot work":
+
+| consequence | mechanism | citation |
+|---|---|---|
+| `bpf_xdp_adjust_head()` fails for **any** offset below 40 - including `0` and including positive, shrinking offsets | the floor is the absolute address `data_hard_start + sizeof(struct xdp_frame)`, not a delta from `data` | `net/core/filter.c:4020-4038` |
+| `XDP_TX` and non-XSK `XDP_REDIRECT` become impossible | `xdp_convert_buff_to_frame()` writes an `xdp_frame` into the headroom and returns NULL when `headroom - metasize < sizeof(*xdp_frame)` | `include/net/xdp.h:267-314` |
+| `XDP_DROP`, `XDP_PASS`, `XDP_ABORTED` and AF_XDP redirect are unaffected | AF_XDP redirect copies | `net/xdp/xsk.c:204-232` |
+
+So the minimum headroom that unlocks everything is **40 bytes**, not 256.
+
+**And the real hazard is not headroom at all - it is `frame_sz`.**
+`bpf_xdp_adjust_tail()` bounds growth at `data_hard_start + frame_sz -
+SKB_DATA_ALIGN(sizeof(struct skb_shared_info))` and then **memsets that region**
+(`net/core/filter.c:4283-4309`, macro at `include/net/xdp.h:147-149`). Nothing
+correlates `frame_sz` with the actual packet or with where the next datagram
+starts. Hand a mid-NTB datagram `frame_sz = 32768` and a program can legally
+grow its tail thousands of bytes into the following datagrams and zero them.
+`frame_sz` must describe the per-datagram slot. **E2.**
+
+The same applies to the frags path, and harder: `skb_shared_info` lives at
+`data_hard_start + frame_sz - SKB_DATA_ALIGN(...)`, and
+`bpf_xdp_frags_increase_tail()` writes through it (`net/core/filter.c:4191-4211`).
+Setting the frags flag on a shared buffer requires real, private tailroom per
+datagram.
+
+### 24.3 The precedent I said did not exist, does
+
+Two in-tree counterexamples to "one packet per page", both of which I should have
+found before reasoning from first principles:
+
+* **octeontx2 runs native XDP over a page-pool fragment shared with other
+  packets.** `otx2_common.c:533` allocates each RX buffer with
+  `page_pool_alloc_frag()`; `otx2_txrx.c:1424-1430` runs `bpf_prog_run_xdp()`
+  over that fragment with 128 bytes of per-fragment headroom and
+  `frame_sz = pfvf->rbsize` - the fragment size, **not** `PAGE_SIZE`. That is the
+  exact shape W0026 would need. **E2.**
+* **mlx5e multi-packet-per-page merged in 2026-04.** `[PATCH net-next V2 0/5]
+  net/mlx5e: XDP, Add support for multi-packet per page`, Tariq Toukan, merged by
+  Kicinski. Reported 22.0% and 17.5% XDP_DROP gains at 1500/9000 MTU on 64K-page
+  aarch64. It splits the linear XDP page into fixed-size fragments and tracks
+  usage with a page_pool `frags` counter. **E4.**
+
+The caveat that keeps this honest: mlx5's fragments are laid out by *hardware*
+that knows the geometry, each with its own headroom. An NTB is laid out by modem
+firmware that leaves no gaps. The precedent breaks the rule; it does not solve
+the case.
+
+Four in-tree drivers also pass literal zero headroom in a supported
+configuration - ice, igb, i40e, ixgbe in legacy-rx mode. ice is the instructive
+one: `xdp_prepare_buff(xdp, hard_start, offset, size, !!offset)`
+(`ice_txrx.c:1257`) - it passes `meta_valid = !!offset`, deliberately disabling
+metadata when headroom is zero. **E2.**
+
+### 24.4 Why clone-based de-aggregation is dead, and what replaces it
+
+`iosm` is the only in-tree WWAN de-aggregator that avoids the copy:
+`skb_clone()` + `skb_pull()` + `skb_trim()`
+(`iosm_ipc_mux_codec.c:366-382`). It is tempting and it is a trap here, three
+ways, and the second is specific to this tree:
+
+1. **Truesize.** `__skb_clone()` does `C(truesize)` - each clone inherits the
+   parent's full 32 KB. Twenty-one clones account ~672 KB for ~30 KB of payload,
+   which wrecks rcvbuf accounting and TCP window autotuning. iosm never corrects
+   it. `cdc_ncm` - the same NTB format over USB - copies *deliberately* for this
+   reason, and says so in the code: `/* create a fresh copy to reduce truesize */`
+   (`cdc_ncm.c:1817-1823`). **E2.**
+2. **It would silently disable 991's GRO.** `gro_cells_receive()` bails to plain
+   `netif_rx()` when `skb_cloned(skb)` (`gro_cells.c:23`). Every clone would skip
+   GRO entirely. **E2.** This is the one that settles it for this tree.
+3. **It would not avoid a copy anyway.** `do_xdp_generic()` deep-copies cloned
+   skbs (`net/core/dev.c:5202`). Clone plus XDP equals clone *and* copy.
+
+The pattern that gets in-place de-aggregation **without** the truesize problem is
+mlx5's striding RQ: `page_pool_fragment_page(page, MLX5E_PAGECNT_BIAS_MAX)` on
+refill (`en_rx.c:285`), `frag_page->frags++` per packet carved out (`:539`),
+`skb_add_rx_frag()` (`:540`), and crucially `unsigned int truesize =
+pg_consumed_bytes;` (`:1991`) - each skb charged only the bytes it consumed,
+so the sum over N skbs equals the buffer exactly. Unused references are drained
+at retire with `page_pool_unref_page(page, MLX5E_PAGECNT_BIAS_MAX -
+frag_page->frags)` (`:295-303`). **E2.**
+
+That is the mechanism W0026 should copy. It is also the answer to the objection
+that killed the clone idea.
+
+### 24.5 The MHI plumbing for W0026 already exists
+
+`mhi_queue_dma()` (`bus/mhi/host/main.c:1194-1211`) takes a `struct mhi_buf` and
+sets `buf_info.pre_mapped = true`; `mhi_gen_tre()` then skips `map_single`
+(`:1245-1249`), and the DL completion path skips the unmap and hands the
+`cb_buf` back through `result.buf_addr` (`:643-646`). It is `EXPORT_SYMBOL_GPL`.
+**So a page-pool-backed DL refill needs no MHI core change at all.** **E2.**
+
+Three constraints that come with it: MHI never syncs for CPU on the pre-mapped
+path, so the driver calls `dma_sync_single_for_cpu()` itself; the pool must be
+created with `pp.dev = mhi_cntrl->cntrl_dev`, because that is what
+`dma_map_single()` uses (`main.c:187`); and this modem is configured 32-bit DMA
+(`pci_generic.c:1210`).
+
+None of the three queue APIs takes scatter-gather - one TRE, one contiguous
+region - so a 32 KB NTB still needs an order-3 page-pool page. `MHI_CHAIN`
+(`include/linux/mhi.h:59`) is honoured by `mhi_gen_tre()` (`:1253`) and the DL
+event parser is chain-aware (`:628`), but **no in-tree client has ever set it**.
+**E2** for the plumbing, **E4** for whether real modem firmware honours it.
+
+### 24.6 A smaller MRU is not an aggregation knob, and would make things worse
+
+Worth recording because it is the obvious idea and it is actively harmful.
+
+MRU is only the host buffer length written into the TRE (`main.c:1258`). **The
+modem decides NTB size, not the host.** When the NTB exceeds the buffer, MHI
+reports `MHI_EV_CC_OVERFLOW` (`main.c:581-599`) and the driver chains buffers
+into a `frag_list` via `mhi_net_skb_agg()` (`mhi_wwan_mbim.c:366`, called
+at `:437` and `:452`). `mhi_mbim_rx()` then issues three
+`skb_copy_bits()` calls per datagram against a chained skb, and `skb_copy_bits()`
+re-walks `skb_walk_frags` from the head every time. **That is O(n^2) in chain
+length.** Smaller MRU means more chaining means slower. **E1/E2.**
+
+This also raises a question worth a counter on the live box: whether the modem
+ever exceeds 32 KB and triggers the chaining path *today*. If it fires at all,
+that path costs more than anything else on the list.
+
+### 24.7 WED, closed properly
+
+The tree recorded "WED cannot be repurposed for the modem" at E3, reasoned from a
+second-hand command enumeration. It is now **E2**, and the reason is stronger
+than the one recorded.
+
+First, a correction: **`struct mtk_wed_wlan_device` does not exist.** The client
+contract is an anonymous `wlan` sub-struct inside `struct mtk_wed_device`,
+`include/linux/soc/mediatek/mtk_wed.h:133-190`, marked `/* filled by driver: */`.
+
+Of its 26 obligations, about five are mechanically suppliable by any PCIe device.
+The rest are not, and two are structurally fatal:
+
+* **`wpdma_phys`, `wpdma_int`, `wpdma_mask`, `wpdma_tx`, `wpdma_txfree`,
+  `wpdma_rx_glo`, `wpdma_rx`, `wpdma_rx_rro[]`, `wpdma_rx_pg`** (`:144-152`) are
+  physical addresses of **MediaTek WPDMA ring-control registers inside the
+  client**. WED writes them into its own CSRs (`mtk_wed.c:1222-1252`) and then
+  drives those registers as a bus master. WED does not accept packets; it
+  *operates the client's DMA engine*. An MHI device has channel and event rings
+  with CHDB/ERDB doorbells and a state machine - there is nothing to point WED at.
+* **`init_buf`** (`:181`) is called for every TX buffer (`mtk_wed.c:700`) and
+  mt76's implementation writes a MediaTek **TXWI plus a firmware TXP descriptor**
+  into each one (`mt7915/mac.c:816-837`). Nothing but an 802.11 MAC consumes that.
+
+The rest are `wcid_512` (station table size), `hw_rro` (802.11 reordering),
+`amsdu_max_len`/`amsdu_max_subframes` (A-MSDU), the `*_tbit` fields (bit
+positions in the WLAN chip's interrupt status register), and `ind_cmd` (Block-Ack
+session state, 1024 session elements).
+
+The attach path validates almost nothing - `mtk_wed_attach()` at
+`mtk_wed.c:2378-2391` checks only the PCIe domain number and `try_module_get()`.
+It is a trust contract, which is why the answer has to be argued from what
+happens after rather than from a gate. Further down it branches on chip ID
+(`:625`, `dev->wlan.id == 0x7991`) and loads `mediatek/mt7981_wo.bin`
+(`mtk_wed_mcu.c:340-341`).
+
+The WO command set is 26 entries (`mtk_wed.h:20-47`): two config, one state
+machine, six logging, nine dumps, three statistics, and five that are explicitly
+802.11 object models - `BSS_INFO`, `STA_REC`, `STA_BA_DUMP`, `BA_CTRL_DUMP`,
+`RRO_SER`. **No command anywhere takes an IP address, port, protocol or any
+5-tuple.** The vendor SDK adds none.
+
+**And on this board it is doubly moot.** MT7981 has exactly one WED unit
+(`117-complete-mt7981b-dtsi.patch:319-331`, `grep -c "wed@"` returns 1) and the
+radio is `wifi@18000000` - **on-SoC, AXI-attached**, so mt76 sets
+`wed->wlan.bus_type = MTK_WED_BUS_AXI` (`mt7915/mmio.c:679`). The Quectel is on
+PCIe. They are not on the same bus, and `mtk_wed_assign()` (`:489-519`) hands out
+each unit exactly once.
+
+One naming trap, recorded so nobody chases it: **the WO's IPC block is called
+CCIF, and MediaTek's modem stack (CCCI) also uses CCIF.** Shared IP, shared name,
+no shared data path.
+
+MediaTek does not do this for its own modem either: `drivers/net/wwan/t7xx/` is
+MediaTek's CLDMA 5G modem driver on MediaTek silicon, and grepping it for
+`wed|wdma|mtk_ppe|hnat|offload` returns nothing.
+
+### 24.8 The vendor SDK does have a generic 5-tuple offload - and it is NETSYS v3 only
+
+This is the find that would have overturned the assumption if the silicon
+matched, and it is worth recording precisely because it is so close.
+
+It is not WED. It is **TOPS/NPU** (Tunnel Offload Processing System) plus **PCE**
+(Packet Classification Engine). In `mtkfeed`:
+
+* `999-net-02-netdevice-add-npu-device-path-type.patch` adds a generic tunnel
+  descriptor to `enum net_device_path_type` carrying **MAC addresses, source and
+  destination IPs, and ports** - a real 5-tuple - with a
+  `/* Extend other tunnel here */` union and a hook
+  `extern int (*mtk_flow_tnl_offloadable)(const struct net_device_path *path);`.
+* `999-eth-46-mtk_eth_soc-add-tnl-offload-support.patch` routes
+  hardware-decapsulated packets to an arbitrary netdev via
+  `tops_crsn = RX_DMA_GET_TOPS_CRSN(trxd.rxd6)`.
+* `999-tnl-07-l2tp-add-fill-forward-path.patch` adds `pppol2tp_fill_forward_path`
+  to `ppp_channel_ops` - a **non-802.11 driver producing a forward path**, which
+  upstream has no equivalent of.
+* `mtkfeed/feed/kernel/pce/` is a whole packet-classification-engine driver.
+
+Why it cannot run here, three independent gates: `rxd6` exists only in
+`struct mtk_rx_dma_v2`, and MT7981 uses the 4-word `struct mtk_rx_dma`
+(`mtk_eth_soc.c:5344`); the crypto/NPU TX path is gated on
+`mtk_is_netsys_v3_or_greater()` and MT7981 is v2 (`:5330`); and
+`"mediatek,pce"` is declared only in MT7988 device trees. **E2.**
+
+So the honest statement is not "MediaTek never built a generic offload". It is
+**"MediaTek built it for NETSYS v3 and it never came back to v2."** If
+hardware-assisted modem forwarding is ever the goal, that is the lineage - on
+MT7988/MT7987, not this board.
+
+**Can it be backported? I do not know, and my first answer overstated the
+case.** Recording both the answer and the overstatement, because the
+overstatement is the more instructive half.
+
+The gate itself is one line. `mtk_is_netsys_v3_or_greater()` is
+`return eth->soc->version > 2` (`mtk_eth_soc.h:1349-1352`) and
+`mt7981_data.version` is the literal `2` (`mtk_eth_soc.c:5330`).
+
+I then named three things behind it and called them silicon. **All three are
+readings of what the shipped driver configures, not of what the hardware
+contains**, and the difference is exactly the one this page's own header warns
+about: "nobody has done it" and "it cannot be done" are different claims.
+
+| what I verified (E2) | what I asserted (E3, overstated) | what would actually settle it |
+|---|---|---|
+| `mt7981_data` sets `rx.desc_size = sizeof(struct mtk_rx_dma)`, four words (`:5344`); `mt7988_data` sets `_v2`, eight (`:5404`) | "`rxd6` is absent silicon" | **Settled 2026-09-15, and it went against me** - see below. `rxd6` is how the driver *talks to* TOPS, not why MT7981 lacks it. I had the causality backwards |
+| `compatible = "mediatek,pce"` appears in `mt7988.dtsi` and not in `mt7981.dtsi` (zero word-boundary matches for `tops`, `npu`, `pce`) | "the PCE is not present on MT7981" | A memory map. **Undeclared in device tree is not absent from the die** - a DT node can be added for a block that exists at an address. This is precisely the "make it available" question, and a DTS absence cannot answer it |
+| `feed/kernel/` holds `crypto-eip`, `fips-debugfs`, `pce` and nothing else | "TOPS cannot be had" | Where MediaTek actually ships the TOPS module. Its absence from *this SDK snapshot* is a sourcing fact, not a hardware one |
+
+**The falsification test, run - and it clears the conclusion while killing my
+reason for it.** The test was: if MT7987 is NETSYS v2 *and* carries TOPS, the
+descriptor argument collapses. MT7987 is **NETSYS v3**, confirmed in two
+independent copies of `750-net-ethernet-mtk_eth_soc-add-mt7987-support.patch`,
+the 6.12 one this tree builds and the 6.18 one in OpenWrt. So there is no v2 SoC
+with TOPS, and the conclusion survives.
+
+But completing the table is what matters, because MT7987 turns out to be the
+interesting case rather than the control:
+
+| SoC | `.version` | `ppe_num` | RX descriptor | `tops`/`npu`/`pce` DT node |
+|---|---|---|---|---|
+| MT7981 | 2 | 2 | `mtk_rx_dma`, 4 words | no |
+| MT7986 | 2 | 2 | `mtk_rx_dma`, 4 words | no |
+| **MT7987** | **3** | 2 | **`mtk_rx_dma_v2`, 8 words** | **no** |
+| MT7988 | 3 | 3 | `mtk_rx_dma_v2`, 8 words | **yes** - the only SoC declaring `mediatek,pce` |
+
+**MT7987 is NETSYS v3, has `mtk_rx_dma_v2`, therefore has `rxd6` - and still has
+no TOPS.** Zero word-boundary matches for `tops`, `npu` or `pce` across all
+fifteen `mt7987*.dtsi` files in the vendor SDK. So:
+
+* being NETSYS v3 is **not sufficient** for TOPS;
+* having v3 descriptors is **not sufficient** for TOPS;
+* **TOPS tracks the specific part, not the generation and not the descriptor
+  format.** It appears on exactly one of four Filogic SoCs.
+
+That makes "MediaTek built it for NETSYS v3" - my phrasing - wrong. But so was
+my replacement for it. I then wrote **"MediaTek built it for MT7988"** and called
+TOPS "an MT7988-only hardware block", which is the same error a third time: what
+MT7987 establishes is that MediaTek **did not wire it**, not that the silicon
+lacks it. If a v3 part with `rxd6` can ship without a TOPS node, wiring is a
+choice, and that reading cuts against my conclusion rather than for it.
+
+#### What the PCE actually is, which I should have looked at first
+
+The MT7988 node is:
+
+    pce: pce@15100000 {
+            compatible = "mediatek,pce";
+            fe_mem = <&eth>;
+    };
+
+**No `reg`, no clocks, no interrupts, no power domain.** It is not a separate IP
+block. It borrows the frame engine's register window, and the driver reaches
+everything through `writel(val, netsys.base + reg)` where `netsys.base` is that
+window (`feed/kernel/pce/src/netsys.c`). The offsets it uses, from
+`inc/pce/netsys.h`:
+
+| symbol | offset |
+|---|---|
+| `PPE0_BASE` / `PPE1_BASE` / `PPE2_BASE` | `0x2000` / `0x2400` / `0x2C00` |
+| `PPE_TPORT_TBL_0` / `_1` | `0x0258` / `0x025C` |
+| `GLO_MEM_CFG` / `GLO_MEM_CTRL` / `GLO_MEM_DATA_IDX(x)` | `0x0600` / `0x0604` / `0x0608 + 4x` |
+
+That `CFG` / `CTRL` / `DATA_IDX` triple is an **indirect table-access window** -
+the tables being CLS, CDRT, DIPFILTER and TS_CONFIG, whose index limits
+`netsys.c` carries in `fe_mem_limit[]`.
+
+And the geometry lines up exactly with this board:
+
+* Both `mt7981.dtsi` and `mt7988.dtsi` declare `eth: ethernet@15100000` with
+  `reg = <0 0x15100000 0 0x80000>` - **same base, same 512 KB window**.
+* MT7981 uses `mt7986_reg_map`, whose `ppe_base` is `0x2000`; MT7988 uses
+  `mt7988_reg_map`, whose `ppe_base` is also `0x2000`. **The PCE driver's
+  `PPE0_BASE` matches MT7981's PPE0 offset exactly.**
+* Upstream `mtk_eth_soc` describes **nothing** at `0x0258` or `0x0600` for *any*
+  SoC, and has no notion of CLS, CDRT, DIPFILTER or `GLO_MEM` at all. So upstream
+  silence is not evidence either way.
+
+**So I cannot establish from source that MT7981 lacks these tables.** The
+register geometry the PCE driver assumes is the geometry MT7981 has. The only
+difference I can actually point to is a device-tree node MediaTek did not write.
+**E2** for all of the above; the conclusion I previously drew from it is
+withdrawn.
+
+#### The question is now testable on the box, which it never was before
+
+This is the useful part. `GLO_MEM_CFG` is a plain register read at physical
+`0x15100600`. Whether MT7981's frame engine responds there is not a datasheet
+question any more - it is a `devmem` read, with the PPE0 registers upstream
+already drives as a positive control and unused offsets in the same window as a
+negative control. `x3000/docs/fe-probe.sh` does exactly that and nothing else.
+
+**Read-only, and it must stay that way.** Writing an undocumented frame-engine
+register on a live router is how the WAN goes away. Reading is not free either -
+on some designs an unimplemented address inside a peripheral window raises an
+imprecise abort rather than returning zero - so it is a run-it-when-a-reboot-is-
+cheap probe, not a routine one.
+
+Neither outcome would be proof. A region that reads back identical to the
+negative controls is consistent with not being implemented; a region that reads
+back structured says it responds. Either is one more piece of evidence than a
+device-tree absence, which is all this question has had so far. **E1 once run;
+nothing above it has been run.**
+
+Weak corroboration, graded **E4** and offered as no more than that: MediaTek's
+own RDK-B `meta-filogic` layer's only TOPS reference is an MT7988 commit. It
+carries no per-SoC capability matrix, so it confirms nothing on its own.
+
+**One claim from the sweep that I am retracting outright.** The sweep reported
+"the vendor's own build matrix has `mt7987-npu` and `mt7988-npu`". It does not.
+The only `npu` build variant anywhere in the feed is **`mt7996_npu`**, and every
+occurrence is inside **mt76 Wi-Fi driver patches** - that is the Wi-Fi 7 chip's
+own NPU, unrelated to NETSYS TOPS. I did not carry the claim into this document,
+but it was in the report this section was written from, and the same search will
+surface it again.
+
+**What is genuinely established:** the v3 path as MediaTek wrote it will not run
+on this board unmodified, because it reads a descriptor word this driver does
+not configure and maps a node this device tree does not declare. **What is not
+established:** that the silicon lacks the blocks. Those are different sentences
+and only the first is E2.
+
+**Two patches in the series looked worth carrying and are not** - see 24.12.
+I planned to take them as scaffolding for W0040 and validation killed that:
+neither compiles here as written, one patches a file this image does not build,
+and the infrastructure they appeared to add is already upstream. W0044 is
+withdrawn. What came out of looking properly is a much stronger W0040, now
+shipped as 997.
+
+One method note, because this section nearly recorded the opposite. My first
+sweep of the vendor SDK for `mt7981` near `npu` returned the MT7981 device trees
+as hits, which reads as evidence that the silicon has an NPU. It is the regex
+trap this document has hit before: **`input` contains `npu`.** With word
+boundaries the count is zero.
+
+A methodological note that cost real time: the `mtkfeed` checkout is **sparse**.
+`git sparse-checkout disable` materialises 4,683 files; anyone grepping it
+without that gets false negatives.
+
+One curiosity found along the way and confirmed dead: the legacy 5.4 vendor HNAT
+declares `ppe_hook_rx_modem` and `ppe_hook_tx_modem` function pointers
+(`21.02/.../foe_hook/hook_ext.c:29-32`) with a `channel_id` argument. Zero callers
+anywhere in 4,683 files, `struct sk_buff *` so software not hardware, and gone
+entirely from the current 6.12 HNAT. There is no `FOE_MAGIC_MODEM` in the legacy
+magic list either.
+
+### 24.9 The PPE claim was right in its conclusion and wrong in its mechanism - and downlink installs a phantom entry
+
+This tree has recorded, and built on, the assertion that *"a PPE entry needs both
+ends and every internet flow on this box crosses the modem, which can never be a
+PPE ingress."* The bottom line survives. The mechanism does not, and the wrong
+mechanism has been producing a false sub-conclusion.
+
+**"A PPE entry needs both ends" is false. E2.** A `struct mtk_foe_entry` contains
+**no ingress-derived field whatsoever**. Every `mtk_foe_entry_set_*` helper
+writes egress state: the L2 header the PPE will synthesise, the destination PSE
+port, the queue, the VLAN/PPPoE/DSA/WDMA encapsulation to apply on transmit. The
+ingress netdev is consulted in exactly one place in the whole driver -
+`mtk_ppe_offload.c:291-299` - and only to choose which of the two PPE units to
+install into. `mtk_flow_is_valid_idev()` returning false **is not an error
+path**: there is no `else` and no `return`, and control falls straight through.
+
+The two real barriers are:
+
+1. **The egress must be an mtk netdev.** `mtk_ppe_offload.c:224-231` -
+   `eth->netdev[0..2]` or `-EOPNOTSUPP`. A genuine, cited software check.
+2. **The ingress must physically enter through a GMAC or WDMA.** PPE ingress
+   routing is configured per-GDM-port only (`mtk_eth_soc.c:3460-3479`), and PPE
+   learning happens only inside the FE RX DMA loop from the FE RX descriptor
+   (`:2169-2204`). A packet arriving over PCIe/MHI has no FE RX descriptor. This
+   is a hardware property and is **never expressed as a software check anywhere
+   in the driver** - which is exactly why conflating it with (1) was easy.
+
+**The operational finding, and it is the one to act on. E2.** The two directions
+are two independent FOE entries with two independent cookies
+(`nf_flow_table_offload.c:866-896`), both always offered
+(`nft_flow_offload.c:378` sets `NF_FLOW_HW_BIDIRECTIONAL` unconditionally), and
+one succeeding is sufficient (`nf_flow_table_offload.c:955-969`).
+
+* **Uplink (LAN -> modem) is rejected twice**: `-EINVAL` at
+  `mtk_ppe_offload.c:398-400` because the synthesised source MAC is all-zero
+  (wwan0 has `addr_len == 0`), and `-EOPNOTSUPP` at `:231` because wwan0 is not
+  an mtk netdev. Clean, visible failure.
+* **Downlink (modem -> LAN) is accepted and installed.** The ingress check falls
+  through, both MACs are valid because they come from the LAN side, `eth1`
+  resolves to `PSE_GDM2_PORT`, and `mtk_foe_entry_commit()` runs at `:500`. **A
+  real entry in `MTK_FOE_STATE_BIND` appears in
+  `/sys/kernel/debug/mtk_ppe/entries` and forwards exactly zero packets**,
+  because modem-originated packets never traverse the frame engine.
+
+So any reading of PPE debugfs that treats a bound entry as evidence that WAN
+offload works is wrong. That is a live instrument hazard on this box, of the same
+class as the three this document has already had to withdraw. It is harmless to
+correctness - `NF_FLOW_HW` only gates GC and stats - but it is misleading, and
+nothing in this tree warned about it before now.
+
+A second reason the entry is unreachable even in principle: GMAC1 is bound to
+`ppe_idx = 1` (`mtk_eth_soc.c:3471-3473`) while the downlink entry lands on
+`ppe[0]`, because `ppe_index` kept the literal `0` from
+`mtk_ppe_offload.c:609` when the ingress check fell through.
+
+**And MediaTek ships a counterexample to the "both ends" formulation today.**
+`999-ppe-39-mtk_ppe-add-464xlat-clat-support.patch` matches a CLAT virtual
+interface as the **ingress**, by name prefix `"464-"`, and never consults
+`mtk_flow_is_valid_idev()`. **E2.** That is notable here beyond the general
+point, because section 23.11 established that this link *is* 464XLAT.
+
+### 24.10 Two findings from the sweep that I am rejecting
+
+Recorded because both are correct about pristine 6.12.103 and wrong about this
+tree, and the next sweep will surface them again.
+
+* **"RX headroom is too small, so generic XDP reallocates every packet."** True
+  of pristine `mhi_wwan_mbim.c:319`, where `netdev_alloc_skb()` yields only
+  `NET_SKB_PAD` and `netif_receive_generic_xdp()` therefore takes the
+  `netif_skb_check_for_xdp()` branch on every packet
+  (`net/core/dev.c:5202-5206`). **992 already fixes this**: it reserves
+  `XDP_PACKET_HEADROOM` whenever a program is attached, so headroom is
+  `NET_SKB_PAD + XDP_PACKET_HEADROOM` and the slow branch is never taken. The
+  patch header has always said so.
+* **"Threaded NAPI on the gro_cells NAPIs, zero code, move GRO to the second
+  core."** This is W0002, and section 23.21 established it is unsafe by
+  construction; 996 now makes the toggle inert precisely so it cannot be taken.
+  It is an appealing suggestion from the outside and it took the WAN down twice.
+
+### 24.11 What this changes
+
+* **My headroom claim is withdrawn.** Zero headroom does not block native XDP.
+  The design constraint is 40 bytes for `XDP_TX`/`XDP_REDIRECT` and a correct
+  per-datagram `frame_sz`; the memset in `bpf_xdp_adjust_tail()` is the actual
+  hazard.
+* **W0026 gains a mechanism and loses an excuse.** `mhi_queue_dma()` already
+  accepts pre-mapped buffers, octeontx2 shows native XDP over a shared page-pool
+  fragment, and mlx5 striding RQ shows how to charge truesize proportionally. The
+  remaining obstacle is geometry - 32 KB against a 4 KB page - not accounting and
+  not headroom.
+* **W0026's payoff grading is unchanged.** Nothing here revisits the measurement
+  that undercut "the modem path is CPU-bound by the copy": both cores at 20-26%
+  at ~250 Mbps.
+* **The upstream calculus is worse than it was.** Three maintainers stated a
+  month ago that XDP is Ethernet-only and that the answer for non-Ethernet
+  devices is tc-BPF. A native-XDP-on-cellular series is now first-of-kind against
+  a stated position, not merely unprecedented.
+* **WED moves from E3 to E2 and stays closed.** So does the modem-as-PPE-ingress
+  question, with a corrected mechanism and a new instrument hazard attached.
+* **One new open item**: whether the modem ever exceeds the 32 KB MRU today and
+  triggers the O(n^2) `frag_list` chaining path. That is a counter on the box,
+  not a source read.
+* **One upstream door is open**: MediaTek's t9xx WWAN driver has its control
+  plane in review at v7 and its **data plane not yet posted**. If page-pool or
+  XDP is ever to exist in a cellular driver, an unfixed design is the place to
+  argue for it.
+
+### 24.12 W0040 was the answer, and the evidence for it is upstream - 2026-09-15
+
+I set out to carry two of MediaTek's TOPS patches as scaffolding for W0040.
+Validating them first killed the plan and produced a better one. Recording the
+whole path, because the dead ends are the useful part.
+
+#### What validation found, in order
+
+| check | result |
+|---|---|
+| Is `union nf_inet_addr` reachable from `netdevice.h`? | **No.** No `netfilter.h` include, zero references; it is at `include/uapi/linux/netfilter.h:72`. `999-net-02`'s `tunnel.sip`/`.dip` do not compile here |
+| Is `struct dst_entry` declared for `netdevice.h`? | **No.** Not there, not in `skbuff.h`. The only `include/linux/` header carrying the forward declaration is `security.h`, which is not included. `struct dst_entry *dst;` would declare a fresh incomplete type |
+| Does another vendor patch supply those? | **No.** Of the eight `999-*` patches touching `netdevice.h`, the only one adding an include is `999-ppe-01`, and it adds `br_private.h` to a different file |
+| Is `net/l2tp/l2tp_ppp.c` built in this image? | **No.** `# CONFIG_L2TP is not set` and `# CONFIG_PPPOL2TP is not set`, OpenWrt `generic/config-6.12:3124` and `:4882` |
+| Does a new path type break existing consumers? | **No.** `nft_dev_path_info()` ends its switch with `default: info->indev = NULL; break;` and the caller bails on `!info->indev`. Clean |
+
+So lifting was never a lift; it was a port with a config change attached.
+
+#### The finding that changed the plan
+
+**The infrastructure those patches appeared to add is already upstream.**
+`struct ppp_channel_ops` has a `fill_forward_path` member at
+`include/linux/ppp_channel.h:33` in pristine `v6.12.103`. MediaTek's
+`999-tnl-07` does not add a hook - it *implements an existing one* for L2TP
+channels. There was nothing to backport.
+
+And once I looked at who implements these callbacks at all, W0040 stopped being
+a board-specific Wi-Fi complaint. **Exactly three functions sit behind
+`ndo_fill_forward_path` in the entire tree**, and two return `-EOPNOTSUPP` to
+mean "not this instance":
+
+| implementer | returns `-EOPNOTSUPP` | when |
+|---|---|---|
+| `ppp_fill_forward_path()` `ppp_generic.c:1591` | `:1599` | the PPP device is a multilink bundle |
+| the same | `:1610` | the channel's ops lack `fill_forward_path` - and `pppoe.c:1008` is the **only** setter upstream, so every non-PPPoE channel type lands here, L2TP included |
+| `ieee80211_netdev_fill_forward_path()` | `iface.c:939` (pristine) / `:1001` (backports 7.2, which is what ships) | the driver has no `net_fill_forward_path` op |
+
+`dev_fill_forward_path()` (`dev.c:729`) turns every one of those into
+`return -1`, discarding the walk - while a device with **no callback at all**
+falls through to `DEV_PATH_ETHERNET` and works.
+
+**So MediaTek's L2TP patch is a downstream workaround for W0040, not
+infrastructure to carry.** They hit `ppp_generic.c:1610` and implemented the
+hook for the one channel type they cared about rather than fixing the walk.
+That makes it evidence *for* the bug report - a citation, not a merge.
+
+#### A route that looked promising and closes cleanly
+
+If a non-Ethernet device can implement `ndo_fill_forward_path`, could
+`mhi_wwan_mbim` implement one and reach `FLOW_OFFLOAD_XMIT_DIRECT`? **No, and
+the reason is structural. E2.**
+
+`nft_dev_path_info()` sets `info->indev = path->dev` for
+`DEV_PATH_ETHERNET/DSA/VLAN/PPPOE`, and the xmit type is decided at the end by
+`nft_is_valid_ether_device(info->indev)` - which requires `ARPHRD_ETHER`,
+`addr_len == ETH_ALEN` and a valid address. A non-Ethernet device reaches
+XMIT_DIRECT only by **resolving down to a real Ethernet device beneath it**:
+PPPoE resolves to its underlying NIC, a Wi-Fi client to its bridge port.
+
+`wwan0` has nothing beneath it. It is the bottom of the stack - MHI over PCIe,
+no netdev below. Whatever it declared, `info->indev` would still be `wwan0` and
+`nft_is_valid_ether_device()` would still be false. Implementing the callback
+there buys nothing.
+
+#### What shipped
+
+**997**, the three-line W0040 fix: treat `-EOPNOTSUPP` from
+`ndo_fill_forward_path` as "no special path" rather than as failure. Three
+details in it are load-bearing rather than stylistic, and each was found by
+checking rather than by reading the diff:
+
+* `dev_fwd_path()` does `int k = stack->num_paths++` **before** the callback
+  runs, so the slot has to be given back.
+* `ret` must be cleared. `nft_flow_offload.c:206` gates on `>= 0` and
+  `mtk_ppe_offload.c:105-108` does `if (err) return err`, so leaving `ret` at
+  `-EOPNOTSUPP` would reproduce the same bug one layer up. My first draft did
+  exactly that.
+* `break`, not `continue`. The callbacks return without touching `ctx`, so
+  continuing trips `WARN_ON_ONCE(last_dev == ctx.dev)` immediately below.
+
+**W0044 is withdrawn**, having existed for about an hour. The two patches it
+covered are cited in 997's message instead.

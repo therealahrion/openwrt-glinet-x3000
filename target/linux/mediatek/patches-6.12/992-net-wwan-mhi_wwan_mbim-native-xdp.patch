@@ -59,6 +59,36 @@ header at offset 0 -- programs written against an Ethernet header will
 misparse silently here, reading the first two octets of the source
 address as an EtherType.
 
+Three more on the way back, which the core does not impose but the way it
+implements them makes necessary, because bpf_prog_run_generic_xdp()
+reconstructs the L2 header's fate from the packet's own bytes.
+bpf_xdp_adjust_head() shifts skb->mac_header along with skb->data
+(dev.c:5107), so any head adjustment leaves mac_len non-zero on a link
+with no L2 header -- undoing the anchoring above for everything
+downstream. And the "did XDP change the eth hdr" test at dev.c:5128
+compares bytes 0..5 and 12..13 before and after the program and answers a
+difference with __skb_push(ETH_HLEN) plus eth_type_trans(). Here those
+offsets are IP header fields: 12..13 is the top half of the source
+address, so a source rewrite, an IHL change or any head adjustment trips
+the test. eth_type_trans() then reads the version nibble as the first
+octet of a destination MAC, making IPv4 PACKET_MULTICAST (0x45 has the
+multicast bit set) and IPv6 PACKET_OTHERHOST -- and ip_forward() drops
+anything that is not PACKET_HOST at net/ipv4/ip_forward.c:93, under a
+comment reading "that should never happen". On a router that is every
+forwarded datagram, silently, for an entirely ordinary program.
+
+So on XDP_PASS the hook re-anchors both headers and forces PACKET_HOST
+before returning. Two stores fix three things: mac_len needs no store of
+its own because skb_reset_mac_len() recomputes it from the two headers at
+dev.c:5603 and gro.c:503, and it comes out 0 once they agree. All three
+are unconditional -- detecting the case costs more than redoing them --
+and they are applied to *pskb, not the entry skb, because
+do_xdp_generic() may have replaced it. Stock mhi_wwan_mbim never needed
+the pkt_type store, since netdev_alloc_skb() zeroes the field and
+PACKET_HOST is 0; the other two raw-IP modem netdevs in tree store it
+regardless (iosm_ipc_wwan.c:233, rmnet_handlers.c:48), and once an
+attached program can change it there is no choice.
+
 XDP_PACKET_HEADROOM is reserved in front of each datagram whenever a
 program is attached, so netif_skb_check_for_xdp() never has to
 pskb_expand_head(). When no program is attached the cost of this hook is
@@ -97,11 +127,21 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  
  	/* stats */
  	u64_stats_t rx_packets;
-@@ -338,6 +341,106 @@ static void mhi_mbim_set_gro_hash(struct
+@@ -338,6 +341,153 @@ static void mhi_mbim_set_gro_hash(struct
  	skb_set_hash(skb, jhash_3words(a, b, ports, proto), PKT_HASH_TYPE_NONE);
  }
  
-+/* Raw-IP link: the version nibble is the only protocol indicator. */
++/* Raw-IP link: the version nibble is the only protocol indicator.
++ *
++ * No length guard, deliberately.  On the pre-XDP call the null-terminator
++ * check in the RX loop has already established dgram_len != 0.  On the
++ * post-XDP call generic XDP's own helpers floor the packet at ETH_HLEN:
++ * bpf_xdp_adjust_head() rejects data > data_end - ETH_HLEN and
++ * bpf_xdp_adjust_tail() rejects data_end < data + ETH_HLEN, both in
++ * net/core/filter.c.  So skb->data[0] is in bounds on either path, and a
++ * runt that keeps a plausible version nibble is rejected further in --
++ * inet_gro_receive()'s skb_gro_header(), then ip_rcv()'s pskb_may_pull().
++ */
 +static __be16 mhi_mbim_ip_proto(const struct sk_buff *skb)
 +{
 +	switch (skb->data[0] & 0xf0) {
@@ -168,6 +208,43 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
 +	if (do_xdp_generic(xdp_prog, pskb) != XDP_PASS)
 +		return false;
 +
++	/* Undo what generic XDP's Ethernet assumption did on the way back.
++	 * Two separate things, both unconditional because testing for either
++	 * costs more than redoing the store, and both against *pskb rather
++	 * than the entry skb because do_xdp_generic() may have replaced it.
++	 *
++	 * bpf_xdp_adjust_head() moves skb->mac_header by the same offset it
++	 * moved skb->data (dev.c:5107), so any program that adjusts the head
++	 * leaves mac_len non-zero on a link that has no L2 header -- undoing
++	 * the anchoring this driver does precisely so that mac_header-relative
++	 * arithmetic downstream cannot walk before skb->head.
++	 *
++	 * The pkt_type store is the more damaging of the two. At dev.c:5095
++	 * bpf_prog_run_generic_xdp() snapshots bytes 0..5 and 12..13 of the
++	 * packet as an Ethernet destination and ethertype, compares them
++	 * against the same bytes after the program ran (dev.c:5128), and reads
++	 * any difference as "the program rewrote L2" -- responding with
++	 * __skb_push(ETH_HLEN) and eth_type_trans().  On a raw-IP link those
++	 * offsets are inside the IP header: bytes 12..13 are the top half of
++	 * the source address, so an ordinary source rewrite trips it, as does
++	 * an IHL change or any bpf_xdp_adjust_head().  eth_type_trans() then
++	 * reads the version nibble as the first octet of a MAC address, where
++	 * IPv4's 0x45 has the multicast bit set and IPv6's 0x60 does not, so
++	 * the datagram comes out PACKET_MULTICAST or PACKET_OTHERHOST.  Either
++	 * is fatal to a router: ip_forward() drops anything that is not
++	 * PACKET_HOST at net/ipv4/ip_forward.c:93, under a comment reading
++	 * "that should never happen".
++	 *
++	 * Stock mhi_wwan_mbim never had to store pkt_type because
++	 * netdev_alloc_skb() zeroes it and PACKET_HOST is 0.  The other two
++	 * raw-IP modem netdevs store it anyway -- iosm_ipc_wwan.c:233 and
++	 * rmnet_handlers.c:48 -- and once a program can change it, so must
++	 * this one.
++	 */
++	skb_reset_network_header(*pskb);
++	skb_reset_mac_header(*pskb);
++	(*pskb)->pkt_type = PACKET_HOST;
++
 +	return true;
 +}
 +
@@ -204,7 +281,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  static void mhi_mbim_rx(struct mhi_mbim_context *mbim, struct sk_buff *skb)
  {
  	int ndpoffset;
-@@ -391,6 +494,8 @@ static void mhi_mbim_rx(struct mhi_mbim_
+@@ -391,6 +541,8 @@ static void mhi_mbim_rx(struct mhi_mbim_
  		dpeoffset = ndpoffset + sizeof(struct usb_cdc_ncm_ndp16);
  		for (n = 0; n < nframes; n++, dpeoffset += sizeof(dpe16)) {
  			u16 dgram_offset, dgram_len;
@@ -213,7 +290,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  			struct sk_buff *skbn;
  
  			if (skb_copy_bits(skb, dpeoffset, &dpe16, sizeof(dpe16)))
-@@ -402,21 +507,30 @@ static void mhi_mbim_rx(struct mhi_mbim_
+@@ -402,21 +554,30 @@ static void mhi_mbim_rx(struct mhi_mbim_
  			if (!dgram_offset || !dgram_len)
  				break; /* null terminator */
  
@@ -253,7 +330,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  				net_err_ratelimited("%s: unknown protocol\n",
  						    link->ndev->name);
  				dev_kfree_skb_any(skbn);
-@@ -656,6 +770,12 @@ static void mhi_mbim_ndo_uninit(struct n
+@@ -656,6 +817,12 @@ static void mhi_mbim_ndo_uninit(struct n
  {
  	struct mhi_mbim_link *link = wwan_netdev_drvpriv(ndev);
  
@@ -266,7 +343,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  	gro_cells_destroy(&link->gcells);
  }
  
-@@ -666,6 +786,7 @@ static const struct net_device_ops mhi_m
+@@ -666,6 +833,7 @@ static const struct net_device_ops mhi_m
  	.ndo_stop = mhi_mbim_ndo_stop,
  	.ndo_start_xmit = mhi_mbim_ndo_xmit,
  	.ndo_get_stats64 = mhi_mbim_ndo_get_stats64,
@@ -274,7 +351,7 @@ Out-of-tree patch for the GL-X3000 lean build; applies after 991.
  };
  
  static int mhi_mbim_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
-@@ -727,6 +848,13 @@ static void mhi_mbim_setup(struct net_de
+@@ -727,6 +895,13 @@ static void mhi_mbim_setup(struct net_de
  	ndev->max_mtu = MHI_MAX_BUF_SZ - ndev->needed_headroom;
  	ndev->tx_queue_len = 1000;
  	ndev->needs_free_netdev = true;
