@@ -4896,3 +4896,97 @@ no caller's contract changed.
 Eight more windows, `rx_dropped` 0 in every one. **Twenty-four windows across
 five runs now, 1939 to 11790 dgram/s, not one drop.**
 
+### 23.27 A syntax, arithmetic and logic audit of the shipped scripts - 2026-09-15
+
+Six scripts audited with `shellcheck 0.9.0` in POSIX `sh` dialect, parsed in
+busybox ash, dash and bash, and then the arithmetic tested numerically. Most of
+what the linter raised is noise on this codebase; three real defects came out,
+two of them in the measurement math itself.
+
+#### What is clean, and why the linter's complaints are not
+
+- **All six parse in busybox ash** - the shell the router actually runs - as
+  well as dash and bash.
+- **Five `SC2045` "iterating over ls output is fragile"**: false, and provably
+  so. `dev_valid_name()` (`net/core/dev.c:1140`) rejects any name containing
+  `/`, `:` or `isspace()`, and caps length at `IFNAMSIZ-1`. Interface names
+  cannot contain whitespace, so the word splitting those loops rely on is safe.
+- **Four `SC2154` "referenced but not assigned"** on `sb`/`sp`/`sr`/`sf`: they
+  are assigned by an `eval` of awk output, which shellcheck cannot see through.
+- **Two `SC2140` "suspicious quoting"**: `"A"\<newline>"B"` concatenates into a
+  single argument. Verified - `argc=1`, `arg1=[part one part two]`.
+- **`BS_FAILED` "appears unused"**: set at `boxstate.sh:60`, initialised at
+  `:335` which is before the library return at `:594`, and read by
+  `xdp-ft-wwan.sh:224`. An unset value would arithmetic to 0 in any case.
+- **busybox shell arithmetic is 64-bit.** `2^40` and `3e9 * 8` both evaluate
+  correctly. The `%d` saturation that cost this project three figures is a
+  **busybox awk** defect, not a shell one: `awk %d` on 3e9 prints
+  `-2147483648` while `%.0f` prints it correctly. No awk `printf %d` in any of
+  the six is applied to a raw byte counter.
+- **Division-by-zero is guarded everywhere it can occur**, including the site I
+  suspected first: `verify-992a.sh:241` wraps its awk in
+  `[ "$_ds" -gt 0 ] && [ "$_dp" -gt 0 ]` with an else branch. I was wrong about
+  that one.
+- **`meas()` captures `_lab=$1` at line 339, before `set --` at 361-362.** The
+  bug that once printed `2147483647` where a window label belonged is genuinely
+  fixed, not merely moved.
+
+#### Defect 1: a duplicate hex parser that a blank field turns into a crash
+
+`gro-backlog-ab.sh` carried its own `sq()` reading `/proc/net/softnet_stat`:
+
+```sh
+_d=$((_d + 0x$_b)); _s=$((_s + 0x$_c))
+```
+
+With an empty field that expands to `$((0x))`, which is an **arithmetic syntax
+error** - verified - and there was no readability guard on the file either.
+`boxstate.sh` has owned this read all along as `bs_hexsum`, which walks the hex
+digits by hand (busybox awk has no `strtonum`), skips anything that is not a hex
+digit, and returns 0 for an unreadable file. `sq()` now delegates. Both produce
+identical output on the same file.
+
+This is the consolidation boxstate's own header describes, finished: that header
+already claims `gro-backlog-ab.sh` was the only script reading `time_squeeze`,
+and the copy it was consolidating out is the one that was still there.
+
+#### Defect 2: a whole-second clock in the divisor of every rate
+
+`wifi-encap.sh` measured its window with `date +%s`. Whole seconds, so a true
+20.0s window reads as 20 **or 21** depending only on where it fell inside a
+second - a 5% error, landing directly in the divisor of every throughput it
+reports. `gro-backlog-ab.sh` had the opposite problem: it used the *nominal*
+`WINDOW` and never measured at all, silently absorbing the seven counter reads
+that bracket the sleep on each side.
+
+Neither needed a better idea, only a better clock. busybox `date` has no `%N` -
+it prints the literal characters - but `/proc/uptime` is seconds with two
+decimals on every Linux. `bs_now_cs()` reads it as centiseconds, and both
+scripts now divide by what actually elapsed. Error over a 12s window drops from
+8.3% (whole seconds) to 0.008%.
+
+That conversion has its own trap, caught before shipping: concatenating the two
+halves of `0.50` gives the string `050`, and `$((050))` is **40**, because a
+leading zero means octal. `10#` would fix it and is a bashism busybox merely
+tolerates; the halves are added arithmetically instead.
+
+The new throughput expression was checked against the old across four
+magnitudes - they agree - and its worst intermediate, 1 Gbit/s for 60 seconds,
+is `6e12` against an int64 ceiling of `9.2e18`.
+
+#### Defect 3: a silent double-count if awk is missing
+
+`wifi-encap.sh` summed station counters through `eval` of an awk `END` block.
+awk's `END` always fires, so the variables are normally assigned even with no
+stations - but if awk itself were absent the `eval` produces nothing and the
+*previous* interface's values survive into the next iteration's addition. They
+are now reset to 0 before each eval. A zero is a visible wrong answer; a
+double-count is an invisible one.
+
+#### What this does not cover
+
+`shellcheck` finds shape, not meaning. It had nothing to say about any of the
+measurement errors this document has had to withdraw - the feature bit read as
+behaviour, the peak-to-peak comparison across drifting runs, the PID count read
+as a working download. Those were all syntactically perfect.
+

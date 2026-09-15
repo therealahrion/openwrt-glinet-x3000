@@ -205,6 +205,28 @@ bs_gro_fraglist() {
   ethtool -k "$1" 2>/dev/null | awk '/^rx-gro-list:/{print $2}'
 }
 
+# Elapsed time in CENTISECONDS, for windows that need to divide by it.
+#
+# Not `date +%s`: that is whole seconds, so a true 20.0s window reads as 20 or
+# 21 depending only on where the window happened to fall inside a second - an
+# 8% error on a 12s window, silently, in the divisor of every rate. wifi-encap.sh
+# was doing exactly that. And not busybox `date +%s%N` either: busybox has no
+# %N and prints the literal characters, which would parse as a wild number.
+#
+# /proc/uptime is seconds with two decimals on every Linux, so it gives
+# centisecond resolution with no tools at all.
+#
+# The two halves are added arithmetically rather than concatenated, because
+# concatenation reintroduces an octal bug: uptime "0.50" becomes the string
+# "050", and $((050)) is 40, not 50. `10#` would also fix it but is a bashism
+# busybox merely tolerates.
+bs_now_cs() {
+  read -r _u _ < /proc/uptime 2>/dev/null || { echo 0; return 0; }
+  _s=${_u%.*}; _f=${_u#*.}
+  _f=${_f#0}; [ -n "$_f" ] || _f=0
+  echo $(( _s * 100 + _f ))
+}
+
 bs_threaded()  { cat "/sys/class/net/$1/threaded" 2>/dev/null || echo "-"; }
 bs_backlog()   { cat /proc/sys/net/core/netdev_max_backlog 2>/dev/null || true; }
 bs_steering()  { uci -q get network.globals.packet_steering 2>/dev/null || echo unset; }

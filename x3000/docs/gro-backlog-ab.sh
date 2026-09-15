@@ -166,13 +166,15 @@ cpu() {
 }
 
 # softnet_stat is hex, one row per CPU: processed, dropped, time_squeeze, ...
-sq() {
-	_d=0; _s=0
-	while read -r _a _b _c _rest; do
-		_d=$((_d + 0x$_b)); _s=$((_s + 0x$_c))
-	done < /proc/net/softnet_stat
-	echo "$_d $_s"
-}
+#
+# This used to parse the file itself with $((_d + 0x$_b)), which is an
+# arithmetic SYNTAX ERROR the moment a field comes back empty - and it had no
+# readability guard either. boxstate.sh already owns this read, walks the hex
+# digits by hand (busybox awk has no strtonum), skips anything that is not a hex
+# digit, and returns 0 when the file cannot be read. That is the whole reason
+# the library exists, and this copy predates the consolidation rather than
+# disagreeing with it.
+sq() { echo "$(bs_softnet_dropped) $(bs_squeeze)"; }
 
 # ---- load -----------------------------------------------------------------
 # Each stream restarts when its file completes, so the offered load does not
@@ -347,6 +349,12 @@ meas() {
 	_i0=$(( $(in4) + $(in6) ))
 	_q0=$(sq)
 	_c0=$(cpu)
+	# The divisor is the window that actually elapsed, not the one asked for.
+	# Seven counter reads bracket the sleep on each side and they are not free
+	# on a loaded box; nominal WINDOW ignores them. Centiseconds, so the
+	# resolution costs 0.008% on a 12s window rather than the 8% that whole
+	# seconds would.
+	_cs0=$(bs_now_cs)
 
 	sleep "$WINDOW"
 
@@ -357,6 +365,11 @@ meas() {
 	_i1=$(( $(in4) + $(in6) ))
 	_q1=$(sq)
 	_c1=$(cpu)
+	_cs1=$(bs_now_cs)
+	_wcs=$(( _cs1 - _cs0 ))
+	# A zero or negative elapsed cannot happen from a sleep, but /proc/uptime is
+	# external input and a divisor of zero would take awk down mid-window.
+	[ "$_wcs" -gt 0 ] || _wcs=$(( WINDOW * 100 ))
 
 	set -- $_q0; _sd0=$1; _ss0=$2
 	set -- $_q1; _sd1=$1; _ss1=$2
@@ -368,12 +381,13 @@ meas() {
 	[ -n "$_rtt" ] || _rtt="n/a"
 	[ -n "$_loss" ] || _loss="n/a"
 
-	awk -v lab="$_lab" -v w="$WINDOW" \
+	awk -v lab="$_lab" -v wcs="$_wcs" \
 	    -v dp=$((_p1-_p0)) -v ds=$((_i1-_i0)) -v db=$((_b1-_b0)) \
 	    -v dd=$((_r1-_r0)) -v de=$((_e1-_e0)) \
 	    -v sd=$((_sd1-_sd0)) -v ss=$((_ss1-_ss0)) \
 	    -v rtt="$_rtt" -v loss="$_loss" \
 	    -v ct=$((_ct1-_ct0)) -v ci=$((_ci1-_ci0)) -v cs=$((_cs1-_cs0)) 'BEGIN{
+		w = wcs / 100                 # centiseconds back to seconds, as a float
 		if (ds<=0 || dp<=0) { printf "%-12s no traffic in the window\n", lab; exit }
 		printf "%-12s %6.1f Mbit/s %6d dgram/s %6d skb/s  agg=%5.2fx\n", lab, db*8/w/1000000, dp/w, ds/w, dp/ds
 		printf "%-12s rx_dropped=%-5d softnet_dropped=%-5d time_squeeze=%-4d rx_errors=%d\n", "", dd, sd, ss, de

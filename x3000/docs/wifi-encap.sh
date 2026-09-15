@@ -95,6 +95,11 @@ snap() {
   for a in $(aps); do
     n=$(cat "/sys/class/net/$a/statistics/tx_bytes" 2>/dev/null || echo 0)
     nb=$((nb + n))
+    # Reset before the eval. awk's END always fires, so these are normally
+    # assigned even with no stations - but if awk itself is missing the eval
+    # produces nothing and the PREVIOUS interface's values survive and get added
+    # a second time. Silent double-counting is worse than a zero.
+    sb=0; sp=0; sr=0; sf=0
     eval "$(iw dev "$a" station dump 2>/dev/null | awk '
       /tx bytes:/   {b+=$3}
       /tx packets:/ {p+=$3}
@@ -109,15 +114,21 @@ snap() {
 interval() {
   lbl="$1"          # captured BEFORE `set --` overwrites the positional params,
                     # which once printed a byte counter where the label belonged
-  s1=$(snap); t1=$(date +%s)
+  # bs_now_cs, not `date +%s`: whole seconds quantise a true 20.0s window to
+  # either 20 or 21 depending on sub-second phase, a 5% error that lands
+  # straight in the divisor of every rate below.
+  s1=$(snap); t1=$(bs_now_cs)
   sleep "$SECS"
-  s2=$(snap); t2=$(date +%s)
+  s2=$(snap); t2=$(bs_now_cs)
   set -- $s1; ab=$1; ap=$2; ar=$3; af=$4; an=$5; aq=$6
   set -- $s2; bb=$1; bp=$2; br=$3; bf=$4; bn=$5; bq=$6
-  d=$((t2-t1)); [ "$d" -gt 0 ] || d=1
+  dcs=$((t2-t1)); [ "$dcs" -gt 0 ] || dcs=$(( SECS * 100 ))
   dsp=$((bp-ap)); dsr=$((br-ar)); dsf=$((bf-af))
-  mst=$(( (bb-ab) / d * 8 / 1000000 ))
-  mnd=$(( (bn-an) / d * 8 / 1000000 ))
+  # Divide by the elapsed centiseconds, then scale: (bytes*8*100)/(cs*1e6).
+  # Bytes first would be 2e8*800 = 1.6e11, which busybox's 64-bit shell
+  # arithmetic carries fine - verified - where a 32-bit shell would not.
+  mst=$(( (bb-ab) * 800 / dcs / 1000000 ))
+  mnd=$(( (bn-an) * 800 / dcs / 1000000 ))
   if [ "$dsp" -gt 0 ]; then rr=$(( dsr * 1000 / dsp )); else rr=-1; fi
   printf '%-9s sta %5d Mbit/s | netdev %5d Mbit/s | frames %9d | retries/1k %5d | failed %6d | squeeze %3d\n' \
          "$lbl" "$mst" "$mnd" "$dsp" "$rr" "$dsf" "$((bq-aq))"
