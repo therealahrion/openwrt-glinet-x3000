@@ -4687,6 +4687,64 @@ saw a nearly constant skb rate across a 76% swing in offered datagrams. This is
 the clearest demonstration in the record of what 991 buys, and it is a stronger
 argument for the patch than any of the throughput numbers that could not be read.
 
+#### Four streams at last, and they made the measurement worse
+
+The multi-source ramp held: `load: 4 of 4 stream(s) holding, no fetch failures`,
+dealt round-robin across four Hetzner hosts that each serve two. First time this
+harness has run four streams. The candidate check found `hil`, `ash`, `fsn1` and
+`nbg1` all serving 206 at two concurrent apiece, and Cloudflare's endpoint
+returning 403 - so the "designed for parallel" source I would have reached for
+is not usable from here at all.
+
+| window | Mbit/s | dgram/s | skb/s | agg | rx_dropped | rtt avg |
+|---|---|---|---|---|---|---|
+| backlog-1000 | 75.7 | 6591 | 3355 | 1.96x | **0** | 61.2 ms |
+| backlog-2000 | 86.2 | 7506 | 3149 | 2.38x | **0** | 107.0 ms |
+| backlog-4000 | 73.7 | 6415 | 3251 | 1.97x | **0** | 70.0 ms |
+| backlog-1000 (drift control) | 88.7 | 7738 | 3853 | 2.01x | **0** | 79.8 ms |
+
+**Throughput fails the drift control for the third consecutive run**: the two
+windows at backlog 1000 are 1147 dgram/s apart, the three settings span 1091.
+
+**Latency is tracking the offered load, not the queue depth.** `backlog-4000`,
+the deepest setting, came in at 70.0 ms against a 70.5 ms mean for the two
+backlog-1000 windows - indistinguishable. `backlog-2000` has both the highest
+rate and the worst latency, which is what a fuller pipe looks like rather than a
+deeper queue. The 17.8 ms gap measured in the previous run is **not reproduced**,
+and there are now two reasons it might not be: a different rate, and - below - a
+different flow structure.
+
+#### More streams is not more load: it is less GRO
+
+This is the result worth keeping, and it was not what the run was for.
+
+| | streams | dgram/s | skb/s | agg |
+|---|---|---|---|---|
+| previous run, best window | 2 | 11790 | 2370 | 4.97x |
+| this run, best window | 4 | 7738 | 3853 | 2.01x |
+
+**34% fewer datagrams arriving, 63% more skbs handed to the stack.** Doubling
+the stream count did not raise the offered load; it lowered it, and it made the
+receive path do considerably more work for what did arrive.
+
+The mechanism is not subtle once stated. GRO merges consecutive packets **of the
+same flow**. With four flows interleaving on one link, the next packet is the
+same flow only about a quarter of the time, so each batch that reaches
+`napi_gro_receive()` is shorter and aggregation collapses - here from ~5x to ~2x.
+The link then hands the stack nearly twice as many skbs while carrying a third
+less traffic.
+
+Two of the four sources compound it: `fsn1` and `nbg1` are in Germany, so two of
+the four streams were trans-Atlantic. They added flows without adding rate.
+
+**Consequences for every comparison in this section.** Stream count is not a
+free knob - it changes what is being measured. Runs at different stream counts
+are not comparable on `skb/s`, on `agg`, or on anything downstream of how much
+per-packet work the stack does. The instinct that drove this whole detour, that
+more streams means more load and therefore a better test, is wrong on this link.
+For the GRO question specifically, **fewer and fatter flows are the harder test
+of the receive path**, not more of them.
+
 #### What it changes
 
 - **W0002's premise is unsupported at this rate.** Its argument was
@@ -4708,7 +4766,13 @@ argument for the patch than any of the throughput numbers that could not be read
 - **The gate and the drift control both earned their place on first use** - one
   stopped a doomed run in 8 seconds, the other disqualified a throughput
   ordering that looked clean.
-- **Nothing here reaches 20k dgram/s**, and now the reason is known: half the
-  streams were never running. Whether the original 0.2% drop figure reproduces
-  at that rate is still open, and needs a load source that tolerates four
-  concurrent connections.
+- **Sixteen windows across four runs, 2316 to 11790 dgram/s, zero drops in
+  every one.** The backlog question is closed: no depth removed a drop, because
+  there was never one to remove.
+- **Nothing here reaches 20k dgram/s, and more streams will not get there.**
+  Four streams produced a *lower* datagram rate than two. If that rate is worth
+  chasing it needs a faster link or fewer, fatter flows - not more fetchers.
+  Whether the original 0.2% figure reproduces at 20k remains open and is now
+  the only open part of it.
+- **Stream count joins the list of things a run must state to be comparable**,
+  alongside GRO, backlog, threading and steering.
