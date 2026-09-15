@@ -4566,6 +4566,56 @@ Fixed in `gro-backlog-ab.sh`:
   is the cheap form of the alternation 23.19 arrived at for the Wi-Fi A/B.
 - The read-it-this-way note now says to compare the control pair *first*.
 
+#### The clean run, 2026-09-14, `STREAMS=2`
+
+The gate fired on the first attempt exactly as designed - 6 fetch failures in
+8 seconds, stopped before spending the data - and `STREAMS=2` then produced the
+first run of this harness with a load that held:
+
+| window | Mbit/s | dgram/s | skb/s | agg | rx_dropped | rtt min/avg/max |
+|---|---|---|---|---|---|---|
+| backlog-1000 | 110.5 | 9616 | 2294 | 4.19x | **0** | 38.4 / 71.7 / 140.5 ms |
+| backlog-2000 | 135.4 | 11790 | 2370 | 4.97x | **0** | 35.3 / 94.7 / 253.2 ms |
+| backlog-4000 | 124.1 | 10801 | 2357 | 4.58x | **0** | 30.6 / 91.8 / 155.7 ms |
+| backlog-1000 (drift control) | 76.9 | 6695 | 2183 | 3.07x | **0** | 37.3 / 79.4 / 166.1 ms |
+
+`load: 2 of 2 stream drivers up, 0 fetch failure(s)`. `softnet_dropped` and
+`time_squeeze` were 0 in every window, as was `rx_errors`.
+
+**Throughput is still unreadable, and now the harness proves it rather than
+implying it.** The two windows at backlog 1000 are 2921 dgram/s apart. The three
+*settings* span 2174. **Drift is larger than the effect**, so no ordering of the
+settings survives - including the tempting reading that 2000 is best because it
+posted the highest number. Unlike the first run the decline is not monotonic
+(9616, 11790, 10801, 6695), which says this is ordinary link variance rather
+than a systematic artefact.
+
+**Latency is readable, because the same test passes.** The two backlog-1000
+windows differ by 7.7 ms; the 1000 pair averages 75.5 ms against 93.3 ms for the
+deeper pair - a 17.8 ms gap, 2.3x the within-setting spread, and in the direction
+theory predicts. **A deeper backlog costs about 18 ms of latency under load and
+buys nothing**, because there were no drops to reduce at any depth. That is the
+bufferbloat trade with one side empty. Two samples per condition, so it is
+suggestive rather than settled - but it is the first time this sweep has produced
+a comparison that survives its own drift control.
+
+**Eight windows now, across two runs, at 6695 to 11790 dgram/s: zero drops
+everywhere.** The peak here exceeds the first run's, and W0002's premise still
+has nothing under it.
+
+#### What 991 is actually doing, measured
+
+The skb rate barely moves while the datagram rate swings hard:
+
+- `dgram/s` spans 6695 to 11790, **+76%**
+- `skb/s` spans 2183 to 2370, **+8.6%**
+
+GRO absorbed nearly all of it. At the top window 11790 datagrams per second
+reached the stack as 2370 skbs - **4.97x less per-packet work**, and the stack
+saw a nearly constant skb rate across a 76% swing in offered datagrams. This is
+the clearest demonstration in the record of what 991 buys, and it is a stronger
+argument for the patch than any of the throughput numbers that could not be read.
+
 #### What it changes
 
 - **W0002's premise is unsupported at this rate.** Its argument was
@@ -4576,10 +4626,17 @@ Fixed in `gro-backlog-ab.sh`:
 - **The sweep has been fixed rather than re-run as-is.** It now refuses a
   partial load and carries its own drift control, so the next run either
   produces a comparable set or says why it cannot.
-- **Four windows now show zero drops**, counting the baseline: 10976, 9211,
-  7575 and 7933 dgram/s, all at `rx_dropped` 0. The zeros are the one column
-  the load fault does not touch, because a bad load generator only lowers the
-  rate and drops are rate-dependent.
+- **Eight windows now show zero drops**, across both runs and from 6695 to
+  11790 dgram/s. The zeros are the one column the load fault never touched,
+  because a bad load generator only lowers the rate and drops are
+  rate-dependent.
+- **`netdev_max_backlog` should stay at 1000.** Deeper depths removed no drops,
+  because there were none, and cost about 18 ms of latency under load. That
+  closes the question the sweep was written to answer, in the opposite
+  direction from the one that motivated it.
+- **The gate and the drift control both earned their place on first use** - one
+  stopped a doomed run in 8 seconds, the other disqualified a throughput
+  ordering that looked clean.
 - **Nothing here reaches 20k dgram/s**, and now the reason is known: half the
   streams were never running. Whether the original 0.2% drop figure reproduces
   at that rate is still open, and needs a load source that tolerates four
