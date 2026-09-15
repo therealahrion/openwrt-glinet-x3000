@@ -7,7 +7,7 @@
 # while tx keeps flowing. Captured and analysed in x3000/docs/downlink-stall.md.
 #
 # The parameter comes from
-# target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch
+# target/linux/mediatek/patches-6.12/880-bus-mhi-host-optional-doorbell-write.patch
 # and defaults to off, so this line is what enables it on this board.
 #
 # Why here and not /etc/modules.conf, which also works: that file is a ubox

@@ -78,14 +78,14 @@ it would be an ABI change inside a patch whose job is to stop a
 corruption, and it would give a mixed device two different answers
 depending on which NAPIs happen to exist when the write lands.
 
-This is not specific to this board or to my 991. Every gro_cells user at
+This is not specific to this board or to my 890. Every gro_cells user at
 6.12.103 -- amt, bareudp, geneve, macsec, pfcp, vxlan, ip_tunnel and
 rmnet_vnd -- exposes the same writable sysfs file with the same exposure
 on any non-RT kernel. rmnet_vnd is Qualcomm's modem netdev in mainline,
 so the hazard is reachable on stock hardware by writing one file, with
 no local patch applied first.
 
-I hit it here because 991 moved wwan0 into that class: stock
+I hit it here because 890 moved wwan0 into that class: stock
 mhi_wwan_mbim registers no NAPI at all (a bare netif_rx() at
 mhi_wwan_mbim.c:348), so the toggle was inert before. Writing 1 to it
 took the WAN down twice on 2026-09-14, silently, with no recovery from
@@ -102,10 +102,11 @@ netif_napi_add_weight() to honour it, then one patch setting it in
 gro_cells_init(). Kept as a single patch here because the first half is
 dead code without the second.
 
-Independent of 991, 992, 993 and 995: it touches core net only, no
+Independent of 890, 891, 880 and 892: it touches core net only, no
 driver, and shares no file with them, so the apply order between them
-does not matter. Numbered 996 because 994 is retired -- see 995's
-message and xdp-methods-tested.md section 22.7.
+does not matter. Numbered in the 870-879 core-networking group; the
+series is grouped by subsystem rather than by the order things were
+written.
 
 Out-of-tree patch for the GL-X3000 lean build.
 

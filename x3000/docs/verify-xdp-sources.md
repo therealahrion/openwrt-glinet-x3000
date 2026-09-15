@@ -144,7 +144,7 @@ Note `bpf_trace_printk` takes at most three variadic arguments; a fourth is a
 compile error (`too many arguments`), which is why the output is split across
 two calls.
 
-## `xdp_tail_probe.bpf.c` — tells 999's native hook from 992's generic one
+## `xdp_tail_probe.bpf.c` — tells 893's native hook from 891's generic one
 
 The source is committed next to the object at `bpf/xdp_tail_probe.bpf.c`, so it
 is not reproduced here. What it does, and why it is the discriminator:
@@ -154,7 +154,7 @@ three-entry array map, undoes the growth if it somehow succeeded - it runs on
 live forwarded traffic and must not leave a packet longer than it arrived - and
 returns `XDP_PASS`.
 
-999 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
+893 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
 SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`, so `xdp_data_hard_end()`
 (`include/net/xdp.h:147`) lands at the end of the datagram and there is no room
 to grow: the call must return `-EINVAL`. The generic path runs the same program

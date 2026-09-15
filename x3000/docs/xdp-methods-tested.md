@@ -1,5 +1,53 @@
 # XDP / eBPF / tc-BPF on the X3000: every method, tested
 
+## The patch series: numbering, what each touches, and the old names
+
+Renumbered 2026-09-15. The series had reached 999 with no room left above it -
+the four patches that edit `mhi_wwan_mbim.c` sat at 991, 992, 995 and 999 and
+the next one in that chain had nowhere to go. It is now grouped by subsystem,
+in a range disjoint from the old one so that no number ever refers to two
+different patches: anything written before that date that says "992" means the
+patch now called 891, unambiguously, and this table is how to resolve it.
+
+| now | was | patch | touches |
+|---|---|---|---|
+| **870-879** | | **core networking** | |
+| 870 | 990 | tcp-bbr3 | `net/ipv4/` (16 files), `include/net/tcp.h`, `include/uapi/linux/tcp.h` |
+| 871 | 996 | gro_cells opt out of threaded napi | `net/core/gro_cells.c`, `net/core/dev.c`, `include/linux/netdevice.h` |
+| 872 | 997 | forward path decline without failing | `net/core/dev.c` |
+| 873 | 998 | xdp: no ethernet assumption rebuilding skb | `net/core/xdp.c` |
+| **880-889** | | **bus and driver infrastructure** | |
+| 880 | 993 | mhi host optional doorbell write | `drivers/bus/mhi/host/init.c` |
+| **890-899** | | **modem receive path**, in apply order | |
+| 890 | 991 | mhi_wwan_mbim gro_cells rx | `drivers/net/wwan/mhi_wwan_mbim.c`, `drivers/net/wwan/Kconfig` |
+| 891 | 992 | mhi_wwan_mbim xdp hook (generic) | `drivers/net/wwan/mhi_wwan_mbim.c` |
+| 892 | 995 | mhi_wwan_mbim validate ndp chain and bounds | `drivers/net/wwan/mhi_wwan_mbim.c` |
+| 893 | 999 | mhi_wwan_mbim native xdp datagrams | `drivers/net/wwan/mhi_wwan_mbim.c` |
+
+Outside the kernel tree, in `package/network/config/firewall4/patches/`:
+
+| now | was | patch | touches |
+|---|---|---|---|
+| 900 | 001 | flowtable fall back to l3 device | `root/usr/share/ucode/fw4.uc` |
+
+That one moved for a different reason. It was at `001` - the lowest number in a
+directory this fork created, because upstream firewall4 ships no patches at all.
+OpenWrt's convention elsewhere starts at `010` or `100`, so a future upstream
+patch would have landed on top of it.
+
+**What the grouping has to preserve.** Only two orderings are forced, and both
+come from shared files rather than from logic: 890 before 891 before 892 before
+893, because all four edit the same datagram loop; and 871 before 872, because
+both edit `net/core/dev.c` and that is the order they were verified in. Every
+other patch in the series is the only one touching its files, so its position is
+free. Upstream's own `8xx`/`9xx` patches in this target touch 22 files, none of
+them in the table above, which is why sitting below `900` changes nothing.
+
+**Why this table is the thing to check on a kernel bump.** A version bump does
+not break a patch because of its number; it breaks it because upstream changed
+the same lines. The `touches` column is the checklist: four of these patches
+share one driver file, two share `net/core/dev.c`, and the rest stand alone.
+
 ## Which tree each claim was read from - read this before trusting a line number
 
 The image is built from three separate source trees, on a base of
@@ -9,7 +57,7 @@ this repo's lean overlay. Paths are relative to
 
 | what | tree | notes |
 |---|---|---|
-| kernel | `linux-6.12.103` | post upstream + Jeeves + OpenWrt patches + this repo's 990-993 |
+| kernel | `linux-6.12.103` | post upstream + Jeeves + OpenWrt patches + this repo's own series, 870-893 |
 | wireless driver | `mt76-2026.03.19~39c960c3` | separate package; files are `dma.c`, `mac80211.c`, not `mt76_*.c` |
 | 802.11 stack | `mac80211-regular/backports-6.18.39` | **backports, not the kernel's own `net/mac80211`**. Confirmed on the box: `modinfo mac80211` shows `depends: cfg80211,compat` |
 
@@ -24,7 +72,7 @@ diffed against it:
 | `include/linux/netdevice.h` | **+10 below line 2242** | patches 651 (+0), 721 (+1, +5, +4), 731 (+0) |
 | `net/core/gro.c`, `gro_cells.c`, `filter.c`, `kernel/bpf/*`, `net/xdp/*`, `net/netfilter/*` | **0** | unpatched in this tree; citations resolve as written |
 | `drivers/net/ethernet/mediatek/` | 300 to 600 | where the patches accumulate |
-| `drivers/net/wwan/mhi_wwan_mbim.c` | shifts with 991/992 | cite against pristine and say so, as sections 20 and 22 do |
+| `drivers/net/wwan/mhi_wwan_mbim.c` | shifts with 890/891 | cite against pristine and say so, as sections 20 and 22 do |
 
 So a `dev.c` citation in this file can be checked arithmetically rather than
 re-found: subtract 5 and it must match pristine v6.12.103. Fifteen citations were
@@ -76,26 +124,26 @@ and `drivers/net/tun.c` calls it from a driver in exactly the shape needed
 which is `eth_type_trans()`, six lines short). I was looking one level too deep in
 the call chain and stopped at the first unexported symbol.
 
-**992 changed the default XDP attach mode on `wwan0`, and that is why
+**891 changed the default XDP attach mode on `wwan0`, and that is why
 `xdp-loader load wwan0` broke.**
 
 ```
 net/core/dev.c:9457:  return dev->netdev_ops->ndo_bpf ? XDP_MODE_DRV : XDP_MODE_SKB;
 ```
 
-Pristine `mhi_wwan_mbim.c` has **0** `ndo_bpf` references; 991 has **0**; 992
-adds **6**. So before 992, an attach with no mode flag went to `XDP_MODE_SKB`
-(full generic XDP, redirect and AF_XDP included). After 992 it goes to
+Pristine `mhi_wwan_mbim.c` has **0** `ndo_bpf` references; 890 has **0**; 891
+adds **6**. So before 891, an attach with no mode flag went to `XDP_MODE_SKB`
+(full generic XDP, redirect and AF_XDP included). After 891 it goes to
 `XDP_MODE_DRV` — the hand-rolled hook, which advertises `NETDEV_XDP_ACT_BASIC`
 and refuses `XDP_REDIRECT`. Verified at runtime (test C5 below).
 
 That is the whole story of the crash: `xdp-loader load wwan0` installed
-libxdp's `xsk_def_prog`, 992's `ndo_bpf` captured it into native mode, the
+libxdp's `xsk_def_prog`, 891's `ndo_bpf` captured it into native mode, the
 program called `bpf_redirect_map()` from the MHI tasklet, and there was no
 `bpf_net_context`. The `bpf_net_context` fix stopped the oops; the redirect
 itself was still refused at that point.
 
-**That last sentence describes the hand-rolled hook, not the shipped patch.** 992
+**That last sentence describes the hand-rolled hook, not the shipped patch.** 891
 as it stands routes through `do_xdp_generic()`, which dispatches `XDP_REDIRECT`
 and `XDP_TX` itself and sets up its own `bpf_net_context`, and the patch
 advertises `NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT`. So redirect and
@@ -157,7 +205,7 @@ net/core/gro_cells.c:23
 ```
 
 `xdpgeneric` sets `dev->xdp_prog`, so `gro_cells_receive()` bypasses GRO on
-**every datagram**. Attaching generic XDP to `wwan0` turns 991 off. That is the
+**every datagram**. Attaching generic XDP to `wwan0` turns 890 off. That is the
 measured −36.6% softirq CPU/MB, gone.
 
 ---
@@ -199,7 +247,7 @@ Three preconditions the driver must satisfy (all from reading
 1. `skb_reset_mac_header()` **before** the call. `mac_len = skb->data -
    skb_mac_header(skb)`; a fresh `netdev_alloc_skb()` leaves the `~0U` sentinel,
    and that arithmetic would walk off the front of the buffer. **Satisfied.**
-   This line read "992 currently resets it only *after* the XDP hook" until the
+   This line read "891 currently resets it only *after* the XDP hook" until the
    2026-09-09 rework moved it; corrected 2026-09-15, having gone stale in place
    for six days.
 2. `skb->protocol` set before the call — `generic_xdp_tx()` and
@@ -217,7 +265,7 @@ receive metadata it derived by reading the first fourteen bytes as an Ethernet
 header -- which on a raw-IP link they are not. `skb->mac_header` may have moved
 (`bpf_xdp_adjust_head()` shifts it at `dev.c:5107`), and `skb->pkt_type` may no
 longer be `PACKET_HOST`, which costs every forwarded datagram at
-`ip_forward.c:93`. 992 now re-anchors both headers and forces `PACKET_HOST`
+`ip_forward.c:93`. 891 now re-anchors both headers and forces `PACKET_HOST`
 before returning. Section 23.28 has the mechanism and the trigger set. Listing
 only preconditions here was itself the mistake: I read the core's requirements
 of the driver and not the driver's requirements of the core.
@@ -250,7 +298,7 @@ Two things the implementation has to get right that aren't obvious:
 
 - The `bpf_net_context` must stay **alive across** `xdp_do_generic_redirect()` —
   `ri->map_type`, `ri->tgt_index` and `ri->tgt_value` live in it. Clearing it
-  right after `bpf_prog_run_xdp()`, which is what 992 does today, throws the
+  right after `bpf_prog_run_xdp()`, which is what 891 does today, throws the
   verdict away.
 - `xdp_do_flush()` must be called before clearing the context. This is not inside
   `net_rx_action()`, so nothing else will drain the devmap/cpumap/xsk bulk queues
@@ -354,7 +402,7 @@ it bypasses everything *after* 5538, including the bridge `rx_handler`.
 | DSA user ports | no — `net/dsa/user.c`: 0 `ndo_bpf` | yes | yes | no |
 | `br-lan` | no — `net/bridge/br_device.c`: 0 `ndo_bpf` | yes | yes | no |
 | wireless LAN (mac80211/mt76) | no — `net/mac80211/iface.c`: 0 `ndo_bpf` | yes | yes | no |
-| wireless WAN (`wwan0`) | 992's hook, `BASIC` only | yes (full set) | yes (raw-IP-aware) | no |
+| wireless WAN (`wwan0`) | 891's hook, `BASIC` only | yes (full set) | yes (raw-IP-aware) | no |
 
 **Hardware BPF/XDP offload does not exist on this box.** Whole-tree grep:
 `NETDEV_XDP_ACT_HW_OFFLOAD` is set in exactly two files — `netdevsim/netdev.c:639`
@@ -415,12 +463,12 @@ Caveat: it only helps where XDP runs *natively* — i.e. the wired ports. On
 
 ## 7. Recommendation
 
-Switch 992's hook to **Method A**. It is one function replaced (`exp-a` is
+Switch 891's hook to **Method A**. It is one function replaced (`exp-a` is
 written and compiles clean), no kernel patch, and it:
 
 - restores `XDP_REDIRECT`, `XDP_TX`, AF_XDP and cpumap on `wwan0`;
 - makes `xdp-loader load wwan0` work again instead of exception-counting;
-- keeps 991's gro_cells alive, unlike `xdpgeneric`;
+- keeps 890's gro_cells alive, unlike `xdpgeneric`;
 - deletes ~60 lines of hand-rolled action handling that the core already does,
   including the `bpf_net_context` dance (it establishes its own).
 
@@ -490,7 +538,7 @@ roughly 3.5 KB) - not a practical limit at 1500.
     if (!(dev->xdp_features & NETDEV_XDP_ACT_NDO_XMIT))
             return -EOPNOTSUPP;
 
-992 advertises `NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT`, so a program on
+891 advertises `NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT`, so a program on
 `wwan0` can redirect *out*, but nothing can redirect *into* `wwan0`. The wired
 ports advertise `NDO_XMIT` and `NDO_XMIT_SG` as well, so `eth1 -> eth0` XDP
 forwarding works today and `eth1 -> wwan0` returns `-EOPNOTSUPP`. Closing that
@@ -521,7 +569,7 @@ would mean adding `ndo_xdp_xmit` to `mhi_wwan_mbim` - see section 13.
 | `eth1` (LAN) | same program as `eth0` | yes | yes | same | yes |
 | `br-lan` | no `ndo_bpf` | yes | yes | inherited | no |
 | wireless (mt76/mac80211) | no `ndo_bpf` in `net/mac80211/iface.c` | yes | yes | `napi_gro_receive` (mt76 `mac80211.c:1550` -> `ieee80211_rx_napi` -> backports `rx.c:5497`) | no |
-| `wwan0` | 992, `BASIC\|REDIRECT` | yes | yes (raw-IP aware) | 991 gro_cells | **no** |
+| `wwan0` | 891, `BASIC\|REDIRECT` | yes | yes (raw-IP aware) | 890 gro_cells | **no** |
 
 Hardware BPF offload still does not exist anywhere on this box; that part of
 section 5 is unchanged.
@@ -595,7 +643,7 @@ That egress gate was the original reason given here, and it is the weaker one.
 Checked again on 2026-09-10, a `wwan0` flow never reaches MediaTek code at all:
 
 - `mhi_wwan_mbim`'s `net_device_ops` has exactly four entries - `ndo_open`,
-  `ndo_stop`, `ndo_start_xmit`, `ndo_get_stats64` - plus `ndo_bpf` from 992.
+  `ndo_stop`, `ndo_start_xmit`, `ndo_get_stats64` - plus `ndo_bpf` from 891.
   **No `ndo_setup_tc`.** So `nf_flow_table_offload_setup()` takes its `else`
   branch into `nf_flow_table_indr_offload_cmd()`, which calls
   `flow_indr_dev_setup_offload(dev, NULL, TC_SETUP_FT, ...)`.
@@ -690,7 +738,7 @@ guard at `fw4.uc:2071` skips it, and the device never enters the list. Setting
 `option device` on the zone does not help either - `fw4.uc:2078` pushes that
 into `match_devices`, which the flowtable never reads.
 
-`package/network/config/firewall4/patches/001-flowtable-fall-back-to-l3-device.patch`
+`package/network/config/firewall4/patches/900-flowtable-fall-back-to-l3-device.patch`
 changes `physdev` to `ifc.device ?? ifc.l3_device`. It only ever adds devices
 that previously resolved to nothing: where `device` exists it still wins, so
 PPPoE and VLAN setups keep resolving to their lower device unchanged. `physdev`
@@ -776,7 +824,7 @@ Small claims that were resting on inference, now checked directly.
   and the PPE check. There is no other delivery call in the driver.
 - **BBRv3 is the boot default.** `kmod-tcp-bbr` installs
   `package/kernel/linux/files/sysctl-tcp-bbr.conf` as `/etc/sysctl.d/12-tcp-bbr.conf`,
-  containing `net.ipv4.tcp_congestion_control=bbr`, and 990 makes the module
+  containing `net.ipv4.tcp_congestion_control=bbr`, and 870 makes the module
   registered under that name BBRv3 (`#define BBR_VERSION 3`,
   `MODULE_VERSION(__stringify(BBR_VERSION))`, 1719 added lines in `tcp_bbr.c`).
 - **The SoC wifi is an mt7915e device.** `mt798x_wmac_of_match` in mt76's
@@ -862,7 +910,7 @@ handled entirely in software.
 
 If PPE offload ever matters on this box - a wired WAN, or heavy LAN-to-LAN -
 these are the two registers worth turning into module parameters or DT
-properties, in the same shape as 993: default to the current values, patch only
+properties, in the same shape as 880: default to the current values, patch only
 `mtk_ppe_init()`, and leave behaviour unchanged unless the parameter is set.
 That is a small, self-contained patch. It is not worth writing while the 5G
 modem is the only WAN, because nothing binds.
@@ -892,14 +940,14 @@ Verified end to end at 6.12.103:
 - `xdp_do_generic_redirect_map()` (`filter.c:4570`) handles
   `BPF_MAP_TYPE_CPUMAP` via `cpu_map_generic_redirect()`.
 - `cpumap.o` is built by `CONFIG_BPF_SYSCALL`, always on here.
-- 992 routes through `do_xdp_generic()` and advertises
+- 891 routes through `do_xdp_generic()` and advertises
   `NETDEV_XDP_ACT_REDIRECT`.
 
 So an XDP program on `wwan0` can redirect into a CPUMAP pinned to CPU1 today,
 with the image as built. The catch is the delivery on the far side:
 `cpumap.c:364` is `netif_receive_skb_list(&list)` - **no GRO**. Redirecting to a
-cpumap therefore bypasses 991's `gro_cells` entirely and hands the stack
-un-aggregated packets on the other core. That is a trade, not a win, and 991
+cpumap therefore bypasses 890's `gro_cells` entirely and hands the stack
+un-aggregated packets on the other core. That is a trade, not a win, and 890
 exists because the aggregation was worth having.
 
 The native wired path has the same capability (`__xdp_do_redirect_frame` ->
@@ -911,8 +959,8 @@ The native wired path has the same capability (`__xdp_do_redirect_frame` ->
 `target/linux/mediatek/filogic/config-6.12`. The modem receive path is:
 
     MHI IRQ (CPU0) -> mhi_ev_task -> mhi_mbim_rx
-      -> 992's do_xdp_generic hook, if a program is attached
-      -> 991's gro_cells_receive, which queues on this_cpu (gro_cells.c:28)
+      -> 891's do_xdp_generic hook, if a program is attached
+      -> 890's gro_cells_receive, which queues on this_cpu (gro_cells.c:28)
       -> gro_cell_poll -> napi_gro_receive
       -> gro_normal_one -> netif_receive_skb_list_internal()
       -> __netif_receive_skb_core
@@ -927,7 +975,7 @@ post-GRO list:
 
 So RPS runs **after** GRO has already aggregated, and moves the aggregated
 super-packets to another core. That is strictly the better shape than cpumap
-here: it keeps 991, needs no BPF program, and is a single sysfs write.
+here: it keeps 890, needs no BPF program, and is a single sysfs write.
 
     echo 2 > /sys/class/net/wwan0/queues/rx-0/rps_cpus   # 0x2 = CPU1
 
@@ -1290,44 +1338,44 @@ only helpers that read `rxq->dev` are affected.
 
 ### 16.3 On wwan0 the helpers work and the pre-skb win does not exist
 
-The modem path is the mirror image. 992 runs the program through
+The modem path is the mirror image. 891 runs the program through
 `do_xdp_generic()`, and `bpf_prog_run_generic_xdp()` takes its rxq from
 `netif_get_rxqueue(skb)` (`dev.c:5079-5080`) - the real device. So on `wwan0`,
 `ctx->ingress_ifindex`, `bpf_fib_lookup()` and `bpf_xdp_flow_lookup()` all
 behave correctly, and since section 10.3 put `wwan0` in the flowtable, the
 lookup can actually hit.
 
-The price is exactly the thing the pre-allocation argument is about: 992 reaches
+The price is exactly the thing the pre-allocation argument is about: 891 reaches
 XDP only after `netdev_alloc_skb()` and `skb_copy_bits()` have already run,
 because MBIM aggregation packs many datagrams into one 32 KB DMA buffer and each
-has to be copied out before it can be inspected. The 992 patch header has always
+has to be copied out before it can be inspected. The 891 patch header has always
 said this. There is no pre-allocation saving available on the modem path, and
 creating one would mean rebuilding the MBIM RX path around a page pool, not
 adding a hook.
 
 **Half of that last sentence was wrong, and 24.17 corrects it.** Removing the
 *copy* does need a page-pool rewrite, and that part stands. But reaching *native
-XDP* does not: the copy already lands in a privately-owned buffer, and 992
+XDP* does not: the copy already lands in a privately-owned buffer, and 891
 already put 256 bytes of headroom in front of it, so the only thing missing was
 allocating a bare frag instead of an skb and deferring `build_skb()` past the
-verdict. That is 999.
+verdict. That is 893.
 
 Also confirmed: `do_xdp_generic()` implements `XDP_REDIRECT` itself via
 `xdp_do_generic_redirect((*pskb)->dev, ...)` and `XDP_TX` via
 `generic_xdp_tx()`, returning `XDP_DROP` to signal the skb was consumed
-(`dev.c:5262`). 992's `if (do_xdp_generic(...) != XDP_PASS) return false;` is
+(`dev.c:5262`). 891's `if (do_xdp_generic(...) != XDP_PASS) return false;` is
 correct - redirect is fully wired, with the real device.
 
 ### 16.4 The two halves sit on opposite ends of the box
 
-|                                    | eth0 / eth1 (native) | wwan0 (992)   | br-lan, AP netdevs |
+|                                    | eth0 / eth1 (native) | wwan0 (891)   | br-lan, AP netdevs |
 |------------------------------------|----------------------|---------------|--------------------|
 | Hook runs before `sk_buff` alloc   | yes                  | no            | no                 |
 | `ctx->ingress_ifindex` usable      | no - dummy dev, 0    | yes           | yes                |
 | `bpf_xdp_flow_lookup()` usable     | no - dummy dev       | yes           | not in flowtable   |
 | `bpf_fib_lookup()` usable          | no                   | yes           | yes                |
 | Valid `bpf_redirect()` target      | yes (`NDO_XMIT`)     | no (#101)     | yes, generic only  |
-| `ndo_bpf` in driver                | yes                  | yes (992)     | no                 |
+| `ndo_bpf` in driver                | yes                  | yes (891)     | no                 |
 
 Neither `mac80211` nor the bridge implements `ndo_bpf` - no `ndo_bpf` and no
 `xdp_set_features_flag` anywhere in `iface.c`, `main.c` or `br_device.c` - so
@@ -1459,11 +1507,11 @@ And it is not free to attach. `generic_xdp_install()` does
 
 which `dev_gro_receive()` tests on every packet (`gro.c:488`, function at 477).
 `gro_cells_receive()` tests the same predicate at `gro_cells.c:23` and falls back
-to bare `netif_rx()` when it fires - which is exactly why 992 keeps its program
+to bare `netif_rx()` when it fires - which is exactly why 891 keeps its program
 on `link->xdp_prog`, and what the 2.12x measurement in 20.3 confirms.
 So attaching any generic XDP program to `phy0-ap0` or `phy1-ap0` **turns GRO off
-for that interface**. This is the same trap 992 was written to avoid on the
-modem - it is exactly why 992 keeps the program on `link->xdp_prog` instead of
+for that interface**. This is the same trap 891 was written to avoid on the
+modem - it is exactly why 891 keeps the program on `link->xdp_prog` instead of
 `dev->xdp_prog` - and on a wifi netdev there is no equivalent dodge available,
 because there is no driver hook to own the pointer.
 
@@ -1501,7 +1549,7 @@ call.
 The ingress side is the same story. In `__netif_receive_skb_core()` the generic
 XDP hook is at `dev.c:5612`, and `sch_handle_ingress()` - which is where an SQM
 ingress redirect to an IFB lives - is at `dev.c:5655`, **43 lines later**. A
-redirect from XDP never reaches it. For 992 the gap is bigger still, since that
+redirect from XDP never reaches it. For 891 the gap is bigger still, since that
 hook is inside `mhi_mbim_rx()` and runs before the packet is handed to the stack
 at all.
 
@@ -1547,7 +1595,7 @@ wired-WAN-to-wifi, on a port this box does not use as its WAN.
 
 Enabling it is cheap - `wed_enable` is a module parameter on `mt7915e`
 (`mt7915_mmio.c:16-18`, mode 0644, gate at line 640), so it goes in
-`/etc/modules.d/` the same way 993's doorbell parameter does, and the AXI/SoC
+`/etc/modules.d/` the same way 880's doorbell parameter does, and the AXI/SoC
 branch of `mt7915_mmio_wed_init()` is fully populated for the built-in WMAC.
 
 But not on the pinned mt76, and this is why #111 blocks #99. The pin has:
@@ -1572,7 +1620,7 @@ between the two trees; the fix is entirely in `wed.c`.
 | Attach point | Native XDP | Runs pre-skb | Flow lookup | Cost to attach | Verdict |
 |---|---|---|---|---|---|
 | `eth0`/`eth1` | yes | yes | no - dummy dev | link bounce, both ports | static filter only - see 18 |
-| `wwan0` | yes (992) | no - MBIM copy | yes | none | shape A, but see 17.2 |
+| `wwan0` | yes (891) | no - MBIM copy | yes | none | shape A, but see 17.2 |
 | AP netdevs | no | no | n/a | **GRO and LRO off** | not worth it |
 | `br-lan` | no | no | n/a | GRO and LRO off | not worth it |
 
@@ -1911,7 +1959,7 @@ block rather than from one statement.
 Everything else previously listed here is now resolved above, including the
 entire `net/mac80211/` chain against backports 6.18.39.
 
-## 20. Hardware audit of 990-993 and the BPF platform, 2026-09-11
+## 20. Hardware audit of the patch series and the BPF platform, 2026-09-11
 
 Prompted by a reasonable worry that the kernel patches might be wrong. They are
 not. Every item below is **measured on the running box** or read from the
@@ -1924,15 +1972,15 @@ Signature strings that exist only if the patch landed, grepped in
 
 | patch | signature | hits |
 |---|---|---|
-| 990 | `MODULE_VERSION(__stringify(BBR_VERSION))` in `net/ipv4/tcp_bbr.c` | 1 |
-| 990 | `bbr_version` in `include/uapi/linux/inet_diag.h` | 1 |
-| 991 | `select GRO_CELLS` in `drivers/net/wwan/Kconfig` | 1 |
-| 991 | `gro_cells_receive(&link->gcells` in `mhi_wwan_mbim.c` | 1 |
-| 992 | `mhi_mbim_ndo_bpf` | 2 (definition + `.ndo_bpf =`) |
-| 992 | `xdp_set_features_flag` | 1 |
-| 993 | `force_db_brst_disable` in `drivers/bus/mhi/host/init.c` | 4 |
+| 870 | `MODULE_VERSION(__stringify(BBR_VERSION))` in `net/ipv4/tcp_bbr.c` | 1 |
+| 870 | `bbr_version` in `include/uapi/linux/inet_diag.h` | 1 |
+| 890 | `select GRO_CELLS` in `drivers/net/wwan/Kconfig` | 1 |
+| 890 | `gro_cells_receive(&link->gcells` in `mhi_wwan_mbim.c` | 1 |
+| 891 | `mhi_mbim_ndo_bpf` | 2 (definition + `.ndo_bpf =`) |
+| 891 | `xdp_set_features_flag` | 1 |
+| 880 | `force_db_brst_disable` in `drivers/bus/mhi/host/init.c` | 4 |
 
-### 20.2 990 is BBRv3, proven from the module's own BTF
+### 20.2 870 is BBRv3, proven from the module's own BTF
 
 `modinfo tcp_bbr` shows no `version:` field, which looked like a failure and is
 not: `CONFIG_MODULE_STRIPPED=y` and `# CONFIG_MODULE_SRCVERSION_ALL is not set`,
@@ -1958,7 +2006,7 @@ Selected and active: `net.ipv4.tcp_congestion_control = bbr`, available list
 `reno cubic bbr`, pinned by `/etc/sysctl.d/12-tcp-bbr.conf`. Module is 20,712
 bytes, about half again what v1 measures on this architecture.
 
-### 20.3 991 and 992 verified end to end by the repo's own verifier
+### 20.3 890 and 891 verified end to end by the repo's own verifier
 
 `x3000/docs/verify-xdp.sh --traffic`: **PASS=25, FAIL=0, skipped=3.** The skips
 are the optional `--with-drop` and `--with-tc` paths, plus "this iproute2 does
@@ -1969,19 +2017,19 @@ not print xdp-features", which is a tooling limitation and explains why
 |---|---|
 | `bpf_xdp_flow_lookup` kfunc present | yes - BTF gates it and it compiled |
 | GRO baseline, no program attached | **2.09x** aggregation on `wwan0` |
-| attach `xdp_pass` in DRV mode | succeeded, `prog/xdp id 288` - 992's `ndo_bpf` took it |
+| attach `xdp_pass` in DRV mode | succeeded, `prog/xdp id 288` - 891's `ndo_bpf` took it |
 | **GRO survives the attach** | **2.12x vs 2.09x baseline** |
 | `rx_errors` while attached | steady at 0 |
 | detach | clean |
 | AF_XDP oops path | no `dmesg-ramoops-*` in `/sys/fs/pstore/` |
 
-The GRO-survives-attach result is the one worth keeping. 992 deliberately stores
+The GRO-survives-attach result is the one worth keeping. 891 deliberately stores
 the program on `link->xdp_prog` rather than `dev->xdp_prog` so that
 `netif_elide_gro()` never sees it - 16.1 and 18.4 explain the mechanism, and this
 measures the outcome. Had it been stored on `dev->xdp_prog`, aggregation would
 have collapsed to 1.0x on attach.
 
-### 20.4 993 is live and firing
+### 20.4 880 is live and firing
 
 `/sys/module/mhi/parameters/force_db_brst_disable` exists and reads `Y`, and the
 kernel log shows it taking effect on both MBIM channels:
@@ -2016,7 +2064,7 @@ Both working trees clean, both tracking
 
 - The zero-byte BPF objects were busybox lacking `base64`, not a paste failure
   (18.1, now fixed).
-- `/sys/class/net/wwan0/threaded` reads 0. 991 gives `wwan0` real NAPI instances
+- `/sys/class/net/wwan0/threaded` reads 0. 890 gives `wwan0` real NAPI instances
   through gro_cells, which is what makes the `threaded` control meaningful at all
   - it does not turn threading on. Measured: `napi/mtk_eth-5`, `napi/mtk_eth-6`
   and six `napi/phy0-*` threads exist; there is no `napi/wwan0-*`.
@@ -2050,7 +2098,7 @@ explicitly disables the other. Evidence column points at the section or the
 | native XDP | HWLRO | **mutually exclusive**, driver-enforced | `mtk_xdp_setup()` returns `-EOPNOTSUPP` "XDP not supported with HWLRO". A successful `xdp-filter load -m native eth1` therefore proves HWLRO is off here (18.4) |
 | GRO and LRO | generic / skb XDP, any device | **incompatible**, silently | `generic_xdp_install()` (`dev.c:5949-5976`) stores on `dev->xdp_prog` and calls `dev_disable_lro()`; `netif_elide_gro()` (`netdevice.h:2433`) is true for any `dev->xdp_prog`; `dev_gro_receive()` tests it at `gro.c:488` (17.1) |
 | `gro_cells` | `dev->xdp_prog` | **incompatible. Measured.** | `gro_cells_receive()` tests the same predicate at `gro_cells.c:23` and drops to bare `netif_rx()`. measured twice - **1.00x skb against 24.8x detached** (2026-09-09, recorded in `lean-overlay.md`) and 1.06x against 2.20x at a lower link rate (2026-09-11). Correct-but-silent, and not fixable in the core: see 22 |
-| `gro_cells` | 992's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-xdp section 6 |
+| `gro_cells` | 891's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-xdp section 6 |
 | BTF | BPF CO-RE tooling | **required, present** | `DEBUG_INFO_BTF=y`, `_MODULES=y`; `/sys/kernel/btf/vmlinux` 3846 KB; per-module BTF present (20.5) |
 | BTF | `bpf_xdp_flow_lookup` kfunc | **required** | `net/netfilter/Makefile:147-151` gates `nf_flow_table_bpf.o` on `DEBUG_INFO_BTF_MODULES` / `DEBUG_INFO_BTF`. Without this repo's BTF platform the kfunc does not exist at all |
 | flowtable kfunc | native XDP on `eth0`/`eth1` | **incompatible, structurally** | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, ...)` then `nf_flowtable_by_dev()`, keyed on the `net_device *` **pointer** (`nf_flow_table_xdp.c:27-33`). The rxq carries `eth->dummy_dev` (`mtk_eth_soc.c:2115`), never inserted in any flowtable. Permanent `-ENOENT`; a correct `fib_tuple->ifindex` does not help, because the *table* is selected by the pointer (16.2, 18.7) |
@@ -2058,12 +2106,12 @@ explicitly disables the other. Evidence column points at the section or the
 | software flow offload | any per-packet netfilter rule on the same traffic | **mutually exclusive** | an offloaded flow is intercepted at the ingress hook and stops reaching prerouting and forward, so a per-packet rule sees the opening packets of each connection and then nothing. Observed 2026-09-12 with the flowtable on `br-lan`, `eth0` and `wwan0` and 10 of 34 conntrack entries in `OFFLOAD`. This is what rules out NFQUEUE-style inspection while offload is on; MSS clamping is unaffected because it acts at SYN |
 | software flow offload | GRO, and the driver RX path generally | **compatible** | offload shortcuts conntrack and the netfilter chains, not the driver or `gro_cells`. So it changes nothing measured here: every throughput and aggregation run terminated on the router through INPUT, which is never offloaded |
 | NFQUEUE | GRO on `wwan0` | **works, but not per datagram** | netfilter hooks run after GRO, so a queue rule hands userspace the coalesced skb - 12,524 to 16,509 bytes measured (18, 21.3). One verdict covers the whole aggregate, and a consumer with a 1500-byte copy range truncates. `ethtool -K wwan0 gro off` is the escape hatch |
-| NFQUEUE | XDP | **XDP wins** | XDP runs ahead of netfilter entirely, and on `wwan0` 992's hook is in the driver, so anything `XDP_DROP`ped never reaches a queue |
+| NFQUEUE | XDP | **XDP wins** | XDP runs ahead of netfilter entirely, and on `wwan0` 891's hook is in the driver, so anything `XDP_DROP`ped never reaches a queue |
 | PPE hardware NAT | `wwan0` | **impossible** | egress PSE port resolved only from `eth->netdev[0..2]`: `mtk_flow_get_dsa_port` 170, `PSE_GDM1_PORT` 225, `PSE_GDM2_PORT` 227 (10.1) |
 | `XDP_REDIRECT` | cake / SQM | **incompatible** | both paths end in `generic_xdp_tx()` then `netdev_start_xmit()` with no qdisc: `filter.c:4655` for `bpf_redirect()`, `devmap.c:721` for `bpf_redirect_map()` (17.2) |
-| **992's `XDP_TX`** | **cake / SQM** | **incompatible** - see 21.3 | `do_xdp_generic()` dispatches `case XDP_TX` to `generic_xdp_tx()` at `dev.c:5287`, which is the same qdisc-bypassing path |
+| **891's `XDP_TX`** | **cake / SQM** | **incompatible** - see 21.3 | `do_xdp_generic()` dispatches `case XDP_TX` to `generic_xdp_tx()` at `dev.c:5287`, which is the same qdisc-bypassing path |
 | XDP | tc ingress | **XDP wins** | `do_xdp_generic` at `dev.c:5621`, `sch_handle_ingress` at 5661 - so a redirect escapes tc ingress shaping too (17.2) |
-| AF_XDP | 992 | **compatible, deliberately** | libxdp's `xsk_def_prog` emits only `bpf_redirect_map()`, so refusing `XDP_REDIRECT` would refuse AF_XDP. Routing through `do_xdp_generic()` provides it. verify-xdp section 11: no pstore crash records |
+| AF_XDP | 891 | **compatible, deliberately** | libxdp's `xsk_def_prog` emits only `bpf_redirect_map()`, so refusing `XDP_REDIRECT` would refuse AF_XDP. Routing through `do_xdp_generic()` provides it. verify-xdp section 11: no pstore crash records |
 | AF_XDP | cake / SQM | **incompatible** | it is a redirect, so the row above applies |
 | wireless (mt76 + mac80211) | XDP of any kind | **generic only** | no mac80211 source file mentions `xdp` in backports 6.18.39, and none of its three `net_device_ops` tables has `ndo_bpf`; `grep -c xdp` is 0 for mt76's `dma.c`, `mt76.h`, `mac80211.c`. So attaching costs GRO and LRO by the row above, for a hook that runs after decrypt, defrag and A-MSDU split (17.1) |
 | WED | flows crossing `wwan0` | **unreachable** | WED's forwarding half cannot carry a flow that crosses the modem (17.3) |
@@ -2088,7 +2136,7 @@ Each of these is a claim the build currently rests on without evidence.
 
 **`XDP_TX` bypasses the shaper, not just `XDP_REDIRECT`.** Section 17.2 established
 that both redirect paths end in `generic_xdp_tx()`. The same is true of `XDP_TX`:
-992 routes every verdict through `do_xdp_generic()`, whose `case XDP_TX` calls
+891 routes every verdict through `do_xdp_generic()`, whose `case XDP_TX` calls
 `generic_xdp_tx()` at `dev.c:5287`, which goes to `netdev_start_xmit()` under
 `HARD_TX_LOCK` with no qdisc (`dev.c:5242-5263`).
 
@@ -2097,7 +2145,7 @@ So the rule, and it is the most useful line in this section: **only `XDP_PASS` a
 leaves cake behind, on `wwan0` and on the wired ports alike.
 
 **The skb-mode collapse was measured twice, a day apart, and the earlier figure is
-the stronger one.** `lean-overlay.md`'s 992 row has recorded since 2026-09-09 that
+the stronger one.** `lean-overlay.md`'s 891 row has recorded since 2026-09-09 that
 attaching the same program with `xdpgeneric` measures **1.00x aggregation against
 24.8x detached**. The 2026-09-11 run reproduced it at a lower link rate: 1.06x
 against 2.20x. Both are the same phenomenon; quote whichever matches the rate
@@ -2129,8 +2177,8 @@ line up the way rate-scaling predicts: 2.20x at the low 2026-09-11 rate, 8.11x a
 The same run reproduced the skb-mode collapse a third time - 1.00x attached in skb
 mode against an 8.11x baseline, recovering to 6.75x on detach - and the driver-mode
 attach held GRO at 7.37x, with `rx_errors` steady at 0 across both. 27 checks
-passed, none failed. Worth recording for what it verifies beyond 992: this was the
-first run against the quilt-regenerated 990/991/992/993/995, so it is also the
+passed, none failed. Worth recording for what it verifies beyond 891: this was the
+first run against the quilt-regenerated 870/890/891/880/892, so it is also the
 hardware evidence that regenerating those patches changed nothing observable.
 
 One caveat on all three figures: the load generator defaults to
@@ -2142,8 +2190,8 @@ harness at a faster source.
 ### 21.4 Design rules that fall out
 
 1. **Never attach in skb mode on this box.** It costs GRO and LRO everywhere, and
-   on `wwan0` it costs the whole point of 991. Use native mode, which on the wired
-   ports is genuinely pre-skb and on `wwan0` is 992's hook.
+   on `wwan0` it costs the whole point of 890. Use native mode, which on the wired
+   ports is genuinely pre-skb and on `wwan0` is 891's hook.
 2. **A drop is the only verdict that is free.** `XDP_PASS` keeps everything;
    `XDP_DROP` additionally skips the skb, the stack and RPS. `XDP_TX` and
    `XDP_REDIRECT` both cost the shaper.
@@ -2162,11 +2210,11 @@ harness at a faster source.
 
 21.1 records that `gro_cells` and `dev->xdp_prog` are incompatible, measured. The
 open question was whether that is fixable in the core - because if it were, the
-driver-side XDP code in 992 could be deleted and every `gro_cells` driver would
+driver-side XDP code in 891 could be deleted and every `gro_cells` driver would
 get a GRO-preserving XDP hook for free. That was the most valuable thing this work
 had found, so it needed an answer from the tree rather than from reasoning.
 
-Answered 2026-09-12. **It is not fixable in the core, and 992's existing design is
+Answered 2026-09-12. **It is not fixable in the core, and 891's existing design is
 the correct one.** Method: a pristine `v6.12.103` checkout, plus a diff of every
 patch in this tree against it to establish the offsets in the header table above.
 Line numbers below are pristine; add 5 for `net/core/dev.c` to get this build.
@@ -2226,7 +2274,7 @@ purpose, and is exported for it:
     dev.c:5296   EXPORT_SYMBOL_GPL(do_xdp_generic);
 
 `drivers/net/tun.c` does this, verified rather than assumed - this closes the
-"verify the tun.c precedent" item that 992's commit message was resting on:
+"verify the tun.c precedent" item that 891's commit message was resting on:
 
     tun.c:210    struct bpf_prog __rcu *xdp_prog;          in struct tun_struct
     tun.c:1200   rcu_assign_pointer(tun->xdp_prog, prog);  from ndo_bpf
@@ -2234,7 +2282,7 @@ purpose, and is exported for it:
     tun.c:1929   ret = do_xdp_generic(xdp_prog, &skb);
     tun.c:2529   ret = do_xdp_generic(xdp_prog, &skb);
 
-`tun` never assigns `dev->xdp_prog` anywhere in the file. So 992's driver-side code
+`tun` never assigns `dev->xdp_prog` anywhere in the file. So 891's driver-side code
 is not a workaround for a missing core feature - **it is the mechanism**, and the
 only shape that keeps both halves of the contract. Nothing in it should be deleted
 or simplified.
@@ -2242,7 +2290,7 @@ or simplified.
 ### 22.4 Scale: eight drivers, none of them with XDP
 
 `gro_cells_receive()` callers in 6.12.103: `vxlan_core.c`, `geneve.c`,
-`bareudp.c`, `macsec.c`, `amt.c`, `pfcp.c`, `rmnet_handlers.c`, and with 991,
+`bareudp.c`, `macsec.c`, `amt.c`, `pfcp.c`, `rmnet_handlers.c`, and with 890,
 `mhi_wwan_mbim.c`. **None of the first seven implements `ndo_bpf`, and `grep -ci
 xdp` returns 0 for every one of them.** So this build is the first `gro_cells`
 driver anywhere with an XDP hook, which is why the interaction has gone unnoticed,
@@ -2250,12 +2298,12 @@ and why there is no driver to copy for this specific pairing. `tun` supplies the
 call-pattern precedent but does not use `gro_cells` (`grep -c gro_cells
 drivers/net/tun.c` is 0).
 
-### 22.5 Two candidate enhancements to 992 that the tree disproved
+### 22.5 Two candidate enhancements to 891 that the tree disproved
 
 Both of these looked like real defects and both were checked before being
 claimed. Recording them so they are not "found" again.
 
-**A missing `xdp_do_flush()`.** 992 advertises `XDP_REDIRECT` and never calls
+**A missing `xdp_do_flush()`.** 891 advertises `XDP_REDIRECT` and never calls
 `xdp_do_flush()`, which on a NAPI driver would leave redirected frames sitting in
 a per-CPU bulk queue. Not so here: every *generic* redirect target completes its
 work inline. devmap's `dev_map_generic_redirect()` ends in `generic_xdp_tx()`
@@ -2266,17 +2314,17 @@ calls `xsk_flush()` itself; cpumap's `cpu_map_generic_redirect()` does
 `CONFIG_DEBUG_NET` - cannot fire for this hook. The bulk queues belong to the
 *native* redirect helpers, which this path never uses.
 
-**A missing `rcu_read_lock()`.** 992 does `rcu_dereference(link->xdp_prog)` with no
+**A missing `rcu_read_lock()`.** 891 does `rcu_dereference(link->xdp_prog)` with no
 visible lock. The lock is already held, by upstream code, across the whole
 datagram loop:
 
     mhi_wwan_mbim.c:296   rcu_read_lock();
     mhi_wwan_mbim.c:298   link = mhi_mbim_get_link_rcu(mbim, session);
     mhi_wwan_mbim.c:306   for (n = 0; n < nframes; n++, ...)
-    mhi_wwan_mbim.c:348       netif_rx(skbn);          <- the call 991 replaces
+    mhi_wwan_mbim.c:348       netif_rx(skbn);          <- the call 890 replaces
     mhi_wwan_mbim.c:351   rcu_read_unlock();
 
-992's pointer read and its `do_xdp_generic()` call both sit inside that region.
+891's pointer read and its `do_xdp_generic()` call both sit inside that region.
 Adding a second `rcu_read_lock()` would be noise, and claiming the patch needed one
 would have been wrong.
 
@@ -2302,17 +2350,19 @@ skb mode here.
 
 * **No core-fix patch, and the number 994 is retired.** The fix that was going to
   be the project's one genuinely new patch does not exist. The honest output of
-  the investigation is that 992 was already right, for reasons its commit message
-  stated correctly and could not cite. The slot reserved for it is deliberately
-  left empty so that "994" keeps meaning only this, and an unrelated patch
-  written later that day took 995 rather than reusing it.
-* **992 is not to be simplified.** The plan to strip its driver-side XDP once a
+  the investigation is that 891 was already right, for reasons its commit message
+  stated correctly and could not cite. The slot reserved for it was left
+  deliberately empty under the sequential numbering in use at the time, so that
+  "994" kept meaning only this. The series was regrouped by subsystem on
+  2026-09-15 and no file carries that number now; the old-to-new mapping is at
+  the top of this document.
+* **891 is not to be simplified.** The plan to strip its driver-side XDP once a
   core hook existed is void.
 * **The tun.c precedent is verified**, in four parts, at the line numbers above.
 * **The series is the deliverable**, unchanged in shape:
-  `[PATCH net]` for the use-after-free fix currently bundled in 991, then
+  `[PATCH net]` for the use-after-free fix currently bundled in 890, then
   `[PATCH net-next 1/2]` gro_cells and `[PATCH net-next 2/2]` the XDP hook. See
-  `992-upstream-submission.md`, section 2 onward.
+  `mbim-upstream-plan.md`, section 2 onward.
 
 ## 23. Shape A built and run - open - 2026-09-14
 
@@ -2549,7 +2599,7 @@ mechanism fits and has not been checked:
 the **physical** LAN port - and `nft_dev_forward_path()` then discards the whole
 result unless `nft_flowtable_find_dev(info.indev, ft)` finds that device in the
 flowtable's own hook list (`:202`). This tree's firewall4 patch
-`001-flowtable-fall-back-to-l3-device` builds that list from **L3 devices**, so
+`900-flowtable-fall-back-to-l3-device` builds that list from **L3 devices**, so
 it holds `br-lan` and `wwan0`. If the physical ports are absent, the walk sets
 `XMIT_DIRECT` and the caller throws it away two lines later.
 
@@ -2590,7 +2640,7 @@ landed on is not one `nft_flowtable_find_dev()` can find.
 fw4 builds that list from **zone** devices: the wan zone gives `eth0` and
 `wwan0`, the lan zone gives `br-lan`. A bridge port is not a zone device, so it
 is never a candidate. That is the same gap
-`001-flowtable-fall-back-to-l3-device` already fixed from the other direction -
+`900-flowtable-fall-back-to-l3-device` already fixed from the other direction -
 and it means this tree's own patch, which added `wwan0` because it had only an
 `l3_device`, sits beside a case nobody looked for.
 
@@ -3491,7 +3541,7 @@ wrong tree until it is checked against backports.
   losing connectivity, so `probe` comes first and `off` stays to hand.
 - **The change does not persist.** All of it lives in the running ruleset and
   dies on `fw4 restart` or a reboot. Making it survive is W0039, a firewall4
-  patch of the same shape as `001-flowtable-fall-back-to-l3-device.patch`.
+  patch of the same shape as `900-flowtable-fall-back-to-l3-device.patch`.
 - **The payoff argument is unchanged, and still weak.** 14.3 and 18 say this box
   is not cycles-bound, the one poor number is latency, and a generic-mode
   redirect bypasses the qdisc (17.2). W0038 now optimises a resource the box has
@@ -3790,7 +3840,7 @@ write is a trigger rather than a state. That is as far as the evidence goes.
 threaded NAPI on a gro_cells device is unsafe by construction, so none of the
 steps below is worth a third reboot. They are kept because they describe what
 this section would have needed, and because step 2 is still worth doing for the
-993 stall on its own account.
+880 stall on its own account.
 
 Ordered by what each costs to run:
 
@@ -3820,7 +3870,7 @@ construction, so there is no correct number hiding behind these two failures.
   the throughput collapse it produced was the on-box `curl` starving the NAPI
   kthread of CPU. The same collapse happened twice with nothing competing on the
   box. A symptom attributed to contention may have been this all along.
-- **The link to the 993 downlink stall is now a question, not a claim.** I wrote
+- **The link to the 880 downlink stall is now a question, not a claim.** I wrote
   that a wedged gro_cells queue stops draining, the MHI ring fills, and the modem
   stalls - the `dl_qd=127` / `dl_free=0` signature. With the wedge withdrawn,
   what remains is that both failures look like a downlink that stops while the
@@ -3835,7 +3885,7 @@ anything. This section supersedes 23.20's "cause not established" on the
 question of whether to try again: the answer is no, and the reason does not
 depend on either failed run.
 
-#### First, the provenance: `wwan0` is a gro_cells device because 991 is mine
+#### First, the provenance: `wwan0` is a gro_cells device because 890 is mine
 
 Stock `mhi_wwan_mbim` is not a gro_cells driver and has no NAPI at all. At
 `v6.12.103` the entire receive delivery path is one call - `netif_rx()` at
@@ -3844,16 +3894,16 @@ of `napi` or `gro`. On a stock kernel `/sys/class/net/wwan0/threaded` is
 therefore **inert**: `dev_set_threaded()` walks an empty `dev->napi_list`,
 creates no kthreads, and sets a flag nothing reads.
 
-`991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` in this tree is what put per-CPU
+`890-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch` in this tree is what put per-CPU
 gro_cells NAPIs on that netdev, and it is my patch. Its own commit message named
 "a working `/sys/class/net/<dev>/threaded` toggle" as a side benefit of the
 switch. **That line was wrong** and has been removed: the toggle it enabled is
-the one behaviour change 991 makes that is not an improvement. 991 now carries
+the one behaviour change 890 makes that is not an improvement. 890 now carries
 the hazard in its message instead.
 
-So the ordering is: 991 moved `wwan0` into the gro_cells class, the class has an
-upstream defect, and W0002 walked into it. The defect is not 991's to fix, but
-it was 991's to disclose.
+So the ordering is: 890 moved `wwan0` into the gro_cells class, the class has an
+upstream defect, and W0002 walked into it. The defect is not 890's to fix, but
+it was 890's to disclose.
 
 The upstream users of `gro_cells` at `v6.12.103` are `amt`, `bareudp`,
 `geneve`, `macsec`, `pfcp`, `vxlan`, `ip_tunnel` and
@@ -3982,7 +4032,7 @@ consumed from CPU 1.
 
 The reading depends on datagrams being in the cells at all, which 23.22 first
 denied and then confirmed: `dev_xdp_mode()` (`dev.c:9444`) resolves to DRV
-whenever the driver owns `ndo_bpf`, 992 does, and a DRV-mode program leaves
+whenever the driver owns `ndo_bpf`, 891 does, and a DRV-mode program leaves
 `dev->xdp_prog` NULL. So GRO was live and the cells were in the path on the
 shipped image either way. The kthread placement is consistent with the race
 without establishing it - which is what it was worth all along.
@@ -4045,12 +4095,12 @@ is not a property worth another reboot of the house router.
   smaller and is what I would send first, because it cannot regress anything
   that works today.
 
-- **991 is amended, not withdrawn.** The GRO batching it buys is the thing it
+- **890 is amended, not withdrawn.** The GRO batching it buys is the thing it
   was written for and none of that is in question. What changed is that its
   commit message no longer advertises a toggle that is unsafe on the class it
   moves the netdev into, and now warns instead.
 
-- **The defect is not specific to this box, and not specific to 991.** Every
+- **The defect is not specific to this box, and not specific to 890.** Every
   upstream gro_cells user - `amt`, `bareudp`, `geneve`, `macsec`, `pfcp`,
   `vxlan`, `ip_tunnel`, `rmnet_vnd` - exposes a writable `threaded` in sysfs and
   has the same exposure on any non-RT kernel. `rmnet_vnd` matters most for the
@@ -4090,15 +4140,15 @@ XDP is held by the driver and does not set it.
 So on `wwan0` there are two ways for a datagram to miss the gro_cells path
 entirely, and the second one is invisible to `ethtool`.
 
-#### What that means for 991
+#### What that means for 890
 
-**A generic-mode XDP program on `wwan0` does not reduce GRO. It turns 991 off.**
-Every datagram goes to `netif_rx()`, which is the exact call 991 replaced. The
+**A generic-mode XDP program on `wwan0` does not reduce GRO. It turns 890 off.**
+Every datagram goes to `netif_rx()`, which is the exact call 890 replaced. The
 per-CPU cells sit allocated and empty, the NAPIs stay on `dev->napi_list`, and
-the WAN runs its pre-991 receive path while `ethtool -k wwan0` still reports
+the WAN runs its pre-890 receive path while `ethtool -k wwan0` still reports
 `generic-receive-offload: on`.
 
-The capability grid already carried this as "GSK01 costs GRO+991", so the
+The capability grid already carried this as "GSK01 costs GRO+890", so the
 interaction was known. What was missing is that nothing on this box ever checked
 which mode was live.
 
@@ -4129,7 +4179,7 @@ knows the ambiguity exists at the end and never resolves it at the start.
 The first revision of this section claimed the elision undermined 23.21's
 corroboration - that if a generic-mode program had been attached during the
 W0002 runs, no datagram reached a cell and the race could not have fired.
-**That was an over-correction, and 992 is why.**
+**That was an over-correction, and 891 is why.**
 
 `dev_xdp_mode()` at `net/core/dev.c:9444` is not a fallback. It is a capability
 check with no retry:
@@ -4141,21 +4191,21 @@ if (flags & XDP_FLAGS_SKB_MODE) return XDP_MODE_SKB;
 return dev->netdev_ops->ndo_bpf ? XDP_MODE_DRV : XDP_MODE_SKB;
 ```
 
-992 implements `ndo_bpf`, so on the shipped image a bare `ip link set dev wwan0
+891 implements `ndo_bpf`, so on the shipped image a bare `ip link set dev wwan0
 xdp ...` resolves to **DRV**, the program lands on `link->xdp_prog`, and
-`dev->xdp_prog` stays NULL. GRO is not elided. 992's own commit message says
+`dev->xdp_prog` stays NULL. GRO is not elided. 891's own commit message says
 this, cites `dev_xdp_mode()` by name, and gives it as the reason for owning
 `ndo_bpf` at all. I rediscovered a hazard that patch had already closed and then
 wrote it up as though it were open.
 
-So on the shipped build (`990/991/992/993/995`) there are two possibilities for
+So on the shipped build (`870/890/891/880/892`) there are two possibilities for
 the W0002 runs - no program attached, or a DRV-mode one - and `dev->xdp_prog` is
 NULL in both. The cells were in the path. **23.21's run-2 corroboration is
 restored**, at the strength it originally had: consistent with the race, not
 proof of it.
 
 What survives from this section is narrower and still worth having: the elision
-is reachable by an explicit `xdpgeneric`, and on any build without 992 it is the
+is reachable by an explicit `xdpgeneric`, and on any build without 891 it is the
 default. The instruments could not see either case, which is the part that
 needed fixing.
 
@@ -4197,7 +4247,7 @@ tree is CPU-bound, and this one was missed."
 
 ### 23.23 gro_cells is the wrong abstraction for this driver, and what to do about it - 2026-09-14
 
-The question is whether 991 can be made to work correctly threaded as well as
+The question is whether 890 can be made to work correctly threaded as well as
 unthreaded. It can, but not by fixing how it uses gro_cells. **It uses gro_cells
 correctly. gro_cells is the wrong tool for a driver shaped like this one**, and
 replacing it with a single driver-owned NAPI fixes threading by construction and
@@ -4229,7 +4279,7 @@ What the unused half costs is not memory. It is that `gro_cells_init()` puts a
 NAPI per possible CPU onto `dev->napi_list` (`gro_cells.c:78`, `:85`), and those
 extra NAPIs are the entire reason `/sys/class/net/wwan0/threaded` is unsafe:
 `dev_set_threaded()` threads all of them with unbound kthreads, and the cells
-they drain are per-CPU and lockless. 991 pays the hazard of a per-CPU design for
+they drain are per-CPU and lockless. 890 pays the hazard of a per-CPU design for
 a workload with one producer CPU.
 
 #### What gro_cells does not do, since the opposite is widely believed
@@ -4272,7 +4322,7 @@ flushes into the latter at `:6081`, so RPS applies *after* GRO merging on the
 gro_cells path, and directly on the `netif_rx()` path. This box already runs it:
 `packet_steering=2` with every interface at `rps_cpus 3`.
 
-So the ledger for 991 is smaller than the story suggests, and still worth having:
+So the ledger for 890 is smaller than the story suggests, and still worth having:
 **gro_cells buys exactly one thing, a NAPI context in which `napi_gro_receive()`
 is legal for a driver that owns no NAPI.** Stock had no GRO at all. The
 distribution, the parallelism and the threaded unpacking are not happening.
@@ -4285,12 +4335,12 @@ a single-event-ring MHI link whose producer never varies.
 
 #### The replacement: one driver-owned NAPI
 
-This is the shape every ordinary driver uses, and it is what 991 should have
+This is the shape every ordinary driver uses, and it is what 890 should have
 done:
 
 - `netif_napi_add(ndev, &link->napi, mhi_mbim_poll)` and `napi_enable()` in
   `ndo_init`, where `gro_cells_init()` is today; `napi_disable()` and
-  `netif_napi_del()` in `ndo_uninit`, where `gro_cells_destroy()` is. 991 already
+  `netif_napi_del()` in `ndo_uninit`, where `gro_cells_destroy()` is. 890 already
   got that lifetime pairing right and the reasoning carries over unchanged.
 - A driver-owned `struct sk_buff_head` drained by the poll, enqueued with the
   **locked** `skb_queue_tail()` and dequeued with `skb_dequeue()` - not the `__`
@@ -4317,12 +4367,12 @@ done:
   upstream gro_cells users, but this tree stops waiting on it.
 - **Fewer NAPIs**: one per link instead of one per possible CPU.
 - **Better degradation under generic XDP.** Today a skb-mode attach sends every
-  datagram to `netif_rx()`, which is the whole pre-991 path. With a driver NAPI,
+  datagram to `netif_rx()`, which is the whole pre-890 path. With a driver NAPI,
   `napi_gro_receive()` still runs and only the merging is skipped, because
   `netif_elide_gro()` is tested inside `dev_gro_receive()` at `gro.c:488` rather
   than at the delivery call. The `ethtool -K wwan0 gro off` kill switch keeps
   working through the same test.
-- **992 is barely touched.** It hooks `mhi_mbim_rx()` before delivery; only the
+- **891 is barely touched.** It hooks `mhi_mbim_rx()` before delivery; only the
   final `gro_cells_receive()` call becomes a queue-and-schedule.
 
 #### What it costs, stated before it is measured
@@ -4356,7 +4406,7 @@ has shown what the ceiling is.
 
 #### Where this leaves the work
 
-- **W0042** is the 991 rewrite: replace gro_cells with a driver-owned NAPI.
+- **W0042** is the 890 rewrite: replace gro_cells with a driver-owned NAPI.
 - **W0041** stays open and stays worth posting, on the strength of
   `backlog_napi_setup()` binding the kernel's own per-CPU NAPI thread while
   gro_cells' are left unbound. It is no longer blocking anything here.
@@ -4399,7 +4449,7 @@ and `process_backlog()` contains **zero** occurrences of the string `gro`. It
 dequeues from `sd->process_queue` and calls `__netif_receive_skb()` directly.
 
 So on a stock kernel `ethtool -k wwan0` says GRO is on and **not one packet is
-ever aggregated**. That is the entire reason 991 exists, and this tree already
+ever aggregated**. That is the entire reason 890 exists, and this tree already
 recorded it: "GR01 x NW2, unpatched - inert. The feature bit is settable and does
 nothing."
 
@@ -4414,7 +4464,7 @@ the same unwarranted conclusion, in this document, two sections ago.
 - **"`echo 1 > threaded` does nothing; there is no low-level driver kthread."**
   Correct **for stock**, and it is the same provenance point 23.22 makes from the
   other direction: an empty `dev->napi_list` means `dev_set_threaded()` creates
-  no threads. It is wrong for this tree, because 991 put per-CPU gro_cells NAPIs
+  no threads. It is wrong for this tree, because 890 put per-CPU gro_cells NAPIs
   on that list. It also does not "throw an error" - it returns 0 and does
   nothing.
 - **`rx-udp-gro-forwarding` and `rx-gro-list` are real.**
@@ -4444,7 +4494,7 @@ been aggregated on ingress and re-segmented by GSO on egress.
 
 `rx-udp-gro-forwarding` is inert on the interface class it is usually
 recommended for, because those drivers have no GRO to forward. **On this box it
-is not inert, because 991 supplied the NAPI context.** That makes it the first
+is not inert, because 890 supplied the NAPI context.** That makes it the first
 zero-risk thing to try in a while:
 
 ```sh
@@ -4698,7 +4748,7 @@ a comparison that survives its own drift control.
 everywhere.** The peak here exceeds the first run's, and W0002's premise still
 has nothing under it.
 
-#### What 991 is actually doing, measured
+#### What 890 is actually doing, measured
 
 The skb rate barely moves while the datagram rate swings hard:
 
@@ -4708,7 +4758,7 @@ The skb rate barely moves while the datagram rate swings hard:
 GRO absorbed nearly all of it. At the top window 11790 datagrams per second
 reached the stack as 2370 skbs - **4.97x less per-packet work**, and the stack
 saw a nearly constant skb rate across a 76% swing in offered datagrams. This is
-the clearest demonstration in the record of what 991 buys, and it is a stronger
+the clearest demonstration in the record of what 890 buys, and it is a stronger
 argument for the patch than any of the throughput numbers that could not be read.
 
 #### Four streams at last, and they made the measurement worse
@@ -5064,15 +5114,15 @@ behaviour, the peak-to-peak comparison across drifting runs, the PID count read
 as a working download. Those were all syntactically perfect.
 
 
-### 23.28 W0041 form 2 is written, and the same source read found a live defect in 992 - 2026-09-15
+### 23.28 W0041 form 2 is written, and the same source read found a live defect in 891 - 2026-09-15
 
 Three changes, all from reading `net/core` rather than from a measurement, and
 none of them yet on the box:
 
-1. **996** makes gro_cells decline threaded NAPI. This is W0041 form 2 exactly
+1. **871** makes gro_cells decline threaded NAPI. This is W0041 form 2 exactly
    as 23.21 proposed it, so writing 1 to `/sys/class/net/wwan0/threaded` is
    inert again rather than fatal.
-2. **992 had a real bug** on the `XDP_PASS` return path: generic XDP hands the
+2. **891 had a real bug** on the `XDP_PASS` return path: generic XDP hands the
    skb back with Ethernet receive metadata derived from the IP header, and on a
    router that silently drops every forwarded datagram. Fixed with three stores.
 3. **Two things I expected to be bugs are not**, and both are now written down
@@ -5083,11 +5133,11 @@ none of them yet on the box:
 `v6.12.103`. Nothing here has been built, flashed or reproduced, which is the
 outstanding work.
 
-#### 996: how gro_cells opts out, and why three sites is all of them
+#### 871: how gro_cells opts out, and why three sites is all of them
 
 23.21 named two possible shapes for W0041 and said form 2 -- have gro_cells opt
 its NAPIs out -- is the one to send first, "because it cannot regress anything
-that works today". That is what 996 is.
+that works today". That is what 871 is.
 
 `NAPI_STATE_NO_THREAD` is appended to the state enum, so no existing bit is
 renumbered. `gro_cells_init()` sets it beside the `NAPI_STATE_NO_BUSY_POLL` it
@@ -5097,7 +5147,7 @@ finding out why is what turned a two-site patch into a three-site one.
 `NAPI_STATE_THREADED` can be set from exactly four places. Each had to be
 accounted for:
 
-| site | `dev.c` | what it does | how 996 handles it |
+| site | `dev.c` | what it does | how 871 handles it |
 |---|---|---|---|
 | `dev_set_threaded()` kthread loop | `:6688` | creates a kthread per NAPI on `dev->napi_list`, no filter | skipped by the bit |
 | `dev_set_threaded()` assign loop | `:6722` | `assign_bit(NAPI_STATE_THREADED, ...)` on every NAPI | skipped by the bit |
@@ -5120,10 +5170,10 @@ but both are reached only under `napi->poll == process_backlog`, so they can
 never see a gro_cell.
 
 **What the sysfs file means afterwards.** On a device whose every NAPI opts out
--- which is `wwan0` under 991, since the driver registers none of its own --
+-- which is `wwan0` under 890, since the driver registers none of its own --
 writing 1 succeeds, reads back 1, and threads nothing. That is exactly what the
 file already does on a device with no NAPI at all, which is what `wwan0` was
-before 991, so nothing that reads it changes behaviour. I considered returning
+before 890, so nothing that reads it changes behaviour. I considered returning
 `-EOPNOTSUPP` so the write would fail visibly and did not: it is an ABI change
 inside a patch whose job is to stop a corruption, and on a mixed device it would
 have to answer differently depending on which NAPIs happen to exist when the
@@ -5138,11 +5188,11 @@ asymmetry 23.21 pointed at is real and is stronger than stated: the kernel does
 not merely bind its per-CPU NAPI thread, it declines to use the unbound
 `kthread_run()` path for it at all.
 
-#### The 992 defect: generic XDP returns an Ethernet verdict on a raw-IP link
+#### The 891 defect: generic XDP returns an Ethernet verdict on a raw-IP link
 
 This is the part that was not on the list when the session started.
 
-992's commit message already recorded that a program attached here "will
+891's commit message already recorded that a program attached here "will
 misparse silently, reading the first two octets of the source address as an
 EtherType". What it did not record is that **the core does the same misparse,
 on the way back, and acts on it.**
@@ -5153,7 +5203,7 @@ Ethernet header:
 | `dev.c` | what it reads | what that is on `wwan0` |
 |---|---|---|
 | `:5093-5095` | `eth->h_dest` (bytes 0..5) and `eth->h_proto` (bytes 12..13), before the program runs | IPv4: version/IHL, TOS, total length, ID -- and the top half of the source address |
-| `:5107` | `skb->mac_header += off` after `bpf_xdp_adjust_head()` | shifts the anchor 991 sets, so `mac_len` stops being 0 |
+| `:5107` | `skb->mac_header += off` after `bpf_xdp_adjust_head()` | shifts the anchor 890 sets, so `mac_len` stops being 0 |
 | `:5128` | compares those same bytes after the program ran | any difference reads as "the program rewrote L2" |
 | `:5132-5134` | `__skb_push(ETH_HLEN)`, `pkt_type = PACKET_HOST`, `skb->protocol = eth_type_trans()` | runs `eth_type_trans()` over the IP header |
 
@@ -5237,22 +5287,22 @@ to avoid, so it is corrected in place as well as recorded here.
 
 #### What this changes
 
-* **W0041 moves from proposed to written.** 996 is form 2. Form 1 -- bind each
+* **W0041 moves from proposed to written.** 871 is form 2. Form 1 -- bind each
   kthread to the CPU whose cell it serves -- remains the better fix if threaded
   gro_cells is ever wanted, and remains unwritten.
-* **W0002 stays retired.** 996 makes the toggle harmless, not useful: a gro_cells
+* **W0002 stays retired.** 871 makes the toggle harmless, not useful: a gro_cells
   NAPI still never runs in a thread, so there is still no threaded-NAPI latency
   number to go and get.
 * **W0042 is no longer the price of safety.** 23.21 said the `threaded` control
   "must stay at 0 until W0042 replaces gro_cells with a driver-owned NAPI". With
-  996 that is no longer true. W0042 stands or falls on its own merits now, which
+  871 that is no longer true. W0042 stands or falls on its own merits now, which
   after 23.23 are thin.
-* **991's commit message is rewritten**, and the file is ASCII-clean: it carried
+* **890's commit message is rewritten**, and the file is ASCII-clean: it carried
   five em-dashes and a section sign, which `checkpatch.pl` flags and which have
   no business in a patch destined for netdev. The diff body is byte-identical
   (`md5` unchanged).
-* **Three things are still owed**: a build carrying 996, a flash, and a
-  reproduction of the 992 defect -- attach a program that rewrites the source
+* **Three things are still owed**: a build carrying 871, a flash, and a
+  reproduction of the 891 defect -- attach a program that rewrites the source
   address, confirm forwarded traffic dies without the fix and survives with it.
   Until that runs, everything in this section is a source read.
 
@@ -5298,9 +5348,9 @@ quotes being verbatim from the page I opened.
 
 Three things follow, and they are uncomfortable.
 
-* **The 992 defect from 23.28 is the exact bug upstream declined to fix.**
+* **The 891 defect from 23.28 is the exact bug upstream declined to fix.**
   Generic XDP reading bytes 0..5 and 12..13 as an Ethernet header on a raw-IP
-  link is precisely what that patch addressed. So the repair 992 now carries is
+  link is precisely what that patch addressed. So the repair 891 now carries is
   not a local nicety: it is the workaround for something the core will not do,
   by explicit decision, a month ago.
 * **"Just attach the BPF in TC" is Method D**, which this document tested and
@@ -5390,7 +5440,7 @@ ways, and the second is specific to this tree:
    it. `cdc_ncm` - the same NTB format over USB - copies *deliberately* for this
    reason, and says so in the code: `/* create a fresh copy to reduce truesize */`
    (`cdc_ncm.c:1817-1823`). **E2.**
-2. **It would silently disable 991's GRO.** `gro_cells_receive()` bails to plain
+2. **It would silently disable 890's GRO.** `gro_cells_receive()` bails to plain
    `netif_rx()` when `skb_cloned(skb)` (`gro_cells.c:23`). Every clone would skip
    GRO entirely. **E2.** This is the one that settles it for this tree.
 3. **It would not avoid a copy anyway.** `do_xdp_generic()` deep-copies cloned
@@ -5510,15 +5560,15 @@ matched, and it is worth recording precisely because it is so close.
 It is not WED. It is **TOPS/NPU** (Tunnel Offload Processing System) plus **PCE**
 (Packet Classification Engine). In `mtkfeed`:
 
-* `999-net-02-netdevice-add-npu-device-path-type.patch` adds a generic tunnel
+* `893-net-02-netdevice-add-npu-device-path-type.patch` adds a generic tunnel
   descriptor to `enum net_device_path_type` carrying **MAC addresses, source and
   destination IPs, and ports** - a real 5-tuple - with a
   `/* Extend other tunnel here */` union and a hook
   `extern int (*mtk_flow_tnl_offloadable)(const struct net_device_path *path);`.
-* `999-eth-46-mtk_eth_soc-add-tnl-offload-support.patch` routes
+* `893-eth-46-mtk_eth_soc-add-tnl-offload-support.patch` routes
   hardware-decapsulated packets to an arbitrary netdev via
   `tops_crsn = RX_DMA_GET_TOPS_CRSN(trxd.rxd6)`.
-* `999-tnl-07-l2tp-add-fill-forward-path.patch` adds `pppol2tp_fill_forward_path`
+* `893-tnl-07-l2tp-add-fill-forward-path.patch` adds `pppol2tp_fill_forward_path`
   to `ppp_channel_ops` - a **non-802.11 driver producing a forward path**, which
   upstream has no equivalent of.
 * `mtkfeed/feed/kernel/pce/` is a whole packet-classification-engine driver.
@@ -5676,7 +5726,7 @@ I planned to take them as scaffolding for W0040 and validation killed that:
 neither compiles here as written, one patches a file this image does not build,
 and the infrastructure they appeared to add is already upstream. W0044 is
 withdrawn. What came out of looking properly is a much stronger W0040, now
-shipped as 997.
+shipped as 872.
 
 One method note, because this section nearly recorded the opposite. My first
 sweep of the vendor SDK for `mt7981` near `npu` returned the MT7981 device trees
@@ -5751,7 +5801,7 @@ A second reason the entry is unreachable even in principle: GMAC1 is bound to
 `mtk_ppe_offload.c:609` when the ingress check fell through.
 
 **And MediaTek ships a counterexample to the "both ends" formulation today.**
-`999-ppe-39-mtk_ppe-add-464xlat-clat-support.patch` matches a CLAT virtual
+`893-ppe-39-mtk_ppe-add-464xlat-clat-support.patch` matches a CLAT virtual
 interface as the **ingress**, by name prefix `"464-"`, and never consults
 `mtk_flow_is_valid_idev()`. **E2.** That is notable here beyond the general
 point, because section 23.11 established that this link *is* 464XLAT.
@@ -5765,13 +5815,13 @@ tree, and the next sweep will surface them again.
   of pristine `mhi_wwan_mbim.c:319`, where `netdev_alloc_skb()` yields only
   `NET_SKB_PAD` and `netif_receive_generic_xdp()` therefore takes the
   `netif_skb_check_for_xdp()` branch on every packet
-  (`net/core/dev.c:5202-5206`). **992 already fixes this**: it reserves
+  (`net/core/dev.c:5202-5206`). **891 already fixes this**: it reserves
   `XDP_PACKET_HEADROOM` whenever a program is attached, so headroom is
   `NET_SKB_PAD + XDP_PACKET_HEADROOM` and the slow branch is never taken. The
   patch header has always said so.
 * **"Threaded NAPI on the gro_cells NAPIs, zero code, move GRO to the second
   core."** This is W0002, and section 23.21 established it is unsafe by
-  construction; 996 now makes the toggle inert precisely so it cannot be taken.
+  construction; 871 now makes the toggle inert precisely so it cannot be taken.
   It is an appealing suggestion from the outside and it took the WAN down twice.
 
 ### 24.11 What this changes
@@ -5812,9 +5862,9 @@ whole path, because the dead ends are the useful part.
 
 | check | result |
 |---|---|
-| Is `union nf_inet_addr` reachable from `netdevice.h`? | **No.** No `netfilter.h` include, zero references; it is at `include/uapi/linux/netfilter.h:72`. `999-net-02`'s `tunnel.sip`/`.dip` do not compile here |
+| Is `union nf_inet_addr` reachable from `netdevice.h`? | **No.** No `netfilter.h` include, zero references; it is at `include/uapi/linux/netfilter.h:72`. `893-net-02`'s `tunnel.sip`/`.dip` do not compile here |
 | Is `struct dst_entry` declared for `netdevice.h`? | **No.** Not there, not in `skbuff.h`. The only `include/linux/` header carrying the forward declaration is `security.h`, which is not included. `struct dst_entry *dst;` would declare a fresh incomplete type |
-| Does another vendor patch supply those? | **No.** Of the eight `999-*` patches touching `netdevice.h`, the only one adding an include is `999-ppe-01`, and it adds `br_private.h` to a different file |
+| Does another vendor patch supply those? | **No.** Of the eight `893-*` patches touching `netdevice.h`, the only one adding an include is `893-ppe-01`, and it adds `br_private.h` to a different file |
 | Is `net/l2tp/l2tp_ppp.c` built in this image? | **No.** `# CONFIG_L2TP is not set` and `# CONFIG_PPPOL2TP is not set`, OpenWrt `generic/config-6.12:3124` and `:4882` |
 | Does a new path type break existing consumers? | **No.** `nft_dev_path_info()` ends its switch with `default: info->indev = NULL; break;` and the caller bails on `!info->indev`. Clean |
 
@@ -5825,7 +5875,7 @@ So lifting was never a lift; it was a port with a config change attached.
 **The infrastructure those patches appeared to add is already upstream.**
 `struct ppp_channel_ops` has a `fill_forward_path` member at
 `include/linux/ppp_channel.h:33` in pristine `v6.12.103`. MediaTek's
-`999-tnl-07` does not add a hook - it *implements an existing one* for L2TP
+`893-tnl-07` does not add a hook - it *implements an existing one* for L2TP
 channels. There was nothing to backport.
 
 And once I looked at who implements these callbacks at all, W0040 stopped being
@@ -5868,7 +5918,7 @@ there buys nothing.
 
 #### What shipped
 
-**997**, the three-line W0040 fix: treat `-EOPNOTSUPP` from
+**872**, the three-line W0040 fix: treat `-EOPNOTSUPP` from
 `ndo_fill_forward_path` as "no special path" rather than as failure. Three
 details in it are load-bearing rather than stylistic, and each was found by
 checking rather than by reading the diff:
@@ -5883,7 +5933,7 @@ checking rather than by reading the diff:
   continuing trips `WARN_ON_ONCE(last_dev == ctx.dev)` immediately below.
 
 **W0044 is withdrawn**, having existed for about an hour. The two patches it
-covered are cited in 997's message instead.
+covered are cited in 872's message instead.
 
 ### 24.13 The PCE question became answerable, and getting there cost two wrong answers - 2026-09-15
 
@@ -5978,9 +6028,9 @@ is exactly what would make the shared config's dead `=y` line live -
 driver-claimed range exclusive, and `mtk_eth_soc` claims this entire window
 through `devm_platform_ioremap_resource()`. The probe would read nothing.
 
-#### 998, written and dropped
+#### 873, written and dropped
 
-Before the config route was understood I wrote a temporary patch, 998, that read
+Before the config route was understood I wrote a temporary patch, 873, that read
 the same fourteen offsets from inside `mtk_eth_soc` through the ioremap
 `mtk_probe()` already holds, exposed at `/sys/kernel/debug/mtk_fe_probe`. It
 worked on paper - applied at `--fuzz=0` against the fully patched tree, compiled
@@ -5993,7 +6043,7 @@ fallback if `/dev/mem` is ever unavailable again, not the first move.
 #### The patch series, verified rather than assumed
 
 Reconstructed the real tree - pristine `v6.12.103` plus every patch in this tree
-that touches any file 990-997 touch, in OpenWrt's documented order
+that touches any file 870-893 touch, in OpenWrt's documented order
 (backport, pending, hack, then target). The enumeration is complete:
 `net/core/dev.c` is touched by exactly one earlier patch,
 `hack-6.12/721-net-add-packet-mangeling`; `net/core/gro_cells.c` by none;
@@ -6001,29 +6051,29 @@ that touches any file 990-997 touch, in OpenWrt's documented order
 
 | patch | result |
 |---|---|
-| 990, 991, 992, 993 | clean |
-| 995 | applies, 6 hunks at offset +47 |
-| 996 | applies, 3 hunks at offset +5 |
-| 997 | clean, zero offset, applied after 996 |
+| 870, 890, 891, 880 | clean |
+| 892 | applies, 6 hunks at offset +47 |
+| 871 | applies, 3 hunks at offset +5 |
+| 872 | clean, zero offset, applied after 871 |
 
 All at `--fuzz=0`. The offsets are stale recorded line numbers, not conflicts:
-995 is +47 because 991 and 992 grow `mhi_wwan_mbim.c` above its hunks, and 996
+892 is +47 because 890 and 891 grow `mhi_wwan_mbim.c` above its hunks, and 871
 is +5 because `hack/721` adds five lines to `dev.c` above its first edit. Left
 alone; `make target/linux/refresh` is what zeroes them if that is ever wanted.
 
-**One real defect found, in 997's own commit message.** It claimed to share no
-file with 996. It does - both edit `net/core/dev.c`. They do not conflict, since
-996 works on `dev_set_threaded()` and `netif_napi_add_weight()` near line 6726
-and 997 on `dev_fill_forward_path()` near 749, roughly 6000 lines apart, which
-is why 997 lands at zero offset even after 996. The sentence is corrected in
+**One real defect found, in 872's own commit message.** It claimed to share no
+file with 871. It does - both edit `net/core/dev.c`. They do not conflict, since
+871 works on `dev_set_threaded()` and `netif_napi_add_weight()` near line 6726
+and 872 on `dev_fill_forward_path()` near 749, roughly 6000 lines apart, which
+is why 872 lands at zero offset even after 871. The sentence is corrected in
 place and now says how it was checked.
 
 Post-patch source consistency, checked in the extracted tree and confirmed again
 on the box's own build: `NAPI_STATE_NO_THREAD` is appended last in the enum at
 bit 10 with no existing bit renumbered, `NAPIF_STATE_NO_THREAD` is defined
 alongside, and the four use sites resolve - `netdevice.h` 2, `dev.c` 4,
-`gro_cells.c` 1, plus 997's unique `stack->num_paths--` 1, 992's `mhi_mbim_xdp`
-5 and 991's `gro_cells` 7. Those six counts came back exactly on the 2026-09-15
+`gro_cells.c` 1, plus 872's unique `stack->num_paths--` 1, 891's `mhi_mbim_xdp`
+5 and 890's `gro_cells` 7. Those six counts came back exactly on the 2026-09-15
 build. **E1.**
 
 #### Method notes from the probe itself
@@ -6046,11 +6096,11 @@ address the u64 loop cannot run and the u32 loop does exactly one 32-bit load,
 which is the right width. Changing the block size breaks that, which is now a
 note in the script.
 
-### 24.14 The PCE registers read as unimplemented, and 996 is proven on the box - 2026-09-15
+### 24.14 The PCE registers read as unimplemented, and 871 is proven on the box - 2026-09-15
 
 Two results, both **E1**, both from the image flashed today.
 
-#### 996 works: the threaded toggle is inert, not fatal
+#### 871 works: the threaded toggle is inert, not fatal
 
 `echo 1 > /sys/class/net/wwan0/threaded` did not take the WAN down. The file
 reads back `1`, and `ps w | grep 'napi/'` shows no kthread at all. On 2026-09-14
@@ -6343,7 +6393,7 @@ if the question is ever reopened.
 
 ### 24.16 W0045: the XDP frame rebuild assumes Ethernet, and cpumap is where it bites - 2026-09-15
 
-Found by asking the question 997 came from - where else does core net treat a
+Found by asking the question 872 came from - where else does core net treat a
 non-Ethernet device as Ethernet - rather than by looking for it. **E2
 throughout**, read at `v6.12.103`.
 
@@ -6363,14 +6413,14 @@ though it were new, which is the same mistake this document's own preamble to
 24 describes: I had the answer in my own file and did not open it.
 
 What survives the correction, and what does not. **The mechanism stands** - it
-was read from source, not inferred, and 998 fixes a real drop that is silent
+was read from source, not inferred, and 873 fixes a real drop that is silent
 and reachable. **The novelty claim does not**: the failure was described before
 I found it, and the patch header now says so.
 
 What does not follow is that the work is wrong. The three questions worth
 asking are whether it is better, whether it works, and whether it is feasible,
 and a maintainer's position on a neighbouring patch answers none of them. The
-drop is real, the fix is a no-op for every Ethernet caller, and 999 has since
+drop is real, the fix is a no-op for every Ethernet caller, and 893 has since
 been measured working on the box. Upstream's view is recorded here because it
 is useful to whoever sends it - a different patch on a different path, against
 a device class that now demonstrably has native XDP - not as a verdict.
@@ -6395,7 +6445,7 @@ frame comes out `PACKET_MULTICAST`; IPv6's `0x60` does not, so it comes out
 `PACKET_OTHERHOST`. `ip_forward()` drops anything that is not `PACKET_HOST` at
 `net/ipv4/ip_forward.c:93`, still under the comment "that should never happen".
 
-This is 992's defect one layer up, in core net rather than in a driver.
+This is 891's defect one layer up, in core net rather than in a driver.
 
 #### Where it is reachable, and why nobody has hit it
 
@@ -6411,7 +6461,7 @@ them, so a device with only generic XDP cannot reach this. That is why it has
 gone unnoticed, and it is also why it matters here: it becomes reachable the
 moment a raw-IP driver gains native XDP.
 
-#### Why this is a precondition for 999, not a consequence of it
+#### Why this is a precondition for 893, not a consequence of it
 
 cpumap redirect is the principal reason to want native XDP on `wwan0`. The MBIM
 receive path runs on one CPU; cpumap is the mechanism for moving per-packet work
@@ -6422,14 +6472,14 @@ first, or native XDP on this link delivers nothing measurable.**
 That reorders the queue. W0045 is small, core-net-only, upstreamable on its own
 merits, and needs no hardware.
 
-**Written as 999 the same day** (24.17), which is what makes this reachable
-rather than theoretical - and 999's own verification plan reproduces W0045
-deliberately, by redirecting into a cpumap without 998 applied before confirming
-it with 998.
+**Written as 893 the same day** (24.17), which is what makes this reachable
+rather than theoretical - and 893's own verification plan reproduces W0045
+deliberately, by redirecting into a cpumap without 873 applied before confirming
+it with 873.
 
 #### The fix, and the three details that are load-bearing
 
-998 asks `dev->type` and, when it is not `ARPHRD_ETHER`, does the same work
+873 asks `dev->type` and, when it is not `ARPHRD_ETHER`, does the same work
 `eth_type_trans()` does minus the header it does not have.
 
 * **`skb_reset_mac_header()` is required, not decorative.**
@@ -6454,16 +6504,16 @@ rather than guessed at.
 
 `net/core/xdp.c` and `kernel/bpf/cpumap.c` are **pristine** in this tree - no
 patch here and none in OpenWrt's generic set touches either - so the context is
-upstream's. Verified to apply at `--fuzz=0` with 990 through 997 applied, and
-all three core-net patches coexist: 996's four `NAPI_STATE_NO_THREAD` sites in
-`dev.c`, 997's `stack->num_paths--`, and 998's `ARPHRD_ETHER` in `xdp.c`. The
+upstream's. Verified to apply at `--fuzz=0` with 870 through 872 applied, and
+all three core-net patches coexist: 871's four `NAPI_STATE_NO_THREAD` sites in
+`dev.c`, 872's `stack->num_paths--`, and 873's `ARPHRD_ETHER` in `xdp.c`. The
 helper was compiled standalone and checked on IPv4, IPv6, a junk nibble and a
 zero-length frame.
 
 **Not built, not flashed, and not reproducible on this box yet** - nothing on
-`wwan0` reaches the native path until 999 is built, which is the whole point.
-999 is written (24.17) and its verification plan reproduces this deliberately:
-redirect into a cpumap with 998 reverted, confirm the drop, reapply, confirm the
+`wwan0` reaches the native path until 893 is built, which is the whole point.
+893 is written (24.17) and its verification plan reproduces this deliberately:
+redirect into a cpumap with 873 reverted, confirm the drop, reapply, confirm the
 recovery.
 
 #### One other lever, recorded as reasoning rather than a finding
@@ -6487,20 +6537,20 @@ the RX refill is the only route to XNF01 there", on the understanding that MBIM
 datagrams share an NTB with no per-packet headroom. They do not, and never did.
 Pristine `mhi_wwan_mbim.c:319-324` copies every datagram out of the NTB into its
 own `netdev_alloc_skb()` - no clone, no shared page, no refcount to manage - and
-992 added `XDP_PACKET_HEADROOM` to that allocation. So every ingredient
+891 added `XDP_PACKET_HEADROOM` to that allocation. So every ingredient
 `xdp_prepare_buff()` wants was already present, and 256 bytes clears the 40-byte
 `sizeof(struct xdp_frame)` floor that `XDP_REDIRECT` needs. The gap was never the
 buffer; it was that the buffer got wrapped in an skb before the program ran
 instead of after.
 
-**999** closes it: `netdev_alloc_frag()` in place of `netdev_alloc_skb()`, the
+**893** closes it: `netdev_alloc_frag()` in place of `netdev_alloc_skb()`, the
 program on an `xdp_buff`, and `build_skb()` only on `XDP_PASS`. The copy is
 unchanged. `XDP_DROP` allocates no skb at all; `XDP_REDIRECT` can reach a cpumap.
 
 **Native is more correct here, not merely faster**, which is the opposite of the
 usual trade. `bpf_prog_run_generic_xdp()` reads bytes 0..5 and 12..13 as an
 Ethernet destination and ethertype (`dev.c:5093-5134`); on raw IP those offsets
-are inside the IP header, and 992 carries three stores and a long comment to
+are inside the IP header, and 891 carries three stores and a long comment to
 repair the result. Running on an `xdp_buff` never enters that code, so the whole
 class of misparse is absent rather than corrected.
 
@@ -6516,34 +6566,34 @@ as an XDP program exception via `trace_xdp_exception()`.
 `generic_xdp_tx()` is not exported to modules, so the frame re-enters the
 ordinary transmit path; there is no tail slack, so `bpf_xdp_adjust_tail()`
 growth returns `-EINVAL`; and `truesize` accounting changes, which lands
-upstream of 991's gro_cells and needs re-measuring rather than assuming.
+upstream of 890's gro_cells and needs re-measuring rather than assuming.
 
 **What it does to 24.1.** That section recorded Kicinski refusing a nearby patch
 with "There is no native XDP on any non-ether device, making generic xdp work on
 those is silly", and read it as closing the whole XDP-on-the-modem question.
-999 is a direct counter-example to the premise in that first sentence: it makes
+893 is a direct counter-example to the premise in that first sentence: it makes
 a non-Ethernet device a native XDP device, and it does so without asking the
 core for anything, because the buffer discipline was already there. That changes
 the argument available; it does not overturn the conclusion, which was three
 maintainers' stated position and remains theirs. Lobakin's list of what would
 break on such a device - cpumap Rx and `ndo_xdp_xmit` - turned out to be
-exactly 998 and the XDP_TX limitation above, which is a point in his favour and
+exactly 873 and the XDP_TX limitation above, which is a point in his favour and
 worth saying plainly.
 
-**Status: E2, applies at `--fuzz=0` over 990 through 998. Not built, not
-flashed, not measured.** It shares `mhi_wwan_mbim.c` with 991, 992 and 995 and
-must apply after them. The cpumap payoff is gated on 998 (W0045). The
+**Status: E2, applies at `--fuzz=0` over 870 through 892. Not built, not
+flashed, not measured.** It shares `mhi_wwan_mbim.c` with 890, 891 and 892 and
+must apply after them. The cpumap payoff is gated on 873 (W0045). The
 verification plan is five tests, T0056 through T0060 on the matrix, against a
 build (B0011) that does not exist yet.
 
 **One thing this makes stale**: `x3000/docs/verify-xdp.sh` tests the generic
-hook 999 replaces. Its attach steps still work - a program still attaches - but
+hook 893 replaces. Its attach steps still work - a program still attaches - but
 what it verifies is no longer the path the driver takes. It needs a pass before
 it is trusted again, and that is not done.
 
-### 24.18 999 confirmed on hardware, and three runs that measured nothing - 2026-09-15
+### 24.18 893 confirmed on hardware, and three runs that measured nothing - 2026-09-15
 
-**999 works. E1, measured on the flashed image.** This is the first result in
+**893 works. E1, measured on the flashed image.** This is the first result in
 this document that comes from the native XDP path on `wwan0` actually running.
 
 #### The measurement
@@ -6554,13 +6604,13 @@ it succeeded, and returns `XDP_PASS`.
 
 | attach | rx_packets delta | packets seen | `adjust_tail(+64)` returned |
 |---|---|---|---|
-| `xdpdrv` (999's native hook) | +25 | 25 | `18446744073709551594` |
+| `xdpdrv` (893's native hook) | +25 | 25 | `18446744073709551594` |
 | `xdpgeneric` (core `do_xdp_generic`) | +17 | 17 | `0` |
 
 `18446744073709551594` is `2**64 - 22`, so the value is **-22, `-EINVAL`**.
 
 That is the predicted discrimination, and it was predicted from source before
-any of it was built. 999 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
+any of it was built. 893 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
 SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`, so `xdp_data_hard_end()`
 (`include/net/xdp.h:147`) lands at the end of the datagram and there is no room
 to grow. The generic path runs the same program over an skb whose allocation
@@ -6585,7 +6635,7 @@ kmalloc rounded up, so the same call finds tailroom and succeeds.
 
 `XDP_DROP` allocating no skb is not measured, only argued. `XDP_REDIRECT` into a
 cpumap, which is the reason to want any of this and the only thing that
-exercises 998, is not measured. `bpf_xdp_adjust_head()` is not measured - the
+exercises 873, is not measured. `bpf_xdp_adjust_head()` is not measured - the
 probe used here dropped it for size. No performance number of any kind exists.
 T0057 through T0059 on the matrix remain open.
 
@@ -6594,7 +6644,7 @@ T0057 through T0059 on the matrix remain open.
 Worth recording plainly, because the failure was mine and it was invisible.
 
 Three consecutive runs reported zero packets through the program, on both
-attach paths. I read that first as "999's hook is not running", then as "the
+attach paths. I read that first as "893's hook is not running", then as "the
 traffic is leaving by another interface", and went looking at routing tables.
 Both were wrong. The cause was the traffic generator:
 

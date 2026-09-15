@@ -158,8 +158,8 @@ bs_xdp_mode() {
 # That distinction decides real behaviour on this box. gro_cells_receive()
 # (net/core/gro_cells.c:23) tests the same predicate and falls straight through
 # to netif_rx() when it holds, so with a generic program attached the per-CPU
-# gro_cells queues 991 installs are never touched at all - the WAN is back to
-# its pre-991 receive path while ethtool still says GRO is on.
+# gro_cells queues 890 installs are never touched at all - the WAN is back to
+# its pre-890 receive path while ethtool still says GRO is on.
 bs_gro_effective() {
   _f=$(bs_gro "$1")
   # "-" is bs_gro's no-ethtool answer and "" is an interface it could not read.
@@ -514,7 +514,7 @@ bs_require_flowtable() {
     bs_bad "$1 is NOT in the flowtable device list ($d)"
     bs_say "        nf_flowtable_by_dev() will not find it and every lookup"
     bs_say "        returns -ENOENT. On this tree wwan0 gets there only through"
-    bs_say "        the firewall4 patch 001-flowtable-fall-back-to-l3-device."
+    bs_say "        the firewall4 patch 900-flowtable-fall-back-to-l3-device."
   fi
 }
 
@@ -697,21 +697,21 @@ bs_xdp_load_attach() {
     # And confirm WHICH MODE, not merely that something attached. Plain `ip
     # link set ... xdp` is best-effort: dev_xdp_mode() (net/core/dev.c:9444)
     # takes the driver's ndo_bpf if it has one and falls to skb mode if not,
-    # with no retry. That choice decides whether 991's GRO survives, because
+    # with no retry. That choice decides whether 890's GRO survives, because
     # only the skb path sets dev->xdp_prog, which is what netif_elide_gro()
     # tests and what gro_cells_receive() checks per datagram - landing in
-    # generic mode silently reverts the WAN to its pre-991 netif_rx() path.
+    # generic mode silently reverts the WAN to its pre-890 netif_rx() path.
     # A grep for 'prog/xdp' cannot see the difference: iproute2 spells the
     # skb attachment 'prog/xdpgeneric', which that pattern also matches.
     _mode=$(bs_xdp_mode "$BS_IFACE")
     case "$_mode" in
         native)
-            bs_ok "attached to $BS_IFACE in native mode (991's GRO intact)" ;;
+            bs_ok "attached to $BS_IFACE in native mode (890's GRO intact)" ;;
         generic)
             bs_note "attached to $BS_IFACE in GENERIC mode - dev->xdp_prog is set,"
             bs_note "  so netif_elide_gro() is now true and gro_cells_receive()"
-            bs_note "  falls through to netif_rx(). 991's GRO is OFF while this"
-            bs_note "  program is attached. Expect 992 to be missing from the"
+            bs_note "  falls through to netif_rx(). 890's GRO is OFF while this"
+            bs_note "  program is attached. Expect 891 to be missing from the"
             bs_note "  kernel; with it, dev_xdp_mode() would have chosen native." ;;
         offload)
             bs_ok "attached to $BS_IFACE in hardware-offload mode" ;;
@@ -720,7 +720,7 @@ bs_xdp_load_attach() {
             return 1 ;;
         *)
             bs_note "attached to $BS_IFACE, but no xdp-capable ip could read the mode"
-            bs_note "  - cannot tell whether 991's GRO survived the attach" ;;
+            bs_note "  - cannot tell whether 890's GRO survived the attach" ;;
     esac
 }
 

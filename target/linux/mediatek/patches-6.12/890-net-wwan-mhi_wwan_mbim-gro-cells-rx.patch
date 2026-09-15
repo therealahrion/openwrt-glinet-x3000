@@ -35,10 +35,10 @@ reboot each time.
 
 That hazard was upstream's rather than this patch's, and it reaches every
 gro_cells user; what this patch did was move an MBIM netdev into the
-class. 996-net-gro_cells-opt-out-of-threaded-napi.patch closes it in core
+class. 871-net-gro_cells-opt-out-of-threaded-napi.patch closes it in core
 net by having gro_cells decline to be threaded, so with both applied the
-file is inert again and this patch costs nothing. Carrying 991 without
-996 means not writing 1 to it. The full reading, including what the two
+file is inert again and this patch costs nothing. Carrying 890 without
+871 means not writing 1 to it. The full reading, including what the two
 outages do and do not establish, is in
 x3000/docs/xdp-methods-tested.md section 23.21.
 

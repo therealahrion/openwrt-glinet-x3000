@@ -3,7 +3,7 @@
 Status: root-caused and fixed. The modem's MHI data channels run in burst-mode
 doorbell, and under sustained load nothing on this hardware ever rings the bell,
 so the downlink deadlocks holding a full ring of buffers the modem was never
-told about. Patch 993 forces unconditional doorbell writes; it is enabled on
+told about. Patch 880 forces unconditional doorbell writes; it is enabled on
 this board through `/etc/modules.d/mhi-doorbell` and has held through sustained
 250+ Mbps
 runs that used to stall.
@@ -80,7 +80,7 @@ healthy-under-load control.
 
 The kernel-side difference between this tree and `jeeves-r8` is exactly:
 
-- `990-tcp-bbr3.patch`, `991-...gro-cells-rx.patch`, `992-...native-xdp.patch`
+- `870-tcp-bbr3.patch`, `890-...gro-cells-rx.patch`, `891-...native-xdp.patch`
   (none of the three exist in `jeeves-r8`)
 - `PCI_DEBUG` off, `IKCONFIG`, `IKCONFIG_PROC`, `PREEMPT_DYNAMIC` on
 - ramoops record-size and console-size in the board dts
@@ -91,7 +91,7 @@ Marcello Barnaba's, and `790-bus-mhi-core-add-SBL-state-callback.patch` is
 Robert Marko's ath11k patch, which only touches a control-plane execution
 environment transition.
 
-That leaves 991 and 992, and they are ruled out structurally rather than by
+That leaves 890 and 891, and they are ruled out structurally rather than by
 argument:
 
 - Every line either patch changes lives inside `mhi_mbim_rx()` and the new
@@ -105,7 +105,7 @@ argument:
   `mhi_net_rx_refill_work()` is **byte-identical to upstream** too. Neither
   patch touches `mhi_queue*`, `mbim->mru`, `rx_queue_sz` or
   `mhi_get_free_desc_count`.
-- 992's one allocation change is `netdev_alloc_skb(ndev, headroom + dgram_len)`
+- 891's one allocation change is `netdev_alloc_skb(ndev, headroom + dgram_len)`
   where `headroom` is `XDP_PACKET_HEADROOM` only while a program is attached.
   With none attached - normal operation - it is zero and the allocation is
   identical to upstream.
@@ -125,13 +125,13 @@ above roughly 200-300 Mbps.
 `mhi_ev_task()` drains the downlink completion ring with no budget - the quota
 it passes is `U32_MAX` - and calls `mhi_mbim_dl_callback()` inline for every
 entry. So NTB de-aggregation, the per-datagram `netdev_alloc_skb`, the copy,
-and everything 991 added (a per-datagram flow hash, then `gro_cells_receive`)
+and everything 890 added (a per-datagram flow hash, then `gro_cells_receive`)
 all execute inside that single unbounded loop, in a tasklet, on whichever CPU
 took the interrupt. All four MHI vectors land on CPU0, so uplink and downlink
 event processing share one A53 core.
 
-That makes 991 a live suspect again for *entering* the stall, by slowing the
-drain loop until the modem has nowhere left to report completions. 992 is not:
+That makes 890 a live suspect again for *entering* the stall, by slowing the
+drain loop until the modem has nowhere left to report completions. 891 is not:
 with no XDP program attached it costs one `rcu_dereference` per datagram.
 
 `er3_bk` in `dlwatch` measures this directly - unprocessed entries in the
@@ -171,7 +171,7 @@ matches the driver exactly, which also validates the instrument.
 
 **The completion ring is never backed up.** Downlink event-ring backlog is one
 element essentially always, peaking at five, against a 1024-element ring, while
-both CPUs sit at 0-5 percent. The unbounded drain loop keeps up easily, so 991's
+both CPUs sit at 0-5 percent. The unbounded drain loop keeps up easily, so 890's
 per-datagram work in that loop is not a factor. (An earlier version of
 `dlwatch` reported a recurring backlog of 14352 here. That was a bug of mine:
 `off()` masked every pointer to the 0x800 data-ring size, so event offsets
@@ -287,7 +287,7 @@ or the doorbell logic, and the one `mhi_ring_chan_db` change in `main.c` is the
 removal of the unrelated `pre_alloc`/auto-queue path, which never applied here
 (`pre_alloc` comes from `MHI_CH_INBOUND_ALLOC_BUFS`, and IP_HW0_MBIM does not
 set it). `MHI_CHANNEL_CONFIG_HW_UL`/`_DL` in master still use
-`MHI_DB_BRST_ENABLE` with `doorbell_mode_switch = true`, so 993 is not heading
+`MHI_DB_BRST_ENABLE` with `doorbell_mode_switch = true`, so 880 is not heading
 for a conflict either.
 
 Qualcomm's own downstream device-tree binding is the closest thing to a spec:
@@ -356,14 +356,14 @@ cycling that rings the downlink doorbell. Pinning the endpoint at D0 with
 
 stops those transitions entirely, which should make the doorbell exposure
 permanent rather than intermittent. That is the next test: if stalls get worse
-or become constant, the doorbell mechanism is confirmed and 993 is the fix; if
+or become constant, the doorbell mechanism is confirmed and 880 is the fix; if
 they stop, power transitions were causing them and the doorbell is innocent.
 
 ## Confirmed: the deadlock, and then the fix
 
 ### The capture that settles it
 
-2026-09-10 09:26, on an image carrying 993 with the parameter off.
+2026-09-10 09:26, on an image carrying 880 with the parameter off.
 
     09:26:29  rx=2005672  tx=694409  irq91=68126  dl_qd=127  dl_free=0
     09:27:12  rx=2005672  tx=695170  irq91=68126  dl_qd=127  dl_free=0
@@ -375,7 +375,7 @@ buffer starvation outright: the host had done everything it could and the modem
 had consumed nothing.
 
 Everything else was healthy at the same instant. Downlink completion-ring
-backlog 1 of 1024 with both CPUs at 0-6 percent, which exonerates 991 and 992
+backlog 1 of 1024 with both CPUs at 0-6 percent, which exonerates 890 and 891
 for *entering* the stall as well as during it - the open question left by the
 correction above. `m0`/`m3` frozen at 1503/1502, so no power transitions were
 happening. Radio fine: RSRP -100, SINR 17, bearer up 37,128 s.
@@ -402,10 +402,10 @@ stalls, in the same 200-300 Mbps band where they used to appear.
 
 ### Still open
 
-The controlled reverse test - turn 993 back off, reproduce at the same
+The controlled reverse test - turn 880 back off, reproduce at the same
 throughput, confirm the deadlock returns - has not been completed. The first
 attempt did not take: the parameter was written but the rebind read it too
-early, so 993 was still active for that probe. Until that run exists the
+early, so 880 was still active for that probe. Until that run exists the
 evidence is strong but one-directional.
 
 ### How it is enabled

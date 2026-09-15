@@ -161,7 +161,7 @@ check() {
 
 	# bs_xdp_mode rather than a 'prog/xdp' grep: the two spellings iproute2
 	# uses, prog/xdp and prog/xdpgeneric, both match that pattern, and which
-	# one is present decides whether 991's GRO is running. See the attach site.
+	# one is present decides whether 890's GRO is running. See the attach site.
 	_pre=$(bs_xdp_mode "$IFACE")
 	case "$_pre" in
 		none|-) : ;;

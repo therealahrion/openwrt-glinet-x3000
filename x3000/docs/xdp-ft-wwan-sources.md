@@ -337,12 +337,12 @@ was copied from.
 ## Things the source depends on, each read from v6.12.103
 
 - `bpf_xdp_flow_lookup()` resolves its flowtable from `xdp->rxq->dev`. On
-  `wwan0` that is the real netdev, because 992 runs the program through
+  `wwan0` that is the real netdev, because 891 runs the program through
   `do_xdp_generic()`, whose rxq comes from `netif_get_rxqueue(skb)`
   (`dev.c:5079`). On the wired ports it is `eth->dummy_dev` and every lookup
   misses — which is why this program is for `wwan0` and nowhere else.
 - The packet has no Ethernet header. `wwan0` is `ARPHRD_RAWIP` (519) with
-  `hard_header_len` 0, and 991 anchors `mac_header` at `skb->data`, so
+  `hard_header_len` 0, and 890 anchors `mac_header` at `skb->data`, so
   `mac_len` is 0 and the IP header is at `ctx->data`. The in-tree selftest this
   is modelled on parses `ethhdr` and would read the first two octets of the
   source address as an EtherType.
@@ -378,7 +378,7 @@ was copied from.
   (`nf_flow_table_offload.c:1258`) and the device is never inserted into the XDP
   hashtable, so every lookup returns `-ENOENT`.
 - `wwan0` reaches the flowtable at all only because of this tree's firewall4
-  patch `001-flowtable-fall-back-to-l3-device`.
+  patch `900-flowtable-fall-back-to-l3-device`.
 
 ## State
 

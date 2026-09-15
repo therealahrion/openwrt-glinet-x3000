@@ -182,7 +182,7 @@ CONFIG_FEED_custom=m
 # (ModemManager + mainline MHI/MBIM, quectel-5g-tools with its
 # 5g-watchdog) is vjt's, untouched. NO QModem, NO qosify, NO sqm. zram
 # swap is active as of 2026-09-11 (was kmod-only before that).
-# Companion pieces: target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch
+# Companion pieces: target/linux/mediatek/patches-6.12/870-tcp-bbr3.patch
 # (BBRv3), 3 lines appended to target/linux/mediatek/filogic/config-6.12
 # (IKCONFIG, IKCONFIG_PROC, PREEMPT_DYNAMIC — not menu-exposed, so they
 # can't live here), x3000/files-common/etc/sysctl.d/{11,20,30}-*.conf.
@@ -279,7 +279,7 @@ CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
 CONFIG_PACKAGE_kmod-nft-offload=y
 
 # --- BBRv3 ---------------------------------------------------------------
-# vjt's config.common already sets kmod-tcp-bbr=y; with the 990 patch in
+# vjt's config.common already sets kmod-tcp-bbr=y; with the 870 patch in
 # the tree that module IS BBRv3 (tcp_bbr.c 2407 lines, MODULE_VERSION 3).
 # The package's own /etc/sysctl.d/12-tcp-bbr.conf keeps bbr the boot
 # default, as it already is on vjt's builds. Restated here for clarity.
@@ -482,6 +482,33 @@ CONFIG_PACKAGE_ucode-mod-lua=y
 # /etc/config/luci pointing at it, and a theme that fails to render leaves no
 # way back through the UI.
 CONFIG_PACKAGE_luci-theme-argon=y
+
+# --- On-box text and binary tools ----------------------------------------
+#
+# coreutils itself installs NOTHING. Its install recipe is literally `true`
+# and it is a MENU:=1 parent; each applet is a separate coreutils-<name>
+# package that DEPENDS on it, so the dependency runs the opposite way from
+# what the name suggests. Selecting the parent alone gives an empty image
+# slot, which is why the applets are named here one by one.
+#
+# Busybox on this target already provides dd, so coreutils-dd is only for
+# the GNU version's extra options. It does NOT provide od, base32, base64
+# or xxd - all four default to n in Config-defaults.in - which is why the
+# verifiers had to fall back to hex through xxd rather than base64.
+CONFIG_PACKAGE_coreutils=y
+CONFIG_PACKAGE_coreutils-base32=y
+CONFIG_PACKAGE_coreutils-base64=y
+CONFIG_PACKAGE_coreutils-dd=y
+CONFIG_PACKAGE_coreutils-od=y
+
+# diffutils: real diff/cmp for comparing captures and configs on the box.
+CONFIG_PACKAGE_diffutils=y
+
+# xxd lives in the vim source package but builds as its own package with no
+# DEPENDS, so this pulls the tool and none of vim. It is what makes a BPF
+# object pasteable as hex into a serial console, which is the only transport
+# that works when the box cannot fetch and busybox has no base64.
+CONFIG_PACKAGE_xxd=y
 
 # --- Explicitly OUT of the lean image (guards; last line wins) ------------
 # CONFIG_PACKAGE_qosify is not set

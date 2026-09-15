@@ -29,7 +29,7 @@ If the router is affected too:
 
 | what the columns show | what it means |
 |---|---|
-| `dl_db` frozen while `dl_wp` keeps moving, `irq91` flat | the burst-mode doorbell case; 993 is the fix |
+| `dl_db` frozen while `dl_wp` keeps moving, `irq91` flat | the burst-mode doorbell case; 880 is the fix |
 | `dl_qd` collapsing toward 0 | host ran out of RX buffers, which would make it mine |
 | RSRP or SINR falling apart in `5g-info` | the radio; no code change helps |
 | `er3_bk` climbing toward 1023 | the event drain loop fell behind |
@@ -45,9 +45,9 @@ Check whether `rx` was still climbing through the window before calling it a
 stall; on 2026-09-10 a six-second dump turned out to have rx moving at twice
 its average rate.
 
-## 4. Do not touch 993 during a hang
+## 4. Do not touch 880 during a hang
 
-**993 is already on.** The image sets it at every boot, from
+**880 is already on.** The image sets it at every boot, from
 `x3000/files-common/etc/modules.d/mhi-doorbell`, so
 `/sys/module/mhi/parameters/force_db_brst_disable` reads `Y` on a running box.
 Corrected 2026-09-12; this page previously said to turn it on, which was true

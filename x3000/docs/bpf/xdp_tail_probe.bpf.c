@@ -1,6 +1,6 @@
 // Minimal discriminator: does bpf_xdp_adjust_tail() have room to grow?
 //
-// 999 allocates XDP_PACKET_HEADROOM + datagram + SKB_DATA_ALIGN(sizeof
+// 893 allocates XDP_PACKET_HEADROOM + datagram + SKB_DATA_ALIGN(sizeof
 // (struct skb_shared_info)) and nothing else, so xdp_data_hard_end() lands
 // at the end of the datagram and growing the tail must fail with -EINVAL.
 // The generic path runs the program over an skb whose allocation kmalloc

@@ -378,14 +378,15 @@ x3000/
                                    analysis, and how it was settled.
 │   ├── wan-stall-runbook.md       What to do when the WAN hangs. Capture
                                    first; do not fix it.
-│   ├── 993-upstream-report.md     Draft report of the MHI doorbell
+│   ├── mhi-upstream-report.md     Draft report of the MHI doorbell
                                    deadlock for the MHI maintainers.
-│   ├── 992-upstream-submission.md Plan for sending 991 and 992 to netdev,
+│   ├── mbim-upstream-plan.md      Plan for sending 890 and 891 to netdev,
                                    with the reviewer answers worked out.
-│   ├── verify-xdp.sh              On-router verifier for the 991-999 XDP
+│   ├── verify-xdp.sh              On-router verifier for the 870-893 XDP
                                    platform. Extend this rather than
                                    writing another one-off sampler.
-│   ├── verify-xdp-sources.md      The BPF programs that script embeds.
+│   ├── verify-xdp-sources.md      The BPF programs it loads, and their
+                                   checksums.
 │   ├── bpf/                       Their compiled objects, fetched by the
                                    script at run time.
 │   ├── gro-backlog-ab.sh          Load-driven A/B harness for GRO and
@@ -435,19 +436,19 @@ target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
 target/linux/mediatek/patches-6.12/   My kernel patches. Numbered 99x so
-                        they sort last and stay obviously mine. 992
-                        applies after 991; the rest are independent.
-├── 990-tcp-bbr3.patch                     BBRv3.
-├── 991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
+                        they sort last and stay obviously mine. 891
+                        applies after 890; the rest are independent.
+├── 870-tcp-bbr3.patch                     BBRv3.
+├── 890-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
                                            Modem RX through gro_cells.
-├── 992-net-wwan-mhi_wwan_mbim-native-xdp.patch
+├── 891-net-wwan-mhi_wwan_mbim-native-xdp.patch
                                            XDP hook on the same path.
-├── 993-bus-mhi-host-optional-doorbell-write.patch
+├── 880-bus-mhi-host-optional-doorbell-write.patch
                                            MHI doorbell writes.
-└── 995-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch
+└── 892-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch
                                            Modem input validation.
 package/network/config/firewall4/patches/
-└── 001-flowtable-fall-back-to-l3-device.patch
+└── 900-flowtable-fall-back-to-l3-device.patch
                         Lets an L3-only interface, which is what
                         ModemManager produces, into the flow table.
 ```

@@ -1,6 +1,6 @@
 # Sending the MBIM GRO + XDP work upstream
 
-Plan and review prep for submitting patches 991 and 992 to netdev. Written
+Plan and review prep for submitting patches 890 and 891 to netdev. Written
 2026-09-11, after the hardware audit in `xdp-methods-tested.md` section 20 gave
 the GRO claim a measurement instead of an argument.
 
@@ -125,7 +125,7 @@ coalesce first and the core would then run the program once, at `dev.c:5616`, on
 the coalesced skb alone. Per-datagram filtering disappears. That inverts the
 guarantee rather than preserving it.
 
-**What works is the shape 992 already uses, and it has in-tree precedent.** Hold
+**What works is the shape 891 already uses, and it has in-tree precedent.** Hold
 the program on a driver-private pointer, run it per datagram through the core's
 own helper, and leave `dev->xdp_prog` NULL so that neither `netif_elide_gro()` nor
 `__netif_receive_skb_core()` can see it. `do_xdp_generic()` takes the program as an
@@ -142,12 +142,12 @@ argument for exactly that purpose, and it is exported:
     tun.c:1929   ret = do_xdp_generic(xdp_prog, &skb);
     tun.c:2529   ret = do_xdp_generic(xdp_prog, &skb);
 
-`tun` never assigns `dev->xdp_prog`. So 992's driver-side code is not a workaround
+`tun` never assigns `dev->xdp_prog`. So 891's driver-side code is not a workaround
 for a missing core feature - it is the mechanism, and the only one that keeps both
 halves of the contract. None of it should be deleted or simplified away.
 
 For scale: eight in-tree drivers deliver RX through `gro_cells` - vxlan, geneve,
-bareudp, macsec, amt, pfcp, rmnet and (with 991) mhi_wwan_mbim. **None of them
+bareudp, macsec, amt, pfcp, rmnet and (with 890) mhi_wwan_mbim. **None of them
 implements `ndo_bpf` or mentions XDP at all.** This series would be the first
 `gro_cells` driver with an XDP hook, which is why the interaction has gone
 unnoticed, and why there is no existing driver to point at for precedent on this
@@ -189,25 +189,25 @@ held, by upstream code, not by the patch:
     mhi_wwan_mbim.c:296   rcu_read_lock();
     mhi_wwan_mbim.c:298   link = mhi_mbim_get_link_rcu(mbim, session);
     mhi_wwan_mbim.c:306   for (n = 0; n < nframes; n++, ...)
-    mhi_wwan_mbim.c:348       netif_rx(skbn);          <- the call 991 replaces
+    mhi_wwan_mbim.c:348       netif_rx(skbn);          <- the call 890 replaces
     mhi_wwan_mbim.c:351   rcu_read_unlock();
 
-992's `rcu_dereference(link->xdp_prog)` and its `do_xdp_generic()` call both sit
+891's `rcu_dereference(link->xdp_prog)` and its `do_xdp_generic()` call both sit
 inside that region, which brackets the whole datagram loop. No locking needs to be
 added, and none should be claimed as added.
 
 ## 3. The series: one fix plus two patches
 
-992 cannot go alone. It depends on 991 in two concrete ways:
+891 cannot go alone. It depends on 890 in two concrete ways:
 
-* `gro_cells` must exist on the link - 992's hook runs between the datagram copy
+* `gro_cells` must exist on the link - 891's hook runs between the datagram copy
   and `gro_cells_receive()`.
-* 991 anchors `skbn->protocol` and the MAC header before delivery. 992's own
+* 890 anchors `skbn->protocol` and the MAC header before delivery. 891's own
   commit message explains why the program cannot run without that: generic XDP
   computes `mac_len` as `skb->data - skb_mac_header(skb)`, and
   `netdev_alloc_skb()` leaves the MAC header at its `~0U` sentinel.
 
-**991 also has to be split, because it bundles a bug fix.** Its newlink hunk is
+**890 also has to be split, because it bundles a bug fix.** Its newlink hunk is
 unrelated to `gro_cells`:
 
         hlist_add_head_rcu(&link->hlnode, &mbim->link_list[LINK_HASH(if_id)]);
@@ -221,7 +221,7 @@ registration fails. The wwan core's `newlink` error path then calls
 pointing at a freed netdev, and `mhi_mbim_get_link_rcu()` can still find it from
 the RX callback. That is a use-after-free window, and it must not ship inside a
 net-next feature patch: **a fix belongs in `net` with a `Fixes:` tag so it reaches
-stable.** Bundled into 991 it would never be backported, and netdev would ask for
+stable.** Bundled into 890 it would never be backported, and netdev would ask for
 the split on the first review pass regardless.
 
 **Verified end to end on 2026-09-12, because the whole split rests on it.**
@@ -251,7 +251,7 @@ Reachable from userspace with `CAP_NET_ADMIN` and no modem cooperation:
 `rtnl_newlink_create()` copies the requested ifindex into `dev->ifindex` before
 calling `->newlink`, so `ip link add ... type wwan linkid N index <already-taken>`
 makes `register_netdevice()` fail at `dev_index_reserve()` after the link is
-hashed. 991 adds one more failure mode on the same path, because
+hashed. 890 adds one more failure mode on the same path, because
 `gro_cells_init()` in `ndo_init` can return `-ENOMEM`.
 
 The tag, confirmed from two independent upstream patches that carry it:
@@ -265,7 +265,7 @@ So the submission is one fix plus a two-patch feature series:
     [PATCH net-next 1/2] net: wwan: mhi_wwan_mbim: deliver RX datagrams through gro_cells
     [PATCH net-next 2/2] net: wwan: mhi_wwan_mbim: XDP hook on the RX datagram path
 
-The fix goes first and separately. 991 then drops that hunk and keeps only the
+The fix goes first and separately. 890 then drops that hunk and keeps only the
 gro_cells conversion. Check that net-next is open before sending the series; it
 closes during each merge window and patches sent into a closed tree are dropped
 without comment.
@@ -274,15 +274,15 @@ without comment.
 
 Both messages are otherwise ready as written.
 
-**Remove the out-of-tree framing.** 992 ends with *"Out-of-tree patch for the
-GL-X3000 lean build; applies after 991."* That line goes. The dependency is
+**Remove the out-of-tree framing.** 891 ends with *"Out-of-tree patch for the
+GL-X3000 lean build; applies after 890."* That line goes. The dependency is
 expressed by the series ordering, not by prose.
 
 **Add a sign-off to both**, which `git format-patch -s` does automatically:
 
     Signed-off-by: Ahrion Gallegos <ahrionmgallegos@gmail.com>
 
-**Add the measurement to 992's GRO paragraph.** This is the one substantive
+**Add the measurement to 891's GRO paragraph.** This is the one substantive
 improvement available since the patch was written, and it turns the central
 justification from reasoning into evidence. Replace the paragraph beginning
 "GRO. The program is kept on link->xdp_prog" with:
@@ -304,7 +304,7 @@ justification from reasoning into evidence. Replace the paragraph beginning
     device (dev_xdp_mode()), so `ip link set dev wwan0 xdp ...` lands here
     rather than in the generic path.
 
-**Add the same kind of evidence to 991.** Append to the Details list:
+**Add the same kind of evidence to 890.** Append to the Details list:
 
     Measured on an RM520N-GL at a sustained 3.3 Mbit/s downlink: 5114 wwan0
     datagrams against 2467 IP InReceives over 20s, i.e. 2.07x aggregation,
@@ -399,7 +399,7 @@ the program run on the coalesced skb only. `tun` resolves the same tension the s
 way this patch does. What is left for the core is a visibility fix, not a
 capability one, and it belongs in its own submission.
 
-**The tun.c precedent is verified.** 992's message says *"drivers/net/tun.c makes
+**The tun.c precedent is verified.** 891's message says *"drivers/net/tun.c makes
 the same call from its own driver context for the same reason."* Checked against
 6.12.103 on 2026-09-12, and it holds in all four parts: a private
 `struct bpf_prog __rcu *xdp_prog` in `struct tun_struct` (`tun.c:210`), installed
@@ -411,7 +411,7 @@ Re-check after any rebase with:
     grep -n "do_xdp_generic\|xdp_prog" drivers/net/tun.c
 
 **Rebase risk, and it is larger than it looked.** `mhi_mbim_rx()` - the exact
-function 991 and 992 rewrite - is under active repair upstream *right now*. Looked
+function 890 and 891 rewrite - is under active repair upstream *right now*. Looked
 up 2026-09-12:
 
 | posted | patch | what it does |
@@ -423,9 +423,9 @@ up 2026-09-12:
 Both v2 patches carry `Fixes: aa730a9905b7` and `Cc: stable`, and both land in the
 datagram loop. Consequences:
 
-* **They restructure the loop 991/992 patch.** The `mhi_mbim_rx_drop()` helper
+* **They restructure the loop 890/891 patch.** The `mhi_mbim_rx_drop()` helper
   changes the context around `skb_copy_bits(skb, dgram_offset, skbn->data,
-  dgram_len)`, which is inside 992's largest hunk. Rebase, do not hand-merge.
+  dgram_len)`, which is inside 891's largest hunk. Rebase, do not hand-merge.
 * **Check whether they have been applied before sending.** As of 2026-09-12 they
   were a day-old v2 on-list, not merged. Sending a feature series into an active
   review thread on the same function invites "rebase on Guanglei's set" as the
@@ -510,11 +510,11 @@ A/B and were simply taken at different downlink speeds.
 
 ## 8. Why this is worth sending
 
-991 is uncontroversial: it replaces `netif_rx()` with the mechanism every other
+890 is uncontroversial: it replaces `netif_rx()` with the mechanism every other
 callback-driven virtual driver already uses, and the aggregation number is
-measured. It stands on its own merits whatever happens to 992.
+measured. It stands on its own merits whatever happens to 891.
 
-992 is the interesting one and may not land in this shape. The mode objection is
+891 is the interesting one and may not land in this shape. The mode objection is
 legitimate. But the problem it documents is real and, as far as this work has
 found, undocumented anywhere else: **a driver that uses `gro_cells` cannot accept
 an skb-mode XDP program without silently destroying its own GRO**, because

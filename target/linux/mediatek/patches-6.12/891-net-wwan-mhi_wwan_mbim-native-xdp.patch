@@ -1,7 +1,7 @@
 From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
 Subject: net: wwan: mhi_wwan_mbim: XDP hook on the RX datagram path
 
-Stage 2 on top of the gro_cells conversion (991): run an attached XDP
+Stage 2 on top of the gro_cells conversion (890): run an attached XDP
 program on every de-aggregated MBIM datagram, before GRO/stack delivery.
 Implements ndo_bpf (XDP_SETUP_PROG), a per-link rcu-protected prog
 pointer, and NETDEV_XDP_ACT_BASIC|REDIRECT advertisement, so ip/libxdp
@@ -43,7 +43,7 @@ GRO. The program is kept on link->xdp_prog, not dev->xdp_prog.
 dev->xdp_prog is what netif_elide_gro() tests, and gro_cells_receive()
 checks it on every datagram, falling back to netif_rx(); attaching the
 same program in XDP_MODE_SKB would therefore silently switch off the GRO
-991 exists to provide. Owning ndo_bpf also makes XDP_MODE_DRV the default
+890 exists to provide. Owning ndo_bpf also makes XDP_MODE_DRV the default
 attach mode for this device (dev_xdp_mode()), so `ip link set dev wwan0
 xdp ...` lands here rather than in the generic path.
 
@@ -99,7 +99,7 @@ Honest ceiling, by design: MBIM NTB aggregation means datagrams share one
 buys the earliest available drop point and driver-context filtering, not
 the zero-copy page-flip fast path XDP has on real NICs.
 
-Out-of-tree patch for the GL-X3000 lean build; applies after 991.
+Out-of-tree patch for the GL-X3000 lean build; applies after 890.
 
 --- a/drivers/net/wwan/mhi_wwan_mbim.c
 +++ b/drivers/net/wwan/mhi_wwan_mbim.c

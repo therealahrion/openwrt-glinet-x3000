@@ -1,8 +1,8 @@
 # Native XDP on wwan0: design note
 
-Status: **written as 999. Nothing here is built, and nothing here is measured.**
+Status: **written as 893. Nothing here is built, and nothing here is measured.**
 Every API contract below was read at `v6.12.103`; every statement about this
-tree's driver was read against the source after 991, 992 and 995 are applied.
+tree's driver was read against the source after 890, 891 and 892 are applied.
 
 This supersedes the framing in W0026. It is not a page-pool rewrite.
 
@@ -29,7 +29,7 @@ Every datagram is **copied out of the NTB into its own fresh allocation**. No
 clone, no sharing, no aliasing with any other packet. The buffer is exclusively
 owned from the moment it exists.
 
-992 then added headroom to that allocation:
+891 then added headroom to that allocation:
 
 ```c
 headroom = xdp_prog ? XDP_PACKET_HEADROOM : 0;
@@ -49,9 +49,9 @@ wrapped in an skb *before* the program runs instead of after.
 
 ## What the driver has, and what it lacks
 
-Counted in the tree with 991 through 998 applied.
+Counted in the tree with the full series applied.
 
-| present (992 built this) | count | missing | count |
+| present (891 built this) | count | missing | count |
 |---|---|---|---|
 | `ndo_bpf` | 4 | `xdp_rxq_info_reg` | 0 |
 | `xdp_prog` | 12 | `xdp_init_buff` | 0 |
@@ -78,7 +78,7 @@ returns `NULL` if `current->bpf_net_context` is already set, and
 `bpf_net_ctx_clear(NULL)` is a no-op (`:786`). So the set/clear pair can be
 taken unconditionally around the loop without checking whether something
 upstream already took it. `do_xdp_generic()` (`dev.c:5290`) uses exactly this
-idiom, which is what 992 currently relies on.
+idiom, which is what 891 currently relies on.
 
 **Registration** (`include/net/xdp.h:339`):
 
@@ -130,7 +130,7 @@ data       = hard_start + XDP_PACKET_HEADROOM
 
 The copy is unchanged - `skb_copy_bits(skb, dgram_offset, data, dgram_len)` -
 same source, same length, same cost as today. Nothing about the NTB parse or
-995's bounds checks changes.
+892's bounds checks changes.
 
 Note what this arithmetic means for `bpf_xdp_adjust_tail()`: `xdp_data_hard_end`
 lands exactly at the end of the datagram, so there is **no room to grow the
@@ -176,7 +176,7 @@ program on it, and frees it. On `XDP_REDIRECT` the 256 bytes of headroom make
 
 **cpumap is the point.** The MBIM receive path runs on one CPU - the MHI DL
 tasklet - and cpumap redirect is the mechanism for moving per-packet work off
-it. That is also why W0045 (998) had to land first: without it,
+it. That is also why W0045 (873) had to land first: without it,
 `__xdp_build_skb_from_frame()` runs `eth_type_trans()` over the IP header and
 `ip_forward()` drops every redirected packet.
 
@@ -203,7 +203,7 @@ tasklet context rather than copied from an Ethernet driver.
 **Memory accounting changes.** Today's `netdev_alloc_skb()` charges an skb per
 datagram. A frag allocation with a deferred `build_skb()` charges differently,
 and the `truesize` seen by GRO and by socket accounting will not be what it was.
-991's gro_cells path is downstream of this, so any change there needs
+890's gro_cells path is downstream of this, so any change there needs
 re-measuring, not assuming.
 
 **XDP_TX needs `ndo_xdp_xmit`** on the MHI UL path. Deliberately out of scope
@@ -226,8 +226,8 @@ yet.
 3. **XDP_PASS end to end**, confirming forwarded traffic still works and that
    `bpf_xdp_adjust_head()` moving the start does not break the rejoin -
    this is where the `skb_reserve`/`skb_put` arithmetic gets tested.
-4. **XDP_REDIRECT into a cpumap**, which requires 998. Forwarded traffic must
-   survive; without 998 it will not, and confirming that failure first is a
+4. **XDP_REDIRECT into a cpumap**, which requires 873. Forwarded traffic must
+   survive; without 873 it will not, and confirming that failure first is a
    direct reproduction of W0045.
 5. **A program that grows the tail**, confirming `-EINVAL` rather than
    corruption, given the allocation leaves no tail slack.
@@ -249,7 +249,7 @@ stated position and stays theirs.
 
 Alexander Lobakin, in the same thread, listed what would break on such a device:
 "XDP_TX, XDP_REDIRECT won't work properly -- cpumap Rx, each .ndo_xdp_xmit()
-implementation". He was right on both counts. cpumap Rx is W0045, which 998
+implementation". He was right on both counts. cpumap Rx is W0045, which 873
 fixes; `ndo_xdp_xmit` is the XDP_TX limitation recorded above. Neither was
 discovered here first, and saying so is cheaper than having it said back.
 
@@ -257,7 +257,7 @@ discovered here first, and saying so is cheaper than having it said back.
 
 It does not give `wwan0` AF_XDP zero-copy, which needs `MEM_TYPE_XSK_BUFF_POOL`
 and a real driver-owned queue. It does not change the NTB parse, the de-aggregation,
-or 995's bounds checks. It does not remove the per-datagram copy - that copy is
+or 892's bounds checks. It does not remove the per-datagram copy - that copy is
 inherent to MBIM aggregation and is what makes the buffer exclusively owned in
 the first place. And it does not touch the frame engine, which has nothing to do
 with this path.

@@ -29,11 +29,11 @@
  *     OFF (nf_flow_table_offload.c:1258), so keep the firewall dropdown on
  *     software flow offloading. Hardware offload makes every lookup -ENOENT.
  *   - wwan0 reaches the flowtable at all only because of this tree's firewall4
- *     patch 001-flowtable-fall-back-to-l3-device. Stock fw4 builds the device
+ *     patch 900-flowtable-fall-back-to-l3-device. Stock fw4 builds the device
  *     list from ifc.device, and a proto modemmanager interface has only
  *     l3_device.
  *   - The lookup resolves the device from xdp->rxq->dev. On wwan0 that is the
- *     real netdev: patch 992 runs the program through do_xdp_generic(), whose
+ *     real netdev: patch 891 runs the program through do_xdp_generic(), whose
  *     rxq comes from netif_get_rxqueue(skb) (dev.c:5079). On the wired ports it
  *     would be eth->dummy_dev and every lookup would miss - which is why this
  *     program is for wwan0 and nowhere else.
@@ -42,7 +42,7 @@
  *     So eth1 and eth0 are legal targets and each other's peers are not.
  *
  * The packet has no Ethernet header. wwan0 is ARPHRD_RAWIP with hard_header_len
- * 0, and 991 anchors mac_header at skb->data, so do_xdp_generic() computes
+ * 0, and 890 anchors mac_header at skb->data, so do_xdp_generic() computes
  * mac_len 0 and the IP header sits at ctx->data. A program written against
  * ethhdr - including the in-tree selftest this is modelled on - reads the first
  * two octets of the source address as an EtherType here. With no EtherType on

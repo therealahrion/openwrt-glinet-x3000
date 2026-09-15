@@ -18,7 +18,7 @@
  * whether the kfunc itself works.
  *
  * The packet has no Ethernet header: wwan0 is ARPHRD_RAWIP (519) with
- * hard_header_len 0, and 991 anchors mac_header at skb->data, so
+ * hard_header_len 0, and 890 anchors mac_header at skb->data, so
  * do_xdp_generic() computes mac_len 0 and the IP header sits at ctx->data. The
  * selftest this is modelled on parses ethhdr and would read the first two
  * octets of the source address as an EtherType. With no EtherType on the wire

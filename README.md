@@ -52,8 +52,8 @@ and how to read its state on a running router:
 
 ### My Patches
 
-* **991 — modem receive through gro_cells**
-  `target/linux/mediatek/patches-6.12/991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`
+* **890 — modem receive through gro_cells**
+  `target/linux/mediatek/patches-6.12/890-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`
 
   <pre>
   Description:    The modem hands the host one bundle carrying many packets
@@ -66,20 +66,20 @@ and how to read its state on a running router:
   Impact(s):      Gives wwan0 real NAPI contexts, so "ethtool -K wwan0 gro
                   off" becomes a live kill switch. Nothing outside the MBIM
                   receive path changes. It also makes the per-device
-                  "threaded" switch do something on wwan0, which is why 996
+                  "threaded" switch do something on wwan0, which is why 871
                   exists.
   Limitation(s):  Downlink only; the upload side is untouched. Packets have
                   to arrive close together for there to be anything to
                   merge, so it does little at low rates. Carrying it
-                  without 996 means never writing 1 to
+                  without 871 means never writing 1 to
                   /sys/class/net/wwan0/threaded, which killed the WAN
                   twice.
   Attribution(s): Mine, written for this fork. Background:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
-* **992 — XDP on the modem interface**
-  `target/linux/mediatek/patches-6.12/992-net-wwan-mhi_wwan_mbim-native-xdp.patch`
+* **891 — XDP on the modem interface**
+  `target/linux/mediatek/patches-6.12/891-net-wwan-mhi_wwan_mbim-native-xdp.patch`
 
   <pre>
   Description:    Gives the modem's receive path its own XDP hook, so eBPF
@@ -87,7 +87,7 @@ and how to read its state on a running router:
                   network card and see each packet before the rest of the
                   stack does.
   Benefit(s):     Filtering, sampling and redirect on the WAN side, AF_XDP
-                  included, without giving up the batching 991 adds. The
+                  included, without giving up the batching 890 adds. The
                   kernel's fallback way of attaching XDP here switched that
                   batching off, so it used to be one or the other.
   Impact(s):      Owning ndo_bpf makes driver mode the default attach mode
@@ -97,7 +97,7 @@ and how to read its state on a running router:
                   packet is safe to forward behind: the hook repairs the
                   receive metadata the kernel derives from an Ethernet
                   header this link does not have.
-  Limitation(s):  Needs 991. wwan0 is a raw-IP link, so a program written
+  Limitation(s):  Needs 890. wwan0 is a raw-IP link, so a program written
                   against an Ethernet header misreads the first bytes of
                   the source address as an EtherType.
   Attribution(s): Mine, written for this fork. The same-shaped hook in the
@@ -105,8 +105,8 @@ and how to read its state on a running router:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
-* **993 — MHI doorbell writes**
-  `target/linux/mediatek/patches-6.12/993-bus-mhi-host-optional-doorbell-write.patch`
+* **880 — MHI doorbell writes**
+  `target/linux/mediatek/patches-6.12/880-bus-mhi-host-optional-doorbell-write.patch`
 
   <pre>
   Description:    Adds a switch to the MHI bus driver that makes the host
@@ -125,11 +125,11 @@ and how to read its state on a running router:
   Attribution(s): Mine, written for this fork. Capture, analysis and the
                   draft report for the MHI maintainers:
                       - <a href="x3000/docs/downlink-stall.md">x3000/docs/downlink-stall.md</a>
-                      - <a href="x3000/docs/993-upstream-report.md">x3000/docs/993-upstream-report.md</a>
+                      - <a href="x3000/docs/mhi-upstream-report.md">x3000/docs/mhi-upstream-report.md</a>
   </pre>
 
-* **996 — gro_cells declines threaded NAPI**
-  `target/linux/mediatek/patches-6.12/996-net-gro_cells-opt-out-of-threaded-napi.patch`
+* **871 — gro_cells declines threaded NAPI**
+  `target/linux/mediatek/patches-6.12/871-net-gro_cells-opt-out-of-threaded-napi.patch`
 
   <pre>
   Description:    The kernel's per-device threaded switch moves packet
@@ -152,14 +152,14 @@ and how to read its state on a running router:
   Limitation(s):  It removes the hazard rather than making threaded
                   gro_cells work. Binding each thread to the CPU whose
                   queue it serves would do that, and is the larger change.
-                  Nothing needs it without 991, which is what puts
+                  Nothing needs it without 890, which is what puts
                   gro_cells on wwan0 in the first place.
   Attribution(s): Mine, written for this fork. Background, section 23.21:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
-* **997 — a device may decline the forward path walk**
-  `target/linux/mediatek/patches-6.12/997-net-forward-path-decline-without-failing.patch`
+* **872 — a device may decline the forward path walk**
+  `target/linux/mediatek/patches-6.12/872-net-forward-path-decline-without-failing.patch`
 
   <pre>
   Description:    Before offloading a connection the kernel walks the stack
@@ -186,15 +186,15 @@ and how to read its state on a running router:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
-* **998 - XDP frame rebuild stops assuming Ethernet**
-  `target/linux/mediatek/patches-6.12/998-net-xdp-no-ethernet-assumption-rebuilding-skb.patch`
+* **873 - XDP frame rebuild stops assuming Ethernet**
+  `target/linux/mediatek/patches-6.12/873-net-xdp-no-ethernet-assumption-rebuilding-skb.patch`
 
   <pre>
   Description:    __xdp_build_skb_from_frame() ends with an unconditional
                   eth_type_trans(), which is right only when the ingress
                   device has an Ethernet header. An xdp_frame carries no
                   link-layer information, so the device is the only thing
-                  that can answer, and it was never asked. 998 asks it,
+                  that can answer, and it was never asked. 873 asks it,
                   and on a non-Ethernet device does the same work minus
                   the header it does not have.
   Benefit(s):     XDP_REDIRECT into a cpumap survives on a raw-IP link.
@@ -207,7 +207,7 @@ and how to read its state on a running router:
   Limitation(s):  Native XDP only. The generic path tags its skbs into
                   the same ring and never rebuilds them, so nothing can
                   reach this today on a device that has no native XDP.
-                  It is a precondition for 999 rather than a result of
+                  It is a precondition for 893 rather than a result of
                   it: native XDP on wwan0 delivers nothing through cpumap
                   until this lands too.
   Attribution(s): Mine, written for this fork. Alexander Lobakin
@@ -219,16 +219,16 @@ and how to read its state on a running router:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
-* **999 - native XDP on the modem's receive path**
-  `target/linux/mediatek/patches-6.12/999-net-wwan-mhi_wwan_mbim-native-xdp-datagrams.patch`
+* **893 - native XDP on the modem's receive path**
+  `target/linux/mediatek/patches-6.12/893-net-wwan-mhi_wwan_mbim-native-xdp-datagrams.patch`
 
   <pre>
-  Description:    Replaces 992's generic XDP hook with a native one. Each
+  Description:    Replaces 891's generic XDP hook with a native one. Each
                   de-aggregated datagram is copied into a bare page frag
                   and the program runs on an xdp_buff; an skb is built
                   only if the verdict is XDP_PASS. Possible because the
                   driver has always copied every datagram out of the NTB
-                  into its own allocation, and 992 added the headroom.
+                  into its own allocation, and 891 added the headroom.
   Benefit(s):     XDP_DROP allocates no skb at all, where the generic
                   path allocated one, ran the program on it and freed it.
                   XDP_REDIRECT can reach a cpumap, which is how per-packet
@@ -241,11 +241,11 @@ and how to read its state on a running router:
                   running natively on hardware 2026-09-15. Changes
                   how receive memory is accounted, since build_skb() on a
                   frag reports a different truesize than netdev_alloc_skb,
-                  which lands upstream of 991's gro_cells.
+                  which lands upstream of 890's gro_cells.
   Limitation(s):  XDP_TX is not zero-copy - no ndo_xdp_xmit here, so the
                   frame re-enters the ordinary transmit path. No tail
                   slack, so a program growing the packet gets -EINVAL.
-                  The cpumap payoff needs 998, and that is the part
+                  The cpumap payoff needs 873, and that is the part
                   still unmeasured, along with XDP_DROP's saved
                   allocation and any performance figure.
   Attribution(s): Mine, written for this fork. Design, hazards and the
@@ -254,7 +254,7 @@ and how to read its state on a running router:
   </pre>
 
 * **firewall4 — flow offload on a modem WAN**
-  `package/network/config/firewall4/patches/001-flowtable-fall-back-to-l3-device.patch`
+  `package/network/config/firewall4/patches/900-flowtable-fall-back-to-l3-device.patch`
 
   <pre>
   Description:    A one-line fix to OpenWrt's firewall so an interface that
@@ -278,8 +278,8 @@ and how to read its state on a running router:
 
 ### Additional Patches
 
-* **990 — BBRv3**
-  `target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch`
+* **870 — BBRv3**
+  `target/linux/mediatek/patches-6.12/870-tcp-bbr3.patch`
 
   <pre>
   Description:    Replaces the kernel's BBR v1 congestion control with
@@ -299,8 +299,8 @@ and how to read its state on a running router:
                       - <a href="https://github.com/google/bbr">google/bbr, the BBRv3 development branch</a>
   </pre>
 
-* **995 — modem input validation**
-  `target/linux/mediatek/patches-6.12/995-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch`
+* **892 — modem input validation**
+  `target/linux/mediatek/patches-6.12/892-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch`
 
   <pre>
   Description:    Checks values the stock driver takes from the modem
@@ -316,8 +316,8 @@ and how to read its state on a running router:
                   the open-coded counting on the existing unknown-protocol
                   path.
   Limitation(s):  A local carry with an expiry date, and not the version to
-                  send upstream: it applies after 992 because it edits the
-                  same loop 991 and 992 rewrite. Two of its three checks
+                  send upstream: it applies after 891 because it edits the
+                  same loop 890 and 891 rewrite. Two of its three checks
                   can go once the upstream fixes reach 6.12.y; the bounds
                   check has no upstream successor, because the patch that
                   added one was withdrawn.
@@ -325,10 +325,10 @@ and how to read its state on a running router:
                   three checks, on the suggestion of the driver's
                   maintainer Loic Poulain; on-list but not merged as of
                   2026-09-12. The implementation here is mine, against the
-                  post-992 tree. Who posted what, and what was withdrawn:
+                  post-891 tree. Who posted what, and what was withdrawn:
                       - <a href="https://lore.kernel.org/r/20260911021734.1396599-1-zhugl3@xiaopeng.com">netdev v2 1/3: guard against a cyclic NDP chain</a>
                       - <a href="https://lore.kernel.org/r/20260911021734.1396599-2-zhugl3@xiaopeng.com">netdev v2 2/3: check skb_copy_bits() return value</a>
-                      - <a href="x3000/docs/992-upstream-submission.md">x3000/docs/992-upstream-submission.md</a>
+                      - <a href="x3000/docs/mbim-upstream-plan.md">x3000/docs/mbim-upstream-plan.md</a>
   </pre>
 
 ### Enhancements
@@ -346,7 +346,7 @@ and how to read its state on a running router:
                   and kmod-xdp-sockets-diag to the image.
   Benefit(s):     Portable eBPF binaries run unmodified here instead of
                   being cross-compiled against a matching kernel
-                  elsewhere, and 992's XDP hook has something to attach.
+                  elsewhere, and 891's XDP hook has something to attach.
   Impact(s):      Debug info has to stay un-reduced for BTF to build, which
                   costs image size. Kernel modules are tied to this exact
                   build, so they are baked in rather than installable

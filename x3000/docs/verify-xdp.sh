@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # GL-X3000 (MT7981A, aarch64 LE) — verify the XDP hooks this tree carries on
-# the modem's receive path (992's generic hook, 999's native one), the kernel
+# the modem's receive path (891's generic hook, 893's native one), the kernel
 # config claims, and the telegraf footprint. Nothing is compiled on the box.
 #
 #   sh verify-xdp.sh              read-only + safe attach tests
@@ -280,18 +280,18 @@ if [ "$1" -lt 500 ]; then
 	skip "only $1 packets seen — too little traffic for a meaningful ratio"
 	BASE_RATIO=0
 elif awk "BEGIN{exit !($3 > 1.2)}"; then
-	ok "gro_cells is aggregating (${3}x) — 991 is doing its job"
+	ok "gro_cells is aggregating (${3}x) — 890 is doing its job"
 else
 	info "aggregation ${3}x — low, but that is traffic-shape dependent, not a failure by itself"
 fi
 
-hdr "5. attach XDP in DRV mode — the 992 ndo_bpf test"
+hdr "5. attach XDP in DRV mode — the 891 ndo_bpf test"
 if $IP link set dev "$WANIF" xdp obj $D/xdp_pass.o sec xdp 2>$D/err; then
 	MODE=$($IP -d link show "$WANIF" | grep -oE 'xdpgeneric|xdpdrv|xdp' | head -1)
 	if [ "$MODE" = "xdpgeneric" ]; then
 		bad "attached in GENERIC mode — ndo_bpf is not being used"
 	else
-		ok "attached in DRIVER mode ('$MODE') — 992's ndo_bpf captured it"
+		ok "attached in DRIVER mode ('$MODE') — 891's ndo_bpf captured it"
 	fi
 	$IP -d link show "$WANIF" | grep -o 'prog/xdp id [0-9]* name [a-z_]*' | sed 's/^/          /'
 	ATTACHED=1
@@ -330,19 +330,19 @@ $IP -d link show "$WANIF" | grep -q "prog/xdp" && bad "program still attached af
 fi
 
 hdr "8b. skb-mode attach must collapse GRO — the gro_cells interaction"
-# This is the inverse of step 6 and the reason 992 owns ndo_bpf at all.
+# This is the inverse of step 6 and the reason 891 owns ndo_bpf at all.
 # generic_xdp_install() stores the program on dev->xdp_prog; netif_elide_gro()
 # tests that pointer, and gro_cells_receive() consults it per datagram
 # (gro_cells.c:23), dropping to bare netif_rx(). So attaching the SAME program in
 # skb mode should switch GRO off. If it does not, the premise behind keeping the
-# program on link->xdp_prog is wrong and 992 can be simplified.
+# program on link->xdp_prog is wrong and 891 can be simplified.
 if [ "$BASE_RATIO" = "0" ]; then
 	skip "no usable baseline from step 4"
 elif $IP link set dev "$WANIF" xdpgeneric obj $D/xdp_pass.o sec xdp 2>$D/err; then
 	info "attached in skb mode; measuring for 12s ..."
 	set -- $(gro_measure 12)
 	info "skb mode: rx_packets=$1  InReceives=$2  aggregation=${3}x  dropped=$4  bytes/skb=$5"
-	# Must be "xdpgeneric off", not "xdp off". With 992's ndo_bpf present,
+	# Must be "xdpgeneric off", not "xdp off". With 891's ndo_bpf present,
 	# dev_xdp_mode() resolves an unqualified request to XDP_MODE_DRV
 	# (net/core/dev.c:9457), so "xdp off" asks to detach a DRV program that is
 	# not there; dev_xdp_attach() then sees new_prog == cur_prog == NULL,
@@ -360,7 +360,7 @@ elif $IP link set dev "$WANIF" xdpgeneric obj $D/xdp_pass.o sec xdp 2>$D/err; th
 	elif awk "BEGIN{exit !($3 < 1.15)}"; then
 		ok "GRO collapsed to ${3}x in skb mode (baseline ${BASE_RATIO}x) — confirms the gro_cells/dev->xdp_prog interaction"
 	else
-		bad "GRO survived skb mode at ${3}x — 992's link->xdp_prog rationale does not hold, investigate"
+		bad "GRO survived skb mode at ${3}x — 891's link->xdp_prog rationale does not hold, investigate"
 	fi
 	sleep 2
 	set -- $(gro_measure 8)
@@ -466,14 +466,14 @@ info "storage / memory:"
 df -h / /overlay 2>/dev/null | sed 's/^/          /'
 free -m 2>/dev/null | sed 's/^/          /'
 
-hdr "13. native vs generic: bpf_xdp_adjust_tail has no room under 999"
+hdr "13. native vs generic: bpf_xdp_adjust_tail has no room under 893"
 
-# The one probe that separates 999's native hook from 992's generic one. Both
+# The one probe that separates 893's native hook from 891's generic one. Both
 # attach through the same ndo_bpf and both report "prog/xdp id N" with no
 # xdpgeneric qualifier, so ip -d link cannot tell them apart - that was this
 # test's original method and it was wrong.
 #
-# 999 allocates XDP_PACKET_HEADROOM + datagram + SKB_DATA_ALIGN(sizeof(struct
+# 893 allocates XDP_PACKET_HEADROOM + datagram + SKB_DATA_ALIGN(sizeof(struct
 # skb_shared_info)) and nothing more, so xdp_data_hard_end() lands at the end
 # of the datagram and growing the tail must fail with -EINVAL. The generic path
 # runs the same program over an skb whose allocation kmalloc rounded up, so the
@@ -522,7 +522,7 @@ elif tail_probe xdpdrv; then
 	if [ "$_drv" = "$EINVAL_U64" ]; then
 		ok "native: adjust_tail refused with -EINVAL - frame_sz is the true allocation"
 	elif [ "$_drv" = "0" ]; then
-		bad "native: adjust_tail SUCCEEDED - frame_sz is overstated, or this is not 999"
+		bad "native: adjust_tail SUCCEEDED - frame_sz is overstated, or this is not 893"
 		info "  an overstated frame_sz lets the memset run past the end of the buffer"
 	else
 		bad "native: adjust_tail returned $_drv - neither 0 nor -EINVAL"

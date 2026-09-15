@@ -48,13 +48,15 @@ would waste reviewer time. Drop it when the upstream versions reach
 6.12.y. The helper is named mhi_mbim_rx_error() rather than upstream's
 mhi_mbim_rx_drop() so that the collision is loud when that happens.
 
-Numbered 995, not 994: that number is retired. It was reserved earlier for a
-core gro_cells/XDP fix that the tree read showed cannot exist, and the record
-in xdp-methods-tested.md section 22.7 says so, so reusing it would make every
-future reference to "994" ambiguous.
+Numbered 892 as part of the 890-899 modem receive path group, where the four
+patches that edit mhi_wwan_mbim.c sit in apply order. Under the sequential
+numbering this tree used until 2026-09-15 it was 995, and the slot at 994 was
+left deliberately empty for a core fix that turned out not to exist -- that
+history is in xdp-methods-tested.md section 22.7, and no file carries the
+number now.
 
-Applies after 992. It edits the same datagram loop 991 and 992 rewrite,
-so its context is the post-992 one; upstream's equivalents apply to
+Applies after 891. It edits the same datagram loop 890 and 891 rewrite,
+so its context is the post-891 one; upstream's equivalents apply to
 pristine source instead.
 
 Out-of-tree patch for the GL-X3000 lean build.

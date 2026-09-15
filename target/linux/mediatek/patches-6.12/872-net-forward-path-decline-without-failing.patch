@@ -59,7 +59,7 @@ the survey that found the PPP half.
 
 One corroboration worth stating, because it shows the bug bites people
 who are not me. MediaTek's own SDK carries
-999-tnl-07-l2tp-add-fill-forward-path.patch, which implements
+893-tnl-07-l2tp-add-fill-forward-path.patch, which implements
 fill_forward_path for L2TP channels. That is a downstream workaround for
 ppp_generic.c:1610 -- the vendor hit this and papered over it for the one
 channel type they cared about rather than fixing the walk. The hook they
@@ -77,14 +77,14 @@ on any driver without a net_fill_forward_path op hits it, as does any
 non-PPPoE PPP channel and any multilink bundle. This is W0040 and it is
 worth sending upstream on its own merits.
 
-Touches core net only. It does share net/core/dev.c with 996, which an
+Touches core net only. It does share net/core/dev.c with 871, which an
 earlier version of this message wrongly denied, but the two edits are
-about 6000 lines apart -- 996 works on dev_set_threaded() and
+about 6000 lines apart -- 871 works on dev_set_threaded() and
 netif_napi_add_weight(), this one on dev_fill_forward_path() -- so they
 do not overlap and apply order between them does not matter. Verified by
 applying the full series to v6.12.103 with OpenWrt's generic patches in
-place: this one applies at --fuzz=0 and at zero offset after 996. No file
-at all is shared with 991, 992, 993 or 995.
+place: this one applies at --fuzz=0 and at zero offset after 871. No file
+at all is shared with 890, 891, 880 or 892.
 
 Out-of-tree patch for the GL-X3000 lean build.
 

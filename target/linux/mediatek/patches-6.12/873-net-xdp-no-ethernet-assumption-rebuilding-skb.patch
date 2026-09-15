@@ -94,7 +94,7 @@ under supplies one.
 Evidence: E2 throughout, read at v6.12.103. net/core/xdp.c and
 kernel/bpf/cpumap.c are pristine in this tree -- no patch here or in
 OpenWrt's generic set touches either -- so the context is upstream's.
-Verified to apply at --fuzz=0 with 990 through 997 already applied.
+Verified to apply at --fuzz=0 with 870 through 872 already applied.
 Shares no file with any of them.
 
 Out-of-tree patch for the GL-X3000 lean build.

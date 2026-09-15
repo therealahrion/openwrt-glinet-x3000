@@ -1,7 +1,7 @@
 From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
 Subject: net: wwan: mhi_wwan_mbim: run XDP natively on de-aggregated datagrams
 
-This replaces the generic XDP hook 992 added with a native one: the program
+This replaces the generic XDP hook 891 added with a native one: the program
 runs on an xdp_buff over a bare frag, and an skb is built only if the verdict
 is XDP_PASS.
 
@@ -15,7 +15,7 @@ each datagram out into its own allocation:
 	skb_copy_bits(skb, dgram_offset, skbn->data, dgram_len);
 
 No clone, no shared page, no per-packet refcount. The buffer is exclusively
-owned from the moment it exists. 992 then added XDP_PACKET_HEADROOM to that
+owned from the moment it exists. 891 then added XDP_PACKET_HEADROOM to that
 allocation. So every ingredient xdp_prepare_buff() wants was already present,
 and 256 bytes of headroom clears the 40-byte sizeof(struct xdp_frame) floor
 that xdp_convert_buff_to_frame() needs for XDP_REDIRECT. The only thing
@@ -36,7 +36,7 @@ Native is also more correct here than generic, which is worth saying because
 it is the opposite of the usual trade. bpf_prog_run_generic_xdp() reads bytes
 0..5 and 12..13 of the packet as an Ethernet destination and ethertype and
 acts on what it finds (dev.c:5093-5134). On a raw-IP link those offsets are
-inside the IP header, and 992 carries a long comment and three stores to
+inside the IP header, and 891 carries a long comment and three stores to
 repair the damage afterwards. Running the program on an xdp_buff never enters
 that code, so the entire class of misparse is absent rather than corrected.
 
@@ -60,7 +60,7 @@ Details that are load-bearing rather than stylistic:
     redirect ring is safe and the tasklet cannot migrate between the program
     run and the flush. rcu_read_lock() is already held across the loop.
   * xdp_rxq_info is registered in ndo_init and unregistered in ndo_uninit,
-    pairing with gro_cells exactly as 991 set up, so its lifetime is the
+    pairing with gro_cells exactly as 890 set up, so its lifetime is the
     netdev's registered lifetime and not the carrier state. napi_id is 0
     because this loop is not a NAPI poll.
 
@@ -69,7 +69,7 @@ Two honest limitations.
 XDP_TX is not zero-copy. There is no ndo_xdp_xmit on this driver and
 generic_xdp_tx() is not exported to modules, so the frame is wrapped in an skb
 and re-enters the ordinary transmit path. That costs a qdisc traversal, and it
-is done this way rather than dropped so the action set 992 supported is not
+is done this way rather than dropped so the action set 891 supported is not
 regressed. NETDEV_XDP_ACT_NDO_XMIT is deliberately not advertised: this device
 can be a redirect source but not a redirect target.
 
@@ -79,10 +79,10 @@ to grow gets -EINVAL. That is a defined outcome rather than corruption, and
 adding slack is a per-packet memory cost that should be paid on evidence
 rather than by default.
 
-Depends on 998 for the payoff. Without it, __xdp_build_skb_from_frame() runs
+Depends on 873 for the payoff. Without it, __xdp_build_skb_from_frame() runs
 eth_type_trans() over the IP header when cpumap rebuilds the skb and
 ip_forward() drops every redirected packet -- the same Ethernet assumption,
-one layer further out. 998 is core net and could be sent on its own; this
+one layer further out. 873 is core net and could be sent on its own; this
 patch is what makes it reachable.
 
 One piece of context for anyone sending this upstream. On 2026-08-14 Jakub
@@ -92,19 +92,19 @@ a factual claim, and this patch is a measured counter-example to it: a
 non-Ethernet device running native XDP, on the grounds that the buffer
 discipline was already in the driver and only the verdict handling was
 missing. Alexander Lobakin, in the same thread, listed cpumap Rx and
-ndo_xdp_xmit as what would break -- he was right on both, and they are 998 and
+ndo_xdp_xmit as what would break -- he was right on both, and they are 873 and
 the XDP_TX limitation above, handled rather than discovered late.
 
 Evidence: E2. Every API contract above was read at v6.12.103 and every
-statement about this driver was read against the tree with 991, 992 and 995
-applied. Applies at --fuzz=0 with 990 through 998 in place, and shares a file
-with 991, 992 and 995 only -- all three touch mhi_wwan_mbim.c, and this must
+statement about this driver was read against the tree with 890, 891 and 892
+applied. Applies at --fuzz=0 with 870 through 892 in place, and shares a file
+with 890, 891 and 892 only -- all three touch mhi_wwan_mbim.c, and this must
 come after them.
 
 Not built, not flashed, not measured. The verification plan is in
 x3000/docs/native-xdp-wwan-design.md: confirm the path is native rather than
 generic, measure XDP_DROP cost against the generic path, exercise XDP_PASS
-with a head adjustment, redirect into a cpumap with and without 998, and
+with a head adjustment, redirect into a cpumap with and without 873, and
 confirm a tail-growing program gets -EINVAL instead of scribbling.
 
 Out-of-tree patch for the GL-X3000 lean build.
@@ -194,7 +194,7 @@ Out-of-tree patch for the GL-X3000 lean build.
 + * speed. bpf_prog_run_generic_xdp() reads bytes 0..5 and 12..13 of the packet
 + * as an Ethernet destination and ethertype and acts on what it finds there
 + * (dev.c:5093-5134); on raw IP those offsets are inside the IP header, so the
-+ * whole misparse that 992 had to correct afterwards simply never happens when
++ * whole misparse that 891 had to correct afterwards simply never happens when
 + * the program runs on an xdp_buff instead of on an skb.
   *
 - * The program stays on link->xdp_prog rather than dev->xdp_prog.  That
@@ -325,7 +325,7 @@ Out-of-tree patch for the GL-X3000 lean build.
 +		/* Not a zero-copy XDP_TX. This driver has no ndo_xdp_xmit
 +		 * and generic_xdp_tx() is not exported to modules, so the
 +		 * frame re-enters the ordinary transmit path. That keeps the
-+		 * action set 992 already supported rather than regressing it,
++		 * action set 891 already supported rather than regressing it,
 +		 * at the cost of a qdisc traversal.
 +		 */
 +		skbn->protocol = mhi_mbim_ip_proto(skbn);

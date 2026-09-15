@@ -41,8 +41,8 @@ before the test says it helps.
 
 Cost when enabled is one MMIO write per queued buffer.
 
-Out-of-tree patch for the GL-X3000 lean build; independent of 991 and
-992 and can be dropped on its own.
+Out-of-tree patch for the GL-X3000 lean build; independent of 890 and
+891 and can be dropped on its own.
 
 --- a/drivers/bus/mhi/host/init.c
 +++ b/drivers/bus/mhi/host/init.c

@@ -77,7 +77,7 @@ only). v2 was an alpha branch, superseded. **v3 is out-of-tree** in mainline
 as of Sept 2026 — it lives in Google's `google/bbr` branch; upstreaming was
 announced in 2023 and has not landed.
 **Baked here (2026-09-04):** this fork now carries
-`target/linux/mediatek/patches-6.12/990-tcp-bbr3.patch` — the CachyOS/ptr1337
+`target/linux/mediatek/patches-6.12/870-tcp-bbr3.patch` — the CachyOS/ptr1337
 BBRv3 backport — so `kmod-tcp-bbr` builds **v3, not v1**. Verified before
 baking: applies to pristine 6.12.103 with **0 rejects** (benign 1–14 line
 offsets only), and a file-level overlap sweep against OpenWrt's generic 6.12
@@ -180,7 +180,7 @@ home use.
 3. **L4S awareness** — check carrier (T-Mobile: live); verify ECT(1)
    survives the path; keep ECN unmolested; revisit DualPI2 when kernel
    moves (or ask for the backport).
-4. **BBR** — v3 now baked (990 patch) for router-local TCP; the bigger
+4. **BBR** — v3 now baked (870 patch) for router-local TCP; the bigger
    gains for forwarded gaming traffic still belong on the endpoints.
 5. **eBPF+EDT / BPF sk-pacing** — real tech, wrong layer for WAN latency;
    the build fully supports experimenting with both.
@@ -204,7 +204,7 @@ bake-time exclusivities in this whole space, all already handled:
    pair (unset long ago). Resolved.
 2. **Patch-level replacements** — the BBRv3 backport *replaces*
    `tcp_bbr.c` in place; v1 and v3 cannot coexist in one kernel. This one
-   **is applied** (`990-tcp-bbr3.patch`, 2026-09-04) — a deliberate
+   **is applied** (`870-tcp-bbr3.patch`, 2026-09-04) — a deliberate
    replacement, not a conflict. The other source patches (DualPI2, Prague,
    AccECN, BORE, sched_ext flip) are additive, but any of them changes the
    kernel being shipped — they're rebuild decisions, not package adds. Not
@@ -216,7 +216,7 @@ built from it): the entire eBPF/XDP substrate (BTF + BTF-in-modules,
 cgroup-BPF, kprobes, perf events, AF_XDP, host BPF toolchain), tc-bpf,
 libbpf, bpftool-full, xdp-loader/xdpdump, xdp-sockets-diag, sched-bpf,
 full kmod-sched (fq, htb, mq, …) + kmod-sched-cake + ifb, **BBR v3**
-(via 990 patch — replaces v1), sqm-scripts + luci, qosify, bash + fping
+(via 870 patch — replaces v1), sqm-scripts + luci, qosify, bash + fping
 (cake-autorate's deps — the
 script itself is unpackaged, install per its repo). Plus the always-on
 natives: fq_codel default, TSQ, BQL, ECN forwarding. Together these
@@ -365,7 +365,7 @@ config line) · **BACKPORT✔** (external patch, dry-run-tested clean on
 | CAKE | NEXT-BUILD | `sch_cake.c` present; `kmod-sched-cake=y` |
 | sqm / qosify / autorate-deps | NEXT-BUILD | 37/37 config sweep |
 | FQ (`sch_fq`, EDT-aware) | NEXT-BUILD | `sch_fq.c` present, 6 tstamp refs; in `kmod-sched=y` |
-| BBR **v3** (+FQ+BBR combo) | NEXT-BUILD | `990-tcp-bbr3.patch` tracked (replaces v1); `kmod-tcp-bbr=y`; 0 rejects on 6.12.103 + no OpenWrt-generic overlap; router-local flows only |
+| BBR **v3** (+FQ+BBR combo) | NEXT-BUILD | `870-tcp-bbr3.patch` tracked (replaces v1); `kmod-tcp-bbr=y`; 0 rejects on 6.12.103 + no OpenWrt-generic overlap; router-local flows only |
 | EDT via eBPF | NEXT-BUILD | `bpf_skb_set_tstamp` in `filter.c` + uapi; tc-bpf + BTF baked |
 | BPF sk-pacing | NEXT-BUILD | `SO_MAX_PACING_RATE` @ `filter.c:5317`; `KERNEL_CGROUP_BPF=y` |
 | cake_mq (mq + cake children) | NEXT-BUILD-capable | `sch_mq.c` present + cake; WAN is single-queue → LAN-only technique; mqprio in FEEDS |
@@ -467,7 +467,7 @@ patch, plus the MediaTek vendor feed.
   LED patch — zero performance patches. Generic
   hack/pending/backport-6.12 deltas: cpuinfo cosmetics, Motorcomm
   PHY/ethernet drivers (hardware this board does not have), regulator infra —
-  zero datapath. Meanwhile WE carry `990-tcp-bbr3.patch`, which they
+  zero datapath. Meanwhile WE carry `870-tcp-bbr3.patch`, which they
   don't: this tree is *ahead* of the flagship optimization fork.
 * **The one real find — fullcone NAT** (`fullconenat` /
   `fullconenat-nft` packages + a firewall4 patch in ImmortalWrt): not
@@ -926,12 +926,12 @@ Held for a deliberate/tested pass (NOT in this batch, with reasons):
   it was taken against `master`, which moves. An actual bump means choosing a
   specific commit, and some of these changes are recent enough not to be
   battle-tested.
-* **MHI-GRO — DONE, and this entry was stale.** It is patch 991,
-  `991-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`: written, built, flashed and
-  running, with 992 (native XDP via `do_xdp_generic`) and 993 (the MHI doorbell
+* **MHI-GRO — DONE, and this entry was stale.** It is patch 890,
+  `890-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch`: written, built, flashed and
+  running, with 891 (native XDP via `do_xdp_generic`) and 880 (the MHI doorbell
   fix) stacked on top of it. It did not stay lever-off/ethtool-gated as planned;
   it is unconditional. Two later findings matter for anyone reading this row:
-  cpumap redirect bypasses gro_cells entirely and so discards what 991 buys,
+  cpumap redirect bypasses gro_cells entirely and so discards what 890 buys,
   while RPS runs *after* gro_cells and keeps it. Both are written up in
   `xdp-methods-tested.md` section 14.
 * **fullcone NAT** — requires porting ImmortalWrt's firewall4 patch +
