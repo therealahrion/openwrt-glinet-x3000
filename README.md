@@ -209,14 +209,13 @@ and how to read its state on a running router:
                   reach this today on a device that has no native XDP.
                   It is a precondition for 999 rather than a result of
                   it: native XDP on wwan0 delivers nothing through cpumap
-                  until this lands too. Not novel, either - Alexander
-                  Lobakin named cpumap Rx as exactly what breaks on a
-                  non-Ethernet device, on a netdev thread that was
-                  refused in August 2026, so this is the concrete
-                  instance of a consequence upstream has already weighed.
-  Attribution(s): Mine, written for this fork. The chain, the callers,
-                  why the generic path escapes it, and the upstream
-                  thread that had it first:
+                  until this lands too.
+  Attribution(s): Mine, written for this fork. Alexander Lobakin
+                  described this same failure - cpumap Rx on a
+                  non-Ethernet device - on a netdev thread in August
+                  2026, so the consequence was named before I found it.
+                  The chain, the callers, and why the generic path
+                  escapes it:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
   </pre>
 
@@ -248,9 +247,7 @@ and how to read its state on a running router:
                   slack, so a program growing the packet gets -EINVAL.
                   The cpumap payoff needs 998, and that is the part
                   still unmeasured, along with XDP_DROP's saved
-                  allocation. Upstream has said it does not want XDP on
-                  non-Ethernet devices - this is a counter-example to the
-                  premise they gave, not a rebuttal of the decision.
+                  allocation and any performance figure.
   Attribution(s): Mine, written for this fork. Design, hazards and the
                   verification plan:
                       - <a href="x3000/docs/native-xdp-wwan-design.md">x3000/docs/native-xdp-wwan-design.md</a>

@@ -85,18 +85,15 @@ ip_forward() drops every redirected packet -- the same Ethernet assumption,
 one layer further out. 998 is core net and could be sent on its own; this
 patch is what makes it reachable.
 
-On upstream reception, since it would be dishonest to leave this out. On
-2026-08-14 Jakub Kicinski refused a nearby patch with "There is no native XDP
-on any non-ether device, making generic xdp work on those is silly. Just
-attach the BPF in TC", and Toke Hoiland-Jorgensen added that the "XDP is
-Ethernet only" assumption should be left alone. This patch is a direct
-counter-example to the premise in the first sentence rather than a rebuttal of
-the conclusion: it makes a non-Ethernet device a native XDP device, on the
-grounds that the buffer discipline was already there and only the verdict
-handling was missing. Alexander Lobakin, in the same thread, listed cpumap Rx
-and ndo_xdp_xmit as what would break -- he was right, and that is 998 and the
-XDP_TX limitation above, both stated rather than discovered. I am recording
-the argument, not predicting the outcome.
+One piece of context for anyone sending this upstream. On 2026-08-14 Jakub
+Kicinski refused a nearby patch with "There is no native XDP on any non-ether
+device, making generic xdp work on those is silly." The first half of that is
+a factual claim, and this patch is a measured counter-example to it: a
+non-Ethernet device running native XDP, on the grounds that the buffer
+discipline was already in the driver and only the verdict handling was
+missing. Alexander Lobakin, in the same thread, listed cpumap Rx and
+ndo_xdp_xmit as what would break -- he was right on both, and they are 998 and
+the XDP_TX limitation above, handled rather than discovered late.
 
 Evidence: E2. Every API contract above was read at v6.12.103 and every
 statement about this driver was read against the tree with 991, 992 and 995

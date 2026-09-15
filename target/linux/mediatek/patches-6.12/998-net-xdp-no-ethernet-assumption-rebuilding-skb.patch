@@ -69,10 +69,9 @@ modem in tree. It is a precondition for the driver-side native XDP patch
 rather than a consequence of it: that patch delivers nothing through
 cpumap until this is fixed as well.
 
-Not an independent discovery, and the prior art is an argument against
-sending it. Alexander Lobakin named this exact failure on netdev on
-2026-08-18, reviewing Jiayuan Chen's "net: xdp: don't assume an Ethernet
-header in generic XDP":
+Not an independent discovery. Alexander Lobakin named this exact failure
+on netdev on 2026-08-18, reviewing Jiayuan Chen's "net: xdp: don't assume
+an Ethernet header in generic XDP":
 
   Most XDP programs expect Ethernet header at the beginning of a frame.
   Unless you write a custom one which doesn't. But then you may face
@@ -80,21 +79,17 @@ header in generic XDP":
   .ndo_xdp_xmit() implementation -- all expect Ethernet header at the
   beginning.
 
-"cpumap Rx" is this patch. That thread was refused -- pw-bot: cr, no v2
--- with Jakub Kicinski writing that there is no native XDP on any
-non-ether device, so making generic XDP work on them is silly, and Toke
-Hoiland-Jorgensen that the "XDP is Ethernet only" assumption should be
-left alone. So this is the concrete instance of a consequence three
-maintainers have already weighed and declined to treat as a bug, not a
-defect nobody had noticed.
+"cpumap Rx" is this patch. So the failure was described before I found
+it, which is worth saying for attribution. It does not change what the
+code does: the drop is real, reachable, and silent, and the fix is a
+no-op for every Ethernet caller.
 
-Two things separate it from the patch that was refused. It is the native
-path rather than the generic one -- a different function in a different
-file -- and it does not ask the core to relax an assumption on behalf of
-a device class with no native XDP, because the driver patch this sits
-under supplies one. Whether that is enough is not for me to predict; it
-is the argument, and it should be made explicitly rather than discovered
-in review.
+That thread was refused -- pw-bot: cr, no v2 -- and anyone sending this
+upstream should know that. It is a different patch, though: the native
+path rather than the generic one, a different function in a different
+file, and it does not ask the core to relax an assumption on behalf of a
+device class with no native XDP, because the driver patch this sits
+under supplies one.
 
 Evidence: E2 throughout, read at v6.12.103. net/core/xdp.c and
 kernel/bpf/cpumap.c are pristine in this tree -- no patch here or in

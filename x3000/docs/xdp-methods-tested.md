@@ -6363,15 +6363,17 @@ though it were new, which is the same mistake this document's own preamble to
 24 describes: I had the answer in my own file and did not open it.
 
 What survives the correction, and what does not. **The mechanism stands** - it
-was read from source, not inferred, and 998 fixes a real drop. **The novelty
-claim does not**, and neither does "worth sending upstream on its own merits"
-without qualification: the patch walks into a stated position rather than into
-an absence of precedent. Two things do distinguish it from what was refused. It
-is the native path rather than the generic one - a different function in a
-different file - and it does not ask the core to relax an assumption on behalf
-of a device class that has no native XDP, because 999 supplies one. Whether
-that is enough is not something I can predict, and the patch header now says so
-instead of claiming merit.
+was read from source, not inferred, and 998 fixes a real drop that is silent
+and reachable. **The novelty claim does not**: the failure was described before
+I found it, and the patch header now says so.
+
+What does not follow is that the work is wrong. The three questions worth
+asking are whether it is better, whether it works, and whether it is feasible,
+and a maintainer's position on a neighbouring patch answers none of them. The
+drop is real, the fix is a no-op for every Ethernet caller, and 999 has since
+been measured working on the box. Upstream's view is recorded here because it
+is useful to whoever sends it - a different patch on a different path, against
+a device class that now demonstrably has native XDP - not as a verdict.
 
 #### The defect
 
