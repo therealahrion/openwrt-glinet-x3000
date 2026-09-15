@@ -1201,8 +1201,8 @@ NDP16 plus two DPE16, 28 bytes packed - and hands the result to
 adjusting `frame->data` and `frame->len` by hand, after checking
 `frame->headroom` is actually 28 bytes or more rather than assuming the usual
 `XDP_PACKET_HEADROOM`. Not hard, but it is open-coded pointer work in a path
-where getting it wrong corrupts the NTB the modem parses. `mhi_queue_buf()`
-exists and is the right queue call.
+where getting it wrong corrupts the NTB the modem parses. `mhi_queue_dma()` is
+the right queue call, not `mhi_queue_buf()` - see the completion note below.
 
 **Locking.** `mhi_mbim_ndo_xmit()` already takes `spin_lock_irqsave(&mbim->tx_lock)`,
 commented "Serialize MHI channel queuing and MBIM seq", because several links
@@ -1218,10 +1218,22 @@ with normal TX, on a dual-core A53. That erodes a good part of what XDP is for.
     struct net_device *ndev = skb->dev;
 
 It hard-assumes the buffer is an skb and dereferences `skb->dev` for stats.
-`mhi_result` carries no type tag, so mixing `xdp_frame`s into the same channel
-means inventing one: a side table, a tagged wrapper (which reintroduces the
-per-frame allocation XDP exists to avoid), or pointer-bit games. All of it lands
-in a hot completion path.
+
+**Corrected 2026-09-15.** The paragraph here used to say `mhi_result` carries no
+type tag, so mixing `xdp_frame`s in means inventing one - a side table, a tagged
+wrapper, or pointer-bit games. That was reading the wrong API. MHI already
+separates the DMA address from the completion cookie: `mhi_queue_skb()` sets
+`buf_info.v_addr = skb->data` and `buf_info.cb_buf = skb` as two fields
+(`bus/mhi/host/main.c:1174`), `mhi_queue_dma()` sets `p_addr` from the caller
+and `cb_buf = mhi_buf` with `pre_mapped = true` (`:1192`), `mhi_gen_tre()` copies
+`cb_buf` unconditionally (`:1225`), and completion returns
+`result.buf_addr = buf_info->cb_buf` (`:636`, `:734`). So the cookie is whatever
+the caller chooses. The `struct mhi_buf` it wants is 32 bytes and can live in the
+frame's own headroom - 256 bytes, less 40 for the `xdp_frame` and 28 for the NTB
+header, leaves 156 spare - so there is no per-frame allocation either. The real
+obligation is the one MHI states at `:633`: with `pre_mapped` set, the client owns
+both `dma_map_single()` and the unmap that `mhi_queue_skb()` currently gets for
+free. That is a cost, but it is a known one rather than a design problem.
 
 Declining `NETDEV_XDP_ACT_NDO_XMIT_SG` avoids multi-buffer frames entirely -
 `devmap.c:491` refuses fragmented frames when SG is not advertised - so at least
@@ -1230,6 +1242,16 @@ that part can be sidestepped.
 ### 15.2 The part that makes it a project rather than a patch
 
 `ndo_xdp_xmit` on its own buys nothing usable, and not for a subtle reason.
+
+**Scope, corrected 2026-09-15.** What follows is true of the *uplink fast path* -
+a LAN-to-modem redirect - and that is the rung this section was scoping. It is
+not true of the rung below it. `XDP_TX` does not need `ndo_xdp_xmit` at all, so
+it does not need the NAT this section is about either: `mtk_eth_soc.c:1979`
+dispatches `case XDP_TX:` into `mtk_xdp_submit_frame(..., false)` while
+`mtk_xdp_xmit()` at `:1926` calls the same routine with `true`, the `dma_map`
+bool marked `/* ndo_xdp_xmit */` at `:1778`. A frame-transmit routine is the
+shared requirement; the ndo, the concurrency and the devmap plumbing are the
+increment on top. See 24.19.
 
 Generic XDP runs at `dev.c:5616`, tc ingress at `5656`, netfilter ingress at
 `5664`. An `XDP_REDIRECT` from `eth1` to `wwan0` hands the frame to the modem's
@@ -1346,6 +1368,16 @@ side reads:
 This is not a configuration problem. Adding `eth1` to the flowtable does not fix
 it, and it is unrelated to whether hardware offload is on or off.
 `bpf_xdp_flow_lookup()` is structurally unusable on the wired ports of this SoC.
+
+One nuance worth having, because it bounds how big a fix would need to be. Only
+the *flowtable selection* reads `rxq->dev`. The tuple the lookup is keyed on does
+not: `nf_flow_table_bpf.c` builds it with `.iifidx = fib_tuple->ifindex`, a field
+the program fills in, so a program on `eth1` can supply `eth1`'s real ifindex
+from a map or a constant without `ctx->ingress_ifindex` working at all. So the
+blocker is one call - `nf_flowtable_by_dev(xdp->rxq->dev)` - not the whole rxq
+registration. W0011 fixes it by giving each netdev a real rxq; a kfunc variant
+taking the flowtable device as an argument would fix it far more cheaply, and
+17.4's program-owned flow map avoids the kernel flowtable entirely.
 
 What does still work there: `XDP_DROP`, `XDP_TX`, and `bpf_redirect()` /
 `bpf_redirect_map()`. Redirect survives because `mtk_xdp_run()` passes the real
@@ -6601,11 +6633,12 @@ through the `abort:` label, which would have traced an out-of-memory condition
 as an XDP program exception via `trace_xdp_exception()`.
 
 **Three honest limits**, all in the patch header rather than discovered later:
-`XDP_TX` is not zero-copy, because there is no `ndo_xdp_xmit` here and
-`generic_xdp_tx()` is not exported to modules, so the frame re-enters the
-ordinary transmit path; there is no tail slack, so `bpf_xdp_adjust_tail()`
-growth returns `-EINVAL`; and `truesize` accounting changes, which lands
-upstream of 890's gro_cells and needs re-measuring rather than assuming.
+`XDP_TX` is not zero-copy, because this driver has no frame-transmit routine
+and `generic_xdp_tx()` is not exported to modules, so the frame re-enters the
+ordinary transmit path; tail growth beyond the allocator's alignment slack
+returns `-EINVAL`; and `truesize` accounting changes, which lands upstream of
+890's gro_cells and needs re-measuring rather than assuming. Two of those three
+were stated more strongly than the source supports - see 24.19.
 
 **What it does to 24.1.** That section recorded Kicinski refusing a nearby patch
 with "There is no native XDP on any non-ether device, making generic xdp work on
@@ -6712,3 +6745,104 @@ packets in either direction. The program this section measures with is
 `2e34ea12f2189b307f6ccfcee5daf55f1632554ac6d6272a68d812198f639f31`. Second,
 never discard a generator's output and status. Both changes are in the durable
 script rather than in the next one-off.
+
+### 24.19 The transmit side, re-scoped from source - 2026-09-15
+
+Section 15 priced the transmit half of this work as one step and deferred it.
+Re-reading the source turned four of its statements over. This section records
+what changed and what did not; 15.1, 15.2 and 16.2 carry pointers here.
+
+#### 24.19.1 XDP_TX and ndo_xdp_xmit are different rungs
+
+The design note said "XDP_TX needs `ndo_xdp_xmit` on the MHI UL path" and 15.1
+scoped them together. `mtk_eth_soc` is the counter-example in this same tree:
+`case XDP_TX:` at `:1979` calls `mtk_xdp_submit_frame(eth, xdpf, dev, false)`,
+and `mtk_xdp_xmit()` at `:1926` calls the same routine with `true`. The bool is
+`dma_map`, commented `/* ndo_xdp_xmit */` at `:1778`, and it distinguishes a
+frame from the driver's own pool from one another device handed over.
+
+So the shared requirement is a frame-transmit routine. XDP_TX is that routine
+called from inside the driver's own RX path - single-threaded here, since 893
+already holds the frame in the DL tasklet, with no devmap and no NAT question,
+because XDP_TX returns the datagram to where it came from. `ndo_xdp_xmit` is the
+same routine plus concurrency, plus the devmap contract, plus - for anything
+that forwards rather than reflects - the translation 15.2 is about.
+
+**E2**, read from source. Nothing here is built.
+
+#### 24.19.2 MHI already carries a completion cookie
+
+15.1 called the completion callback the hard part, on the grounds that
+`mhi_result` has no type tag. It does not need one. All three queue calls set
+`buf_info.cb_buf` independently of the address that gets DMA'd, and completion
+returns it verbatim:
+
+    mhi_queue_skb   v_addr = skb->data,          cb_buf = skb      main.c:1174
+    mhi_queue_buf   v_addr = buf,                cb_buf = buf      main.c:1264
+    mhi_queue_dma   p_addr = mhi_buf->dma_addr,  cb_buf = mhi_buf  main.c:1192
+    mhi_gen_tre     buf_info->cb_buf = info->cb_buf                main.c:1225
+    completion      result.buf_addr = buf_info->cb_buf             main.c:636, :734
+
+`mhi_queue_dma()` is the one that decouples them, and its cookie is a
+`struct mhi_buf *` of the caller's choosing. That is 32 bytes, and an
+`xdp_frame` arrives with 256 bytes of headroom of which 40 hold the frame struct
+and 28 would hold the NTB header, leaving 156 - so the cookie needs no
+allocation either. The obligation that comes with it is stated at `:633`:
+`if (likely(!buf_info->pre_mapped)) unmap_single()`, so a pre-mapped client owns
+both the `dma_map_single()` and the unmap.
+
+**E2**, read from source.
+
+#### 24.19.3 There is tail slack, and its size depends on the packet
+
+893's header says "There is no tail slack. The allocation is headroom plus
+datagram plus skb_shared_info and nothing more." The code says otherwise:
+
+    truesize = SKB_DATA_ALIGN(XDP_PACKET_HEADROOM + len) +
+               SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+`xdp_data_hard_end()` is `data_hard_start + frame_sz - SKB_DATA_ALIGN(sizeof
+(struct skb_shared_info))` (`include/net/xdp.h:142`), so it lands at
+`SKB_DATA_ALIGN(256 + len)`, while the datagram ends at `256 + len`. On arm64
+`SMP_CACHE_BYTES` is 64 (`arch/arm64/include/asm/cache.h:8`) and
+`XDP_PACKET_HEADROOM` is 256, a multiple of it, so the slack is
+`(64 - len % 64) % 64` - between 0 and 63 bytes, decided by the datagram length
+alone:
+
+    len  1472 -> 0 bytes    len  1400 -> 8 bytes
+    len  1500 -> 36 bytes   len  1492 -> 44 bytes
+
+T0060 probes `+64`, which exceeds the maximum for every length, which is why it
+returned `-EINVAL` deterministically and why the test is sound. But the recorded
+conclusion is not: a program growing the tail by 8 or 16 bytes would succeed on
+some packet lengths and fail on others. That intermittency is the hazard, and no
+test covers it. **E2** from source, and the arithmetic above is arithmetic.
+
+#### 24.19.4 The frag helper note in the design note was backwards
+
+It said `napi_alloc_frag()` is the wrong helper for tasklet context.
+`__netdev_alloc_frag_align()` (`skbuff.c:326`) takes the hardirq branch only when
+`in_hardirq() || irqs_disabled()`; otherwise it wraps `__napi_alloc_frag_align()`
+in `local_bh_disable()`/`local_bh_enable()`. Both branches do
+`fragsz = SKB_DATA_ALIGN(fragsz)`. The napi cache's requirement is
+`local_lock_nested_bh`, which the DL tasklet already satisfies. So both helpers
+are correct here, and `netdev_alloc_frag()` is the more expensive of the two by a
+redundant BH nest per datagram. **E2**, read from source.
+
+#### 24.19.5 One thing that is not a limitation and could be fixed in a word
+
+`xdp_prepare_buff(&xdp, hard_start, XDP_PACKET_HEADROOM, len, false)` - the last
+argument is `meta_valid`, and `false` sets `xdp->data_meta = data + 1`
+(`include/net/xdp.h:133`). `xdp_data_meta_unsupported()` is
+`xdp->data_meta > xdp->data` (`:365`), which `bpf_xdp_adjust_meta()` tests first
+and answers with `-ENOTSUPP` (`filter.c:4232`). So no program attached here can
+carry XDP metadata - into a cpumap, into an AF_XDP consumer, or between the
+components of a multi-program dispatcher.
+
+Passing `true` costs one assignment and no memory: metadata grows downward from
+`data`, is capped by `xdp_metalen_invalid()`, and must stay above
+`data_hard_start + sizeof(struct xdp_frame)` (`filter.c:4234`), which leaves 216
+bytes of room here. This is a code change to 893 rather than a documentation
+one, so it is recorded rather than made - the flashed image is what T0056 and
+T0060 measured, and changing the patch body invalidates that pairing until it is
+re-run. **E2**, read from source.

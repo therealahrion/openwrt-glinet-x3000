@@ -199,9 +199,15 @@ section 24.2 already caught once, on the same subject.
 
 **`build_skb()` needs the frag to be a real page frag**, not a kmalloc'd
 pointer with no page backing, because `skb_free_head()` will treat it
-accordingly. `napi_alloc_frag()` is the wrong helper here - it is documented for
-NAPI context - so the allocation helper needs choosing deliberately against the
-tasklet context rather than copied from an Ethernet driver.
+accordingly. An earlier revision of this note said `napi_alloc_frag()` was the
+wrong helper for tasklet context; that is backwards. `__netdev_alloc_frag_align()`
+(`skbuff.c:326`) takes the hardirq path only when `in_hardirq() || irqs_disabled()`,
+and otherwise does `local_bh_disable()` around `__napi_alloc_frag_align()` - the
+same napi cache, reached through a `local_bh_disable`/`enable` pair that is
+redundant in the DL tasklet, where BH is already off. The cache's own requirement
+is `local_lock_nested_bh`, which softirq context satisfies. So either helper is
+correct here and the napi one is the cheaper of the two by two counter
+operations per datagram.
 
 **Memory accounting changes.** Today's `netdev_alloc_skb()` charges an skb per
 datagram. A frag allocation with a deferred `build_skb()` charges differently,
@@ -209,9 +215,17 @@ and the `truesize` seen by GRO and by socket accounting will not be what it was.
 890's gro_cells path is downstream of this, so any change there needs
 re-measuring, not assuming.
 
-**XDP_TX needs `ndo_xdp_xmit`** on the MHI UL path. Deliberately out of scope
-for a first cut: returning `XDP_ABORTED` for it is honest and keeps the change
-reviewable.
+**XDP_TX does not need `ndo_xdp_xmit`**, and an earlier revision of this note
+said it did. `mtk_eth_soc.c` shows the shape: `case XDP_TX:` at `:1979` calls
+`mtk_xdp_submit_frame(eth, xdpf, dev, false)`, and `mtk_xdp_xmit()` at `:1926`
+calls the same routine with `true` - the bool is `dma_map`, marked
+`/* ndo_xdp_xmit */` at `:1778`, distinguishing a frame from the driver's own
+pool from one handed over by another device. XDP_TX is therefore driver-internal
+and single-threaded here, since 893 already holds the frame in the DL tasklet.
+What it needs is a frame-transmit routine: the NTB header written into the
+frame's headroom, `mhi_queue_dma()`, and `xdp_return_frame()` from the UL
+completion. `ndo_xdp_xmit` is the same routine plus concurrency and devmap, and
+is a separate step - see `xdp-methods-tested.md` 15.1 and 24.19.
 
 ## Verification plan
 
@@ -236,9 +250,14 @@ open.
    survive; without 873 it will not, and confirming that failure first is a
    direct reproduction of W0045.
 5. **A program that grows the tail**, confirming `-EINVAL` rather than
-   corruption, given the allocation leaves no tail slack. **Done - T0060,
-   PASS, 15 Sep:** the helper returned `18446744073709551594`, which is
-   `2**64 - 22`, i.e. `-EINVAL`. The object is `bpf/xdp_tail_probe.bpf`.
+   corruption. **Done - T0060, PASS, 15 Sep:** the helper returned
+   `18446744073709551594`, which is `2**64 - 22`, i.e. `-EINVAL`. The object is
+   `bpf/xdp_tail_probe.bpf`. Note what this does and does not establish: the
+   allocation carries `(64 - len % 64) % 64` bytes of incidental tail slack,
+   0 to 63, because `truesize` aligns the data portion. `+64` exceeds the
+   maximum for every length, which is why the probe fails deterministically.
+   A program growing the tail by a smaller amount would succeed or fail by
+   packet length, and no test covers that yet.
 
 ## Where this stands with upstream
 
@@ -264,7 +283,10 @@ discovered here first, and saying so is cheaper than having it said back.
 ## What this does not do
 
 It does not give `wwan0` AF_XDP zero-copy, which needs `MEM_TYPE_XSK_BUFF_POOL`
-and a real driver-owned queue. It does not change the NTB parse, the de-aggregation,
+and `ndo_xsk_wakeup`. The second half of that sentence used to read "and a real
+driver-owned queue", which is worth re-examining now: under 893 the driver does
+own the buffer for the length of the verdict, which was the premise the RX
+retraction turned on. Treat it as unscoped rather than ruled out. It does not change the NTB parse, the de-aggregation,
 or 892's bounds checks. It does not remove the per-datagram copy - that copy is
 inherent to MBIM aggregation and is what makes the buffer exclusively owned in
 the first place. And it does not touch the frame engine, which has nothing to do

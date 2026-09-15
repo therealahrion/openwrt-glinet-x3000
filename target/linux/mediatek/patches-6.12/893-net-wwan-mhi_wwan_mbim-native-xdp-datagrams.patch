@@ -73,11 +73,18 @@ is done this way rather than dropped so the action set 891 supported is not
 regressed. NETDEV_XDP_ACT_NDO_XMIT is deliberately not advertised: this device
 can be a redirect source but not a redirect target.
 
-There is no tail slack. The allocation is headroom plus datagram plus
-skb_shared_info and nothing more, so a program calling bpf_xdp_adjust_tail()
-to grow gets -EINVAL. That is a defined outcome rather than corruption, and
-adding slack is a per-packet memory cost that should be paid on evidence
-rather than by default.
+Tail growth is bounded by the allocator's alignment rather than forbidden.
+truesize is SKB_DATA_ALIGN(XDP_PACKET_HEADROOM + len) plus
+SKB_DATA_ALIGN(sizeof(struct skb_shared_info)), so xdp_data_hard_end() lands
+SKB_DATA_ALIGN(256 + len) - (256 + len) bytes past the datagram. On arm64
+SMP_CACHE_BYTES is 64 and XDP_PACKET_HEADROOM is a multiple of it, so that is
+(64 - len % 64) % 64: between 0 and 63 bytes, decided by the datagram length
+alone. bpf_xdp_adjust_tail() growing by more than that returns -EINVAL;
+growing by less may succeed. A program that grows the tail by a small amount
+therefore works for some packet lengths and not others, which is the hazard
+worth stating -- not an absence of slack. Reserving a guaranteed amount is a
+per-packet memory cost that should be paid on evidence rather than by
+default.
 
 Depends on 873 for the payoff. Without it, __xdp_build_skb_from_frame() runs
 eth_type_trans() over the IP header when cpumap rebuilds the skb and
