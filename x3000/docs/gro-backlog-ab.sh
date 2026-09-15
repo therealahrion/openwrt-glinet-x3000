@@ -29,9 +29,11 @@
 #
 # STREAMS is a CEILING, not a demand. The load ramps up one stream at a time and
 # keeps only those the source will actually serve, so a source that caps
-# concurrent connections per address - which the default URL does, at two -
-# settles the run at whatever it allows and says so. There is no number to tune
-# by hand and no run to throw away because half the fetchers were thrashing.
+# concurrent connections per address - which the default does, at two, with
+# HTTP 429 on the third - settles the run at whatever it allows and says so.
+# There is no number to tune by hand and no run to throw away because half the
+# fetchers were thrashing. To exceed a source's cap, give URL more sources
+# rather than raising STREAMS; see the note on URL below.
 #
 # What it is looking for. At ~20k datagrams/s this link overflows a queue and
 # drops about 0.2% of them. Which queue depends on GRO:
@@ -54,6 +56,24 @@
 # =============================================================================
 
 WANIF=${WANIF:-wwan0}
+# URL may be a SPACE-SEPARATED LIST. Streams are dealt round-robin across it,
+# which is the only way past a per-source connection cap.
+#
+# Measured 2026-09-15 against the default: a probe holding N connections open
+# and asking for one more got HTTP 206 at 0 and 1 held, and **HTTP 429 Too Many
+# Requests at 2, 3 and 4**. Five rapid SEQUENTIAL requests with nothing held
+# were all 206, so it is not a request-rate limit - two simultaneous connections
+# is simply the ceiling. Range is served (206, Content-Range), but that does not
+# help: a ranged GET still opens a connection, and the response is HTTP/1.1 so
+# there is no multiplexing to hide extra streams inside.
+#
+# So four streams from one host is impossible and always was. Four streams from
+# two hosts is not. Verify a candidate before adding it:
+#
+#     curl -s -o /dev/null -w '%{http_code}\n' -r 0-200000 <candidate>
+#
+# and expect 206. Only the default is verified here; anything else is the
+# operator's to check, which is why none are shipped commented-in.
 URL=${URL:-https://hil-speed.hetzner.com/1GB.bin}
 STREAMS=${STREAMS:-4}
 WINDOW=${WINDOW:-12}
@@ -169,6 +189,23 @@ sq() {
 # stderr so the next occurrence is evidence instead of a mystery.
 LOADLOG=/tmp/.gro_ab_load.log
 
+# The nth entry of the URL list, cycling. Deals stream 1 to source 1, stream 2
+# to source 2, stream 3 back to source 1, so a per-source cap of two allows four
+# streams across two sources.
+#
+# `set --` inside a FUNCTION rebinds that function's positional parameters, not
+# the caller's. Doing this at top level is what once printed a byte counter
+# where a window label belonged, so the containment is the point, not an
+# accident of style.
+nth_url() {
+	_i=$1
+	set -- $URL
+	[ $# -gt 0 ] || { echo ""; return; }
+	_pick=$(( (_i - 1) % $# ))
+	while [ "$_pick" -gt 0 ]; do shift; _pick=$((_pick-1)); done
+	echo "$1"
+}
+
 # How many fetch failures have been logged so far.
 #
 # busybox grep -c prints 0 and exits non-zero when nothing matches, so the
@@ -206,20 +243,30 @@ start_load() {
 	while [ "$_n" -lt "$STREAMS" ]; do
 		_n=$((_n+1))
 		_before=$(fail_count)
+		_u=$(nth_url "$_n")
 		( while :; do
-			wget -qO /dev/null "$URL" 2>>$LOADLOG ||
-				{ echo "fetch exit $? at $(date +%T)" >>$LOADLOG; sleep 2; }
+			wget -qO /dev/null "$_u" 2>>$LOADLOG ||
+				{ echo "fetch exit $? at $(date +%T) on $_u" >>$LOADLOG; sleep 2; }
 		done ) &
 		_new=$!
 		sleep 3
 		_after=$(fail_count)
+		# A caveat worth knowing: this cannot prove the failure belongs to
+		# the stream just added. An existing stream hiccuping inside the same
+		# three seconds is attributed to the newcomer and ends the ramp early.
+		# That direction is safe - fewer streams still measures correctly - but
+		# it is a false negative, not a clean test.
 		if [ "$_after" -gt "$_before" ]; then
 			# This stream could not be added. Stop here rather than trying
 			# more: a source that refused the Nth will refuse the N+1th, and
 			# every extra attempt is another retry loop competing for the
 			# link it is supposed to be loading.
 			kill "$_new" 2>/dev/null
-			say "load: source refused stream $_n - settling at $_kept"
+			say "load: $_u refused stream $_n - settling at $_kept"
+			say "      That source caps concurrent connections (the default"
+			say "      returns HTTP 429 at the third). To get more load, add a"
+			say "      second source rather than asking this one for more:"
+			say "          URL=\"<a> <b>\" sh \$0"
 			break
 		fi
 		PIDS="$PIDS $_new"

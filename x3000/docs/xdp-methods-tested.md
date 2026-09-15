@@ -4578,6 +4578,53 @@ a time, waits three seconds, and keeps it only if no new failure appeared:
   stream that was serving drops out and the offered load moves under the
   windows.
 
+#### What the source actually does, asked rather than assumed
+
+Both attempts above carried a comment asserting that the source "caps concurrent
+connections per address". **Nothing had measured that.** All that was observed
+was `wget` exiting 8, which means only "server issued an error response" - not
+which response, and not why. A probe run on the box on 2026-09-15 settled it:
+
+| test | result |
+|---|---|
+| one `curl` request | HTTP 206 |
+| one `wget` request | streaming normally, no error |
+| an extra request with 0 connections held | HTTP 206 |
+| with 1 held | HTTP 206 |
+| **with 2, 3 and 4 held** | **HTTP 429 Too Many Requests** |
+| five rapid *sequential* requests, nothing held | 206, 206, 206, 206, 206 |
+| `Range` | `206 Partial Content`, `Content-Range: bytes 5000000-5000100/1073741824`, `HTTP/1.1` |
+
+So: **two simultaneous connections, and the third gets 429.** Not a request-rate
+limit - five rapid sequential requests all passed, so frequency is fine and only
+simultaneity is capped. Not a `wget` problem either; `wget` streamed happily.
+
+Range is served, and it does **not** help. A ranged GET still opens a
+connection, and the response is HTTP/1.1, so there is no multiplexing to hide
+extra streams inside. Four streams from this one host was never possible.
+
+One correction to the probe itself: it first reported `wget` as having errored.
+It had not - my regex `4[0-9][0-9]`, meant to catch HTTP status codes, matched
+the **443** in the IPv6 address `2a01:4ff:1ef::fa57:1:443`. A port number read
+as a status code, in the same document that already warns against exactly this
+class of mistake.
+
+**So the fix is more sources, not a different request.** `URL` now takes a
+space-separated list and `nth_url()` deals streams round-robin across it, so a
+per-source cap of two allows four streams across two hosts. `set --` lives
+inside that function, where it rebinds the function's parameters and not the
+caller's - the containment is deliberate, since doing it at top level is what
+once printed a byte counter where a window label belonged. Verified for one,
+two and three sources, for the caller's parameters surviving, and for an empty
+list.
+
+Only the existing URL is shipped, because it is the only one measured. Anything
+added should be checked first:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-200000 <candidate>
+```
+
 The insight the first attempt missed is that **the count was never the problem.**
 A stable two streams measures correctly. What ruined the run was churn - streams
 thrashing on retry make the offered load wander, which reads as throughput drift
