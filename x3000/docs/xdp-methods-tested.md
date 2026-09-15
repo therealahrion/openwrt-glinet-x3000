@@ -4718,14 +4718,25 @@ different flow structure.
 
 This is the result worth keeping, and it was not what the run was for.
 
-| | streams | dgram/s | skb/s | agg |
-|---|---|---|---|---|
-| previous run, best window | 2 | 11790 | 2370 | 4.97x |
-| this run, best window | 4 | 7738 | 3853 | 2.01x |
+**First, how this was nearly got wrong.** The obvious comparison is peak against
+peak - 11790 dgram/s at 4.97x with two streams, 7738 at 2.01x with four - and it
+is worthless. Those windows are 34% apart in rate on a link that varied fivefold
+across the session, and aggregation is already known to be rate-dependent (22).
+Comparing them is precisely what this section's own drift rule forbids.
 
-**34% fewer datagrams arriving, 63% more skbs handed to the stack.** Doubling
-the stream count did not raise the offered load; it lowered it, and it made the
-receive path do considerably more work for what did arrive.
+**The rate-matched pair is the one that carries weight:**
+
+| | streams | sources | dgram/s | skb/s | agg |
+|---|---|---|---|---|---|
+| previous run, control window | 2 | 1 | 6695 | 2183 | 3.07x |
+| this run, backlog-1000 | 4 | 4 | 6591 | 3355 | 1.96x |
+
+**1.6% apart in datagram rate - inside the 10% this section calls comparable -
+and aggregation is 36% lower while the stack takes 54% more skbs.**
+
+And rate alone does not explain it. Run 3 is the control for that: two streams at
+~3500 dgram/s also gave agg ~2.0. This run carried **twice that rate for the same
+aggregation**, where a purely rate-driven effect would have put it well above.
 
 The mechanism is not subtle once stated. GRO merges consecutive packets **of the
 same flow**. With four flows interleaving on one link, the next packet is the
@@ -4737,13 +4748,33 @@ less traffic.
 Two of the four sources compound it: `fsn1` and `nbg1` are in Germany, so two of
 the four streams were trans-Atlantic. They added flows without adding rate.
 
-**Consequences for every comparison in this section.** Stream count is not a
-free knob - it changes what is being measured. Runs at different stream counts
-are not comparable on `skb/s`, on `agg`, or on anything downstream of how much
-per-packet work the stack does. The instinct that drove this whole detour, that
-more streams means more load and therefore a better test, is wrong on this link.
-For the GRO question specifically, **fewer and fatter flows are the harder test
-of the receive path**, not more of them.
+#### How far this actually goes, graded
+
+- **The figures**: E1. Read straight off the output, arithmetic on top.
+- **"aggregation is lower in the four-stream run"**: E1, on the rate-matched
+  pair above.
+- **"because GRO merges within a flow"**: E2. That is how `napi_gro_receive()`
+  works, not something inferred from these numbers.
+- **"more streams *causes* less GRO"**: **E3.** One window per condition, drawn
+  from two different runs, and the four-stream run also changed the source count
+  *and* the source geography. Two of its four streams were trans-Atlantic, which
+  is its own confound - and one I inferred from the hostnames `fsn1` and `nbg1`
+  rather than measuring. Nothing here is a controlled experiment.
+
+The mechanism is sound and the rate-matched pair fits it, but the claim is
+supported rather than established, and it should not be written down as though
+it were measured.
+
+**The controlled test is cheap and has not been run:** the same two sources, the
+same session, only `STREAMS` differing, alternated so link drift shows as
+spread. Four `--baseline` windows, about two minutes.
+
+**Consequences meanwhile.** Stream count is not a free knob - it plausibly
+changes what is being measured, so runs at different counts should not be
+compared on `skb/s`, on `agg`, or on anything downstream of per-packet stack
+work until this is settled. The instinct that drove this detour, that more
+streams means more load and therefore a better test, produced a *lower* datagram
+rate here, which is measured and not in doubt.
 
 #### What it changes
 
