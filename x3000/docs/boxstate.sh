@@ -184,16 +184,55 @@ bs_gro_max() {
   ip -d link show "$1" 2>/dev/null | tr ' ' '\n' \
     | grep -A1 '^gro_max_size$' | tail -1 || true
 }
+# The two GRO bits the core leaves OFF, which therefore say something when set.
+#
+# NETIF_F_GRO is in NETIF_F_SOFT_FEATURES and register_netdevice() turns it on
+# for every netdev (dev.c:10575), so reading it back says nothing - which is why
+# bs_gro_effective() exists. These two are in NETIF_F_SOFT_FEATURES_OFF
+# (netdev_features.h:240): exposed in hw_features, off unless somebody set them.
+# So unlike gro, "on" here is a fact about this box rather than about Linux.
+#
+# rx-udp-gro-forwarding (NETIF_F_GRO_UDP_FWD) lets GRO aggregate UDP the router
+# FORWARDS rather than terminates - udp_offload.c:654 gates the !sk case on it.
+# Without it, forwarded UDP gets no GRO at all. It was turned on by hand on
+# 2026-09-14 and this snapshot could not see it, which is how it got added.
+bs_gro_udp_fwd() {
+  bs_have ethtool || { echo "-"; return; }
+  ethtool -k "$1" 2>/dev/null | awk '/^rx-udp-gro-forwarding:/{print $2}'
+}
+bs_gro_fraglist() {
+  bs_have ethtool || { echo "-"; return; }
+  ethtool -k "$1" 2>/dev/null | awk '/^rx-gro-list:/{print $2}'
+}
+
 bs_threaded()  { cat "/sys/class/net/$1/threaded" 2>/dev/null || echo "-"; }
 bs_backlog()   { cat /proc/sys/net/core/netdev_max_backlog 2>/dev/null || true; }
 bs_steering()  { uci -q get network.globals.packet_steering 2>/dev/null || echo unset; }
-bs_rps() {
+# Read one attribute across every queue of an interface.
+#
+# `[ -r ]` is not a sufficient guard here and the state capture proved it: the
+# 2026-09-14 clean-boot snapshot printed "cat: read error: No such file or
+# directory" nine times, interleaved with the values it did read. The test
+# passes because open() succeeds - the file exists with a readable mode - and
+# then read() returns -ENOENT, which sysfs does when the backing object has no
+# value to show. That happens on bridges and wireless vifs for xps_cpus and for
+# rps_flow_cnt.
+#
+# So the read itself has to be allowed to fail: stderr to /dev/null, and an
+# empty result contributes nothing rather than an error line. A reference
+# document that prints errors between its facts invites the reader to wonder
+# which of the facts also failed.
+bs_qattr() {
   m=""
-  for q in /sys/class/net/$1/queues/rx-*/rps_cpus; do
-    [ -r "$q" ] && m="$m $(cat "$q")"
+  for q in /sys/class/net/$1/queues/$2-*/$3; do
+    [ -r "$q" ] || continue
+    v=$(cat "$q" 2>/dev/null) || continue
+    [ -n "$v" ] && m="$m $v"
   done
   echo "${m# }"
 }
+
+bs_rps() { bs_qattr "$1" rx rps_cpus; }
 
 # RFS is not RPS. rps_cpus says which CPUs a queue may steer to; rps_flow_cnt
 # and the global rps_sock_flow_entries say whether flows are additionally
@@ -201,20 +240,8 @@ bs_rps() {
 # entirely off, which is the usual OpenWrt default, and the two answer
 # different questions about where a packet is processed.
 bs_rfs_global() { cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true; }
-bs_rfs() {
-  m=""
-  for q in /sys/class/net/$1/queues/rx-*/rps_flow_cnt; do
-    [ -r "$q" ] && m="$m $(cat "$q")"
-  done
-  echo "${m# }"
-}
-bs_xps() {
-  m=""
-  for q in /sys/class/net/$1/queues/tx-*/xps_cpus; do
-    [ -r "$q" ] && m="$m $(cat "$q")"
-  done
-  echo "${m# }"
-}
+bs_rfs() { bs_qattr "$1" rx rps_flow_cnt; }
+bs_xps() { bs_qattr "$1" tx xps_cpus; }
 
 # TCP congestion control. It decides the shape of every throughput and latency
 # number this tree records, and nothing was reading it: cubic and bbr fill a
@@ -519,8 +546,20 @@ bs_note_direct_scope() {
       wired="$wired $p"
     fi
   done
-  [ -n "$wired" ] && bs_note "XMIT_DIRECT is reachable for clients on:$wired"
-  [ -n "$wifi" ] && bs_note "and not for clients on:$wifi - the vif has an ndo_fill_forward_path that fails (23.17)"
+  # Being a plain netdev is necessary for XMIT_DIRECT but not sufficient: 23.17
+  # established that the bridge PORT must also be in the flowtable device list.
+  # An earlier revision reported "XMIT_DIRECT is reachable for clients on: eth1"
+  # in the same snapshot whose line above said eth1 was missing from that list -
+  # two contradicting statements, three lines apart, in the document every other
+  # measurement is read against. Split the wired ports by what the flowtable
+  # actually holds.
+  _in="" _out=""
+  for p in $wired; do
+    if bs_ft_has "$p"; then _in="$_in $p"; else _out="$_out $p"; fi
+  done
+  [ -n "$_in" ]  && bs_note "XMIT_DIRECT is reachable now for clients on:$_in"
+  [ -n "$_out" ] && bs_note "and would be for:$_out - plain netdevs, but not in the flowtable device list (23.17)"
+  [ -n "$wifi" ] && bs_note "and never for:$wifi - the vif has an ndo_fill_forward_path that fails, whatever the list says (23.18)"
   return 0
 }
 
@@ -669,9 +708,15 @@ say "  under the same one. ecn: 0 off, 1 request and accept, 2 accept only."
 hdr "NAPI, GRO and offloads"
 for i in $(bs_ifaces); do
   [ "$i" = lo ] && continue
-  printf '  %-14s gro=%-5s lro=%-5s threaded=%-3s gro_max_size=%s\n' \
-    "$i" "$(bs_gro "$i")" "$(bs_lro "$i")" "$(bs_threaded "$i")" "$(bs_gro_max "$i")"
+  printf '  %-14s gro=%-5s lro=%-5s threaded=%-3s gro_max=%-6s udp_fwd=%-4s fraglist=%s\n' \
+    "$i" "$(bs_gro "$i")" "$(bs_lro "$i")" "$(bs_threaded "$i")" "$(bs_gro_max "$i")" \
+    "$(bs_gro_udp_fwd "$i")" "$(bs_gro_fraglist "$i")"
 done
+say "  gro is set by the core on every netdev and says nothing on its own; the"
+say "  effective state is gro minus any generic-mode XDP program, which is what"
+say "  bs_gro_effective reads. udp_fwd and fraglist are the opposite: the core"
+say "  leaves both OFF, so \"on\" there was set deliberately and belongs in any"
+say "  window it was set for. udp_fwd only affects UDP this box FORWARDS."
 kv "time_squeeze (total)" "$(bs_squeeze)"
 kv "softnet dropped" "$(bs_softnet_dropped)"
 say "  time_squeeze is a count of NAPI polls that exhausted their budget. It is"
@@ -711,11 +756,31 @@ for n in $(grep -iE 'mhi' /proc/interrupts 2>/dev/null | sed 's/^ *\([0-9]*\):.*
 done
 say "  A mask permitting both CPUs while every count lands on one is the"
 say "  MSI_FLAG_NO_AFFINITY behaviour: threadirqs moves the handler, not the IRQ."
-pgrep irqbalance >/dev/null 2>&1 \
-  && kv "irqbalance" "running - it may move those masks mid-window" \
-  || kv "irqbalance" "not running"
+# Running and enabled are different facts and only one of them survives a
+# reboot. This tree's 93-irqbalance uci-default flips enabled to 1, so the init
+# starts it at every boot - which is why a clean-boot snapshot finds it live.
+_irqb_run=no; pgrep irqbalance >/dev/null 2>&1 && _irqb_run=yes
+_irqb_cfg=$(uci -q get irqbalance.irqbalance.enabled 2>/dev/null || echo unset)
+if [ "$_irqb_run" = yes ]; then
+  kv "irqbalance" "running (uci enabled=$_irqb_cfg) - it may move those masks mid-window"
+else
+  kv "irqbalance" "not running (uci enabled=$_irqb_cfg)"
+fi
+[ "$_irqb_run" = no ] && [ "$_irqb_cfg" = "1" ] && \
+  say "  enabled but not running: it will be back after a reboot."
 grep -q threadirqs /proc/cmdline 2>/dev/null \
   && kv "threadirqs" "set on the cmdline" || kv "threadirqs" "not set"
+
+hdr "queue discipline, every interface"
+for i in $(bs_ifaces); do
+  [ "$i" = lo ] && continue
+  q=$(bs_qdisc "$i" | head -1)
+  [ -n "$q" ] && printf '  %-14s %s\n' "$i" "$q"
+done
+say "  The egress qdisc shapes what leaves each interface. fq_codel without a"
+say "  rate limit does not shape; cake, htb or tbf with one does. A download's"
+say "  bufferbloat is on the INGRESS side of the WAN, which no egress qdisc on"
+say "  wwan0 can touch - that needs an ifb and a shaper on it."
 
 hdr "shaping on $WAN"
 if bs_have tc; then

@@ -4807,3 +4807,92 @@ rate here, which is measured and not in doubt.
   the only open part of it.
 - **Stream count joins the list of things a run must state to be comparable**,
   alongside GRO, backlog, threading and steering.
+
+### 23.26 The controlled test falsifies my own stream-count claim - 2026-09-15
+
+23.25 recorded, at E3, that more load streams means less GRO. The controlled
+test it called for has now been run and **the claim is wrong.** Same two US
+sources on both legs, same session, alternated 2, 4, 2, 4 so link drift shows as
+within-condition spread, run twice.
+
+| # | STREAMS | dgram/s | skb/s | agg |
+|---|---|---|---|---|
+| A1 | 2 | 4697 | 2165 | 2.17x |
+| A2 | 4 | 8299 | 2790 | 2.97x |
+| A3 | 2 | 3160 | 1665 | 1.90x |
+| A4 | 4 | 3105 | 1669 | 1.86x |
+| B1 | 2 | 5495 | 1807 | 3.04x |
+| B2 | 4 | 2758 | 1507 | 1.83x |
+| B3 | 2 | 1939 | 1056 | 1.83x |
+| B4 | 4 | 2780 | 1510 | 1.84x |
+
+**Stream count does not separate them.** Two-stream aggregation spans 1.83 to
+3.04; four-stream spans 1.83 to 2.97. The ranges almost entirely overlap, and
+the single highest aggregation in the set, 2.97x, is a **four**-stream window -
+backwards for the claim. Correlation between stream count and aggregation:
+**-0.11**, which is nothing.
+
+**Rate separates them completely.** Sorted by datagram rate, aggregation is
+monotonic across all eight windows: 1.83, 1.83, 1.84, 1.86, 1.90, 2.17, 3.04,
+2.97. Correlation with rate: **+0.90**.
+
+So aggregation on this link is a function of arrival rate, exactly as 22 already
+recorded, and the stream count is irrelevant. **The rate-dependence was the
+confound I identified, argued past, and should have deferred to.**
+
+The rate-matched pair that convinced me is worth naming, because it looked
+strong and was not. Two streams at 6695 dgram/s gave 3.07x; four at 6591 gave
+1.96x - 1.6% apart in rate, 36% apart in aggregation. What that pair also
+differed in was **source geography**: the two-stream run used one US host, the
+four-stream run used four hosts of which two were in Germany. Trans-Atlantic
+paths have their own pacing and loss behaviour. One matched pair from two
+different runs, with an uncontrolled variable in it, beat by eight windows that
+were actually controlled.
+
+**Withdrawn:** "more streams causes less GRO". **Retained, and now at E1 across
+eight controlled windows:** aggregation tracks arrival rate.
+
+#### What the clean-boot capture turned up
+
+Two defects in `boxstate.sh`, both in the document every other measurement is
+read against.
+
+**It printed errors between its facts.** Nine `cat: read error: No such file or
+directory` lines, interleaved with the RPS values. The guard was `[ -r "$q" ]`,
+which tests that `open()` will succeed - and it does. The **`read()`** then
+returns `-ENOENT`, which sysfs does for `xps_cpus` and `rps_flow_cnt` on bridges
+and wireless vifs where the attribute exists but has no value to show. Replaced
+with `bs_qattr()`, which lets the read fail, discards stderr, and contributes
+nothing for an empty result.
+
+**It contradicted itself three lines apart.** The snapshot said
+`br-lan ports missing from the flowtable list: eth1 ...` and then
+`XMIT_DIRECT is reachable for clients on: eth1`. Both cannot be true: 23.17
+established the bridge port must be *in* the flowtable device list.
+`bs_note_direct_scope()` was splitting ports by whether they are plain netdevs
+and never consulting the list. It now reports three groups - reachable now, would
+be if added, and never - using `bs_ft_has`.
+
+#### Three facts the capture was missing
+
+Raised by the operator, and the first is the sharpest: `rx-udp-gro-forwarding`
+had just been switched on by hand and the snapshot could not see it.
+
+- **`rx-udp-gro-forwarding` and `rx-gro-list`.** Both sit in
+  `NETIF_F_SOFT_FEATURES_OFF` (`netdev_features.h:240`), so unlike `gro` - which
+  the core sets on every netdev - "on" here means somebody set it. That makes
+  them exactly the kind of fact a window has to be read against.
+- **The qdisc on every interface, not only the WAN.** The egress discipline
+  shapes what leaves each link, and only `wwan0` was being shown.
+- **irqbalance enabled vs running.** Only "running" was reported. The uci value
+  is what survives a reboot, and on this tree `93-irqbalance` set it, which is
+  why a clean boot finds it live.
+
+No API bump: the file's own rule is that adding a reader does not need one, and
+no caller's contract changed.
+
+#### Drops, again
+
+Eight more windows, `rx_dropped` 0 in every one. **Twenty-four windows across
+five runs now, 1939 to 11790 dgram/s, not one drop.**
+
