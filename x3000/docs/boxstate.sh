@@ -17,7 +17,7 @@
 #
 # One file rather than four copies, because the copies had already started to
 # drift. xdp-ft-wwan.sh carried a comment admitting its pick() was the same
-# pick() as verify-992a.sh; boxstate.sh and gro-backlog-ab.sh read GRO, the
+# pick() as verify-xdp.sh; boxstate.sh and gro-backlog-ab.sh read GRO, the
 # backlog and the threaded flag two different ways; and gro-backlog-ab.sh was
 # the only script that read time_squeeze, which 18.3 established is the
 # instrument to trust on this box. Sharing them means a fix reaches every
@@ -53,7 +53,7 @@ bs_hdr() { bs_say ""; bs_say "== $*"; }
 #   bs_bad()  { bad  "$1"; }
 #   bs_note() { skip "$1"; }
 #
-# verify-992a.sh does exactly that. Without it its summary would have
+# verify-xdp.sh does exactly that. Without it its summary would have
 # under-reported, because a gate that moved out of the script stopped moving
 # the script's FAIL count with it.
 bs_ok()   { printf '  ok    %s\n' "$*"; }
@@ -78,7 +78,7 @@ bs_pick_ip() {
   return 0
 }
 
-# Likewise for tc: busybox tc cannot load a BPF classifier. verify-992a.sh
+# Likewise for tc: busybox tc cannot load a BPF classifier. verify-xdp.sh
 # picked both binaries with one function that switched on "$1" rather than on
 # the candidate it was testing - so it chose the right branch only because the
 # first entry of each list happened to decide it, and reordering either list
@@ -613,6 +613,332 @@ bs_port_of() {
 }
 
 # Sourced as a library: define everything above, print nothing, return here.
+
+# ---------------------------------------------------------------------------
+# Shared BPF/XDP machinery.
+#
+# Moved here on 2026-09-15 from xdp-ft-wwan.sh, which had the better version of
+# every one of these, so that verify-xdp.sh stops carrying its own. Two
+# implementations of "fetch an object and check it" is how one of them ends up
+# without the check - which is exactly what verify-xdp.sh's fetch_objs was.
+#
+# Callers set the BS_* inputs each helper names and then call it.
+# ---------------------------------------------------------------------------
+
+bs_obj_sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+
+bs_fetch_obj() {
+    mkdir -p "$BS_OBJDIR"
+
+    # A cached object that does not match is discarded rather than reported,
+    # because the recovery is always the same and doing it by hand is a step
+    # that gets skipped.
+    if [ -s "$BS_OBJ" ] && [ -n "$BS_WANT_SHA" ]; then
+        have=$(obj_sha "$BS_OBJ")
+        if [ -n "$have" ] && [ "$have" != "$BS_WANT_SHA" ]; then
+            bs_say "cached $BS_OBJNAME is from another revision - refetching"
+            rm -f "$BS_OBJ"
+        fi
+    fi
+    [ -s "$BS_OBJ" ] && return 0
+
+    if [ -s "$BS_BPF_DIR/$BS_OBJNAME" ]; then
+        cat "$BS_BPF_DIR/$BS_OBJNAME" > "$BS_OBJ"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$BS_OBJ" "$BS_BPF_URL/$BS_OBJNAME" || true
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$BS_OBJ" "$BS_BPF_URL/$BS_OBJNAME" || true
+    fi
+    [ -s "$BS_OBJ" ] || {
+        bs_say "no object: put $BS_OBJNAME in $BS_BPF_DIR, or let the router reach"
+        bs_say "$BS_BPF_URL"
+        return 1
+    }
+
+    # A mismatch here is the script and the object coming from different
+    # revisions, which is fatal: the slot labels would name the wrong
+    # counters. An image without sha256sum loses the check and says so,
+    # rather than failing a box that is otherwise fine.
+    if [ -n "$BS_WANT_SHA" ]; then
+        got=$(obj_sha "$BS_OBJ")
+        if [ -z "$got" ]; then
+            bs_say "note: no sha256sum on this image - object not verified"
+        elif [ "$got" != "$BS_WANT_SHA" ]; then
+            bs_say "FATAL: $BS_OBJNAME does not match this script."
+            bs_say "  want $BS_WANT_SHA"
+            bs_say "  got  $got"
+            bs_say "  Pull the tree again so the script and the object come"
+            bs_say "  from the same revision, then rm -rf $BS_OBJDIR"
+            return 1
+        fi
+    fi
+}
+
+bs_xdp_load_attach() {
+    mount | grep -q '/sys/fs/bpf' || mount -t bpf bpf /sys/fs/bpf
+    bs_fetch_obj
+    rm -rf "$BS_PINDIR" "$BS_MAPDIR" 2>/dev/null || true
+
+    if ! bpftool prog loadall "$BS_OBJ" "$BS_PINDIR" pinmaps "$BS_MAPDIR"; then
+        bs_say "load failed - nothing reached the kernel and nothing is attached"
+        return 1
+    fi
+    if ! "${BS_IP:-ip}" link set dev "$BS_IFACE" xdp pinned "$BS_PINDIR/$BS_PROGNAME" 2>"$BS_OBJDIR/err"; then
+        bs_say "attach failed - the program loaded but is not on $BS_IFACE"
+        sed -n '1,2p' "$BS_OBJDIR/err" | sed 's/^/        /'
+        rm -rf "$BS_PINDIR" "$BS_MAPDIR" 2>/dev/null || true
+        return 1
+    fi
+    # Confirm rather than trust the exit code: an earlier version of this
+    # script reported a successful attach after ip had failed, because inside
+    # an && list set -e does not fire.
+    #
+    # And confirm WHICH MODE, not merely that something attached. Plain `ip
+    # link set ... xdp` is best-effort: dev_xdp_mode() (net/core/dev.c:9444)
+    # takes the driver's ndo_bpf if it has one and falls to skb mode if not,
+    # with no retry. That choice decides whether 991's GRO survives, because
+    # only the skb path sets dev->xdp_prog, which is what netif_elide_gro()
+    # tests and what gro_cells_receive() checks per datagram - landing in
+    # generic mode silently reverts the WAN to its pre-991 netif_rx() path.
+    # A grep for 'prog/xdp' cannot see the difference: iproute2 spells the
+    # skb attachment 'prog/xdpgeneric', which that pattern also matches.
+    _mode=$(bs_xdp_mode "$BS_IFACE")
+    case "$_mode" in
+        native)
+            bs_ok "attached to $BS_IFACE in native mode (991's GRO intact)" ;;
+        generic)
+            bs_note "attached to $BS_IFACE in GENERIC mode - dev->xdp_prog is set,"
+            bs_note "  so netif_elide_gro() is now true and gro_cells_receive()"
+            bs_note "  falls through to netif_rx(). 991's GRO is OFF while this"
+            bs_note "  program is attached. Expect 992 to be missing from the"
+            bs_note "  kernel; with it, dev_xdp_mode() would have chosen native." ;;
+        offload)
+            bs_ok "attached to $BS_IFACE in hardware-offload mode" ;;
+        none)
+            bs_say "attach reported success but no program is on $BS_IFACE"
+            return 1 ;;
+        *)
+            bs_note "attached to $BS_IFACE, but no xdp-capable ip could read the mode"
+            bs_note "  - cannot tell whether 991's GRO survived the attach" ;;
+    esac
+}
+
+bs_dump_slots() {
+    _map=$1
+    [ -e "$BS_MAPDIR/$_map" ] || { bs_say "  $_map not pinned"; return 1; }
+    # Ask for JSON explicitly rather than taking whatever this build's bpftool
+    # prints by default. A bpftool too old for -j fails here, leaves raw empty
+    # and the plain dump is parsed instead.
+    raw=$(bpftool -j map dump pinned "$BS_MAPDIR/$_map" 2>/dev/null) || raw=
+    [ -n "$raw" ] || raw=$(bpftool map dump pinned "$BS_MAPDIR/$_map" 2>/dev/null) || raw=
+    if [ -z "$raw" ]; then
+        bs_say "  bpftool printed nothing for $BS_MAPDIR/$_map"
+        return 1
+    fi
+
+    # Sum the per-CPU values with awk. Not python3, which a lean image may
+    # lack, and no strtonum, which is a gawk extension busybox does not have.
+    #
+    # Three output shapes have to be handled, because which one appears
+    # depends on the bpftool build and on whether the map carries BTF:
+    #
+    #   text     key: 00 00 00 00  value (CPU 00): 27 f1 00 ...
+    #   json     {"key":["0x00",...],"values":[{"cpu":0,"value":["0x27",...]}]}
+    #   json+btf the same, with a "formatted" object repeating the entry in
+    #            decimal (tools/bpf/bpftool/map.c:161-186, v6.12)
+    #
+    # The third shape carries every counter twice, so when "formatted" is
+    # present only those objects are parsed and the hex arrays are dropped.
+    # Counting both is a silent doubling, which is worse than a parse error.
+    #
+    # The JSON scan walks the buffer as a token stream rather than line by
+    # line: bpftool without -p emits the whole map on one line, and a
+    # line-oriented rule reading that collapses every digit in the map into
+    # one number.
+    out=$(printf '%s\n' "$raw" | awk -v slots="$2" '
+    function h2d(x,   i, d, v) {
+        v = 0; x = tolower(x)
+        for (i = 1; i <= length(x); i++) {
+            d = index("0123456789abcdef", substr(x, i, 1)) - 1
+            if (d >= 0) v = v * 16 + d
+        }
+        return v
+    }
+    function acc(s,   i, m, v) {
+        if (k < 0) return
+        m = split(s, b, " "); v = 0
+        for (i = m; i >= 1; i--) if (b[i] ~ /^[0-9a-fA-F][0-9a-fA-F]$/) v = v * 256 + h2d(b[i])
+        tot[k] += v
+    }
+    # Read the number after a JSON name, either a bare decimal or a
+    # little-endian array of "0xNN" bytes. Leaves the position just past it
+    # in gp so the caller can carry on from there.
+    function jnum(s, p,   c, e, t, m, i, v) {
+        while (p <= length(s)) {
+            c = substr(s, p, 1)
+            if (c == ":" || c == " " || c == "\t") { p++; continue }
+            break
+        }
+        if (substr(s, p, 1) == "[") {
+            e = index(substr(s, p), "]")
+            if (e == 0) { gp = length(s) + 1; return 0 }
+            t = substr(s, p + 1, e - 2)
+            gp = p + e
+            m = split(t, b, ","); v = 0
+            for (i = m; i >= 1; i--) v = v * 256 + h2d(b[i])
+            return v
+        }
+        v = 0
+        while (p <= length(s)) {
+            c = substr(s, p, 1)
+            if (c >= "0" && c <= "9") { v = v * 10 + (c + 0); p++ } else break
+        }
+        gp = p
+        return v
+    }
+    # Keep only the balanced object after each "formatted" name. Safe here
+    # because the map key and value are integers, so no string in the dump
+    # can carry an unbalanced brace.
+    function fmtonly(s,   out, p, q, d, c, st, L) {
+        out = ""; p = 1; L = length(s)
+        while ((q = index(substr(s, p), "\"formatted\"")) > 0) {
+            p = p + q + 10
+            while (p <= L && substr(s, p, 1) != "{") p++
+            st = p; d = 0
+            while (p <= L) {
+                c = substr(s, p, 1)
+                if (c == "{") d++
+                else if (c == "}") { d--; if (d == 0) { p++; break } }
+                p++
+            }
+            out = out substr(s, st, p - st) " "
+        }
+        return out
+    }
+    BEGIN {
+        nslot = split(slots, n, " ")
+        k = -1; want_key = 0; json = 0
+    }
+    # Once a JSON token has been seen every later line belongs to the buffer,
+    # including continuation lines carrying neither name.
+    json || /"key"|"values"/ { json = 1; buf = buf $0 " "; next }
+    /key:/ {
+        line = $0; sub(/.*key:[ \t]*/, "", line)
+        if (line ~ /^[0-9a-fA-F][0-9a-fA-F]/) { split(line, a, " "); k = h2d(a[1]) } else want_key = 1
+        if ($0 ~ /value/) { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); acc(v) }
+        next
+    }
+    want_key && /^[ \t]*[0-9a-fA-F][0-9a-fA-F]/ { split($0, a, " "); k = h2d(a[1]); want_key = 0; next }
+    /value/ { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); if (v ~ /[0-9a-fA-F]/) acc(v); next }
+    /^[ \t]*[0-9a-fA-F][0-9a-fA-F]([ \t]+[0-9a-fA-F][0-9a-fA-F])*[ \t]*$/ { acc($0) }
+    END {
+        if (json) {
+            if (index(buf, "\"formatted\"")) buf = fmtonly(buf)
+            k = -1; p = 1; L = length(buf)
+            while (p <= L) {
+                s = substr(buf, p)
+                kp = index(s, "\"key\"")
+                vp = index(s, "\"value\"")
+                if (kp == 0 && vp == 0) break
+                if (kp != 0 && (vp == 0 || kp < vp)) {
+                    np = p + kp + 4
+                    k = jnum(buf, np)
+                } else {
+                    np = p + vp + 6
+                    v = jnum(buf, np)
+                    if (k >= 0) tot[k] += v
+                }
+                # Always move past the token just read, even when no
+                # number followed it, or this loop never terminates.
+                p = (gp > np) ? gp : np
+            }
+        }
+        for (i = 0; i < nslot; i++) printf "  %-15s %d\n", n[i+1], tot[i] + 0
+    }
+    ')
+    printf '%s\n' "$out"
+
+    # Every slot zero against a pinned map means the parser is the likelier
+    # suspect, not the program. Reading zeros off live counters cost a whole
+    # debugging round once, so show what bpftool actually printed instead of
+    # leaving the next reader to discover the format the hard way.
+    if ! printf '%s\n' "$out" | grep -qv ' 0$'; then
+        bs_say ""
+        bs_say "  every slot of $_map reads zero. If traffic did cross $BS_IFACE while"
+        bs_say "  the program was attached, suspect this parser before the program."
+        bs_say "  bpftool printed:"
+        printf '%s\n' "$raw" | cut -c1-200 | head -4 | sed 's/^/    /'
+    fi
+}
+
+# Read an interface's packet counters. Both directions, because one of them is
+# the tell described below.
+#
+#   bs_dev_counters <iface>   ->  "<rx_packets> <tx_packets>"
+bs_dev_counters() {
+    sed -n "s/^[[:space:]]*$1:[[:space:]]*/ /p" /proc/net/dev |
+        awk '{print $2, $10}'
+}
+
+# Run a traffic generator and refuse to let the caller believe a counter that
+# never moved.
+#
+#   bs_traffic_gate <iface> <command...>
+#
+# Returns 0 only if the command succeeded AND the interface's packet counters
+# actually changed. Prints what it saw either way.
+#
+# This exists because of 2026-09-15. Three consecutive XDP runs reported zero
+# packets through the attached program. I read that first as "the kernel hook
+# is not running" and then as "the traffic is leaving by another interface",
+# and went looking at routing tables. Both were wrong. The cause was the
+# generator: busybox ping accepts -i SECS but will not parse a fractional
+# value, so `ping -c 20 -i 0.2` printed usage and sent nothing - and its output
+# was redirected to /dev/null, which made the failure invisible.
+#
+# The tell was in the counters twice over and I walked past it both times:
+# TRANSMIT was unchanged as well as receive. An interface that is not receiving
+# is a receive problem. An interface that is not transmitting either, while
+# ping reports replies, is a generator that never ran.
+#
+# Two rules follow, and they are enforced here rather than left to whoever
+# writes the next harness: never discard a generator's output and status, and
+# never read a derived counter that has not been shown to move.
+bs_traffic_gate() {
+    _tg_if=$1
+    shift
+
+    set -- "$@"
+    _tg_before=$(bs_dev_counters "$_tg_if")
+    _tg_rx0=${_tg_before% *}
+    _tg_tx0=${_tg_before#* }
+
+    _tg_out=$("$@" 2>&1)
+    _tg_rc=$?
+
+    _tg_after=$(bs_dev_counters "$_tg_if")
+    _tg_rx1=${_tg_after% *}
+    _tg_tx1=${_tg_after#* }
+
+    if [ "$_tg_rc" -ne 0 ]; then
+        bs_bad "traffic generator failed (exit $_tg_rc) - nothing was measured"
+        printf '%s\n' "$_tg_out" | sed -n '1,3p' | sed 's/^/          /'
+        return 1
+    fi
+
+    if [ "$_tg_rx1" = "$_tg_rx0" ] && [ "$_tg_tx1" = "$_tg_tx0" ]; then
+        bs_bad "$_tg_if moved no packets in either direction - nothing was measured"
+        bs_say "  rx $_tg_rx0 tx $_tg_tx0, unchanged. The generator exited 0 but"
+        bs_say "  sent nothing, or the traffic did not use this interface."
+        return 1
+    fi
+
+    bs_say "  $_tg_if rx $_tg_rx0 -> $_tg_rx1, tx $_tg_tx0 -> $_tg_tx1"
+    return 0
+}
+
+
 [ -n "${BOXSTATE_LIB:-}" ] && return 0
 
 # ------------------------------------------------------------------- report

@@ -1,6 +1,6 @@
 # BPF source for `xdp-ft-wwan.sh`
 
-Same arrangement as `verify-992a-sources.md`, for the same reasons: the objects
+Same arrangement as `verify-xdp-sources.md`, for the same reasons: the objects
 live in `bpf/` as `.bpf` files so the repo's blanket `*.o` rule does not swallow
 them, they ship as files rather than base64 because busybox here has no `base64`
 applet, and each source sits next to its object so the object is auditable and
@@ -25,7 +25,7 @@ breaks the struct mirrors, the probe still answers whether the kfunc itself
 works. It is the canary, and canaries are kept in their own cage.
 
 Kept as separate `.c` files rather than inlined here: the fastpath is roughly 700
-lines, where the three objects in `verify-992a-sources.md` are a dozen each.
+lines, where the three objects in `verify-xdp-sources.md` are a dozen each.
 
 Both programs handle IPv4 and IPv6. The first revision was IPv4 only; on this
 link that made every counter a flat line, for the reason set out under

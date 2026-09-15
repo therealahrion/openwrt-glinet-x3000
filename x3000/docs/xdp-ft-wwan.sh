@@ -103,11 +103,30 @@ if [ -z "$IP" ]; then
 fi
 
 # Fetched or read from disk, never base64 inside the script: busybox here ships
-# without the base64 applet. Same layout as verify-992a.sh, whose objects this
+# without the base64 applet. Same layout as verify-xdp.sh, whose objects this
 # sits beside. Named .bpf rather than .o because of the blanket *.o gitignore.
 BPF_URL=${BPF_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/bpf}
 case "$0" in */*) _here=${0%/*} ;; *) _here=. ;; esac
 BPF_DIR=${BPF_DIR:-$_here/bpf}
+
+# The shared machinery lives in boxstate.sh as of 2026-09-15: object fetch and
+# verification, the load-and-confirm-the-mode attach, and the map slot parser.
+# This script had the better version of all three, so those are the ones that
+# moved; verify-xdp.sh now calls the same code instead of its own thinner copy.
+# Binding the script's names to the library's inputs here keeps the rest of the
+# file reading the way it did.
+BS_OBJDIR=$D
+BS_OBJ=$OBJ
+BS_OBJNAME=$OBJNAME
+BS_WANT_SHA=$WANT_SHA
+BS_BPF_DIR=$BPF_DIR
+BS_BPF_URL=$BPF_URL
+BS_PINDIR=$PINDIR
+BS_MAPDIR=$MAPDIR
+BS_PROGNAME=$PROGNAME
+BS_IFACE=$IFACE
+BS_IP=$IP
+
 
 # The sha256 of each object as committed, so a copy cached in $D from an earlier
 # revision cannot be used silently. That is not hypothetical: this script updates
@@ -124,54 +143,6 @@ xdp_ft_probe.bpf)
 *)	WANT_SHA= ;;
 esac
 
-obj_sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
-
-fetch_obj() {
-	mkdir -p "$D"
-
-	# A cached object that does not match is discarded rather than reported,
-	# because the recovery is always the same and doing it by hand is a step
-	# that gets skipped.
-	if [ -s "$OBJ" ] && [ -n "$WANT_SHA" ]; then
-		have=$(obj_sha "$OBJ")
-		if [ -n "$have" ] && [ "$have" != "$WANT_SHA" ]; then
-			say "cached $OBJNAME is from another revision - refetching"
-			rm -f "$OBJ"
-		fi
-	fi
-	[ -s "$OBJ" ] && return 0
-
-	if [ -s "$BPF_DIR/$OBJNAME" ]; then
-		cat "$BPF_DIR/$OBJNAME" > "$OBJ"
-	elif command -v curl >/dev/null 2>&1; then
-		curl -fsSL -o "$OBJ" "$BPF_URL/$OBJNAME" || true
-	elif command -v wget >/dev/null 2>&1; then
-		wget -q -O "$OBJ" "$BPF_URL/$OBJNAME" || true
-	fi
-	[ -s "$OBJ" ] || {
-		say "no object: put $OBJNAME in $BPF_DIR, or let the router reach"
-		say "$BPF_URL"
-		exit 1
-	}
-
-	# A mismatch here is the script and the object coming from different
-	# revisions, which is fatal: the slot labels would name the wrong
-	# counters. An image without sha256sum loses the check and says so,
-	# rather than failing a box that is otherwise fine.
-	if [ -n "$WANT_SHA" ]; then
-		got=$(obj_sha "$OBJ")
-		if [ -z "$got" ]; then
-			say "note: no sha256sum on this image - object not verified"
-		elif [ "$got" != "$WANT_SHA" ]; then
-			say "FATAL: $OBJNAME does not match this script."
-			say "  want $WANT_SHA"
-			say "  got  $got"
-			say "  Pull the tree again so the script and the object come"
-			say "  from the same revision, then rm -rf $D"
-			exit 1
-		fi
-	fi
-}
 
 check() {
 	FAILED=0
@@ -200,7 +171,7 @@ check() {
 	bs_require_btf
 
 	# nf_flow_table is a module here, so the kfunc's BTF is the module's and
-	# not vmlinux - the same place verify-992a.sh looks.
+	# not vmlinux - the same place verify-xdp.sh looks.
 	modprobe nf_flow_table 2>/dev/null || true
 	bs_require_kfunc nf_flow_table bpf_xdp_flow_lookup
 
@@ -233,54 +204,6 @@ check() {
 	return 1
 }
 
-load() {
-	mount | grep -q '/sys/fs/bpf' || mount -t bpf bpf /sys/fs/bpf
-	fetch_obj
-	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
-
-	if ! bpftool prog loadall "$OBJ" "$PINDIR" pinmaps "$MAPDIR"; then
-		say "load failed - nothing reached the kernel and nothing is attached"
-		return 1
-	fi
-	if ! "$IP" link set dev "$IFACE" xdp pinned "$PINDIR/$PROGNAME" 2>"$D/err"; then
-		say "attach failed - the program loaded but is not on $IFACE"
-		sed -n '1,2p' "$D/err" | sed 's/^/        /'
-		rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
-		return 1
-	fi
-	# Confirm rather than trust the exit code: an earlier version of this
-	# script reported a successful attach after ip had failed, because inside
-	# an && list set -e does not fire.
-	#
-	# And confirm WHICH MODE, not merely that something attached. Plain `ip
-	# link set ... xdp` is best-effort: dev_xdp_mode() (net/core/dev.c:9444)
-	# takes the driver's ndo_bpf if it has one and falls to skb mode if not,
-	# with no retry. That choice decides whether 991's GRO survives, because
-	# only the skb path sets dev->xdp_prog, which is what netif_elide_gro()
-	# tests and what gro_cells_receive() checks per datagram - landing in
-	# generic mode silently reverts the WAN to its pre-991 netif_rx() path.
-	# A grep for 'prog/xdp' cannot see the difference: iproute2 spells the
-	# skb attachment 'prog/xdpgeneric', which that pattern also matches.
-	_mode=$(bs_xdp_mode "$IFACE")
-	case "$_mode" in
-		native)
-			ok "attached to $IFACE in native mode (991's GRO intact)" ;;
-		generic)
-			warn "attached to $IFACE in GENERIC mode - dev->xdp_prog is set,"
-			warn "  so netif_elide_gro() is now true and gro_cells_receive()"
-			warn "  falls through to netif_rx(). 991's GRO is OFF while this"
-			warn "  program is attached. Expect 992 to be missing from the"
-			warn "  kernel; with it, dev_xdp_mode() would have chosen native." ;;
-		offload)
-			ok "attached to $IFACE in hardware-offload mode" ;;
-		none)
-			say "attach reported success but no program is on $IFACE"
-			return 1 ;;
-		*)
-			warn "attached to $IFACE, but no xdp-capable ip could read the mode"
-			warn "  - cannot tell whether 991's GRO survived the attach" ;;
-	esac
-}
 
 legend() {
 	say ""
@@ -392,154 +315,7 @@ adopt_slots_from_map() {
 # one already has fixed - the silent doubling when BTF adds a "formatted"
 # object, and the whole-map-on-one-line token walk.
 #
-#   dump_slots <map name> <space-separated labels>
-dump_slots() {
-	_map=$1
-	[ -e "$MAPDIR/$_map" ] || { say "  $_map not pinned"; return 1; }
-	# Ask for JSON explicitly rather than taking whatever this build's bpftool
-	# prints by default. A bpftool too old for -j fails here, leaves raw empty
-	# and the plain dump is parsed instead.
-	raw=$(bpftool -j map dump pinned "$MAPDIR/$_map" 2>/dev/null) || raw=
-	[ -n "$raw" ] || raw=$(bpftool map dump pinned "$MAPDIR/$_map" 2>/dev/null) || raw=
-	if [ -z "$raw" ]; then
-		say "  bpftool printed nothing for $MAPDIR/$_map"
-		return 1
-	fi
-
-	# Sum the per-CPU values with awk. Not python3, which a lean image may
-	# lack, and no strtonum, which is a gawk extension busybox does not have.
-	#
-	# Three output shapes have to be handled, because which one appears
-	# depends on the bpftool build and on whether the map carries BTF:
-	#
-	#   text     key: 00 00 00 00  value (CPU 00): 27 f1 00 ...
-	#   json     {"key":["0x00",...],"values":[{"cpu":0,"value":["0x27",...]}]}
-	#   json+btf the same, with a "formatted" object repeating the entry in
-	#            decimal (tools/bpf/bpftool/map.c:161-186, v6.12)
-	#
-	# The third shape carries every counter twice, so when "formatted" is
-	# present only those objects are parsed and the hex arrays are dropped.
-	# Counting both is a silent doubling, which is worse than a parse error.
-	#
-	# The JSON scan walks the buffer as a token stream rather than line by
-	# line: bpftool without -p emits the whole map on one line, and a
-	# line-oriented rule reading that collapses every digit in the map into
-	# one number.
-	out=$(printf '%s\n' "$raw" | awk -v slots="$2" '
-	function h2d(x,   i, d, v) {
-		v = 0; x = tolower(x)
-		for (i = 1; i <= length(x); i++) {
-			d = index("0123456789abcdef", substr(x, i, 1)) - 1
-			if (d >= 0) v = v * 16 + d
-		}
-		return v
-	}
-	function acc(s,   i, m, v) {
-		if (k < 0) return
-		m = split(s, b, " "); v = 0
-		for (i = m; i >= 1; i--) if (b[i] ~ /^[0-9a-fA-F][0-9a-fA-F]$/) v = v * 256 + h2d(b[i])
-		tot[k] += v
-	}
-	# Read the number after a JSON name, either a bare decimal or a
-	# little-endian array of "0xNN" bytes. Leaves the position just past it
-	# in gp so the caller can carry on from there.
-	function jnum(s, p,   c, e, t, m, i, v) {
-		while (p <= length(s)) {
-			c = substr(s, p, 1)
-			if (c == ":" || c == " " || c == "\t") { p++; continue }
-			break
-		}
-		if (substr(s, p, 1) == "[") {
-			e = index(substr(s, p), "]")
-			if (e == 0) { gp = length(s) + 1; return 0 }
-			t = substr(s, p + 1, e - 2)
-			gp = p + e
-			m = split(t, b, ","); v = 0
-			for (i = m; i >= 1; i--) v = v * 256 + h2d(b[i])
-			return v
-		}
-		v = 0
-		while (p <= length(s)) {
-			c = substr(s, p, 1)
-			if (c >= "0" && c <= "9") { v = v * 10 + (c + 0); p++ } else break
-		}
-		gp = p
-		return v
-	}
-	# Keep only the balanced object after each "formatted" name. Safe here
-	# because the map key and value are integers, so no string in the dump
-	# can carry an unbalanced brace.
-	function fmtonly(s,   out, p, q, d, c, st, L) {
-		out = ""; p = 1; L = length(s)
-		while ((q = index(substr(s, p), "\"formatted\"")) > 0) {
-			p = p + q + 10
-			while (p <= L && substr(s, p, 1) != "{") p++
-			st = p; d = 0
-			while (p <= L) {
-				c = substr(s, p, 1)
-				if (c == "{") d++
-				else if (c == "}") { d--; if (d == 0) { p++; break } }
-				p++
-			}
-			out = out substr(s, st, p - st) " "
-		}
-		return out
-	}
-	BEGIN {
-		nslot = split(slots, n, " ")
-		k = -1; want_key = 0; json = 0
-	}
-	# Once a JSON token has been seen every later line belongs to the buffer,
-	# including continuation lines carrying neither name.
-	json || /"key"|"values"/ { json = 1; buf = buf $0 " "; next }
-	/key:/ {
-		line = $0; sub(/.*key:[ \t]*/, "", line)
-		if (line ~ /^[0-9a-fA-F][0-9a-fA-F]/) { split(line, a, " "); k = h2d(a[1]) } else want_key = 1
-		if ($0 ~ /value/) { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); acc(v) }
-		next
-	}
-	want_key && /^[ \t]*[0-9a-fA-F][0-9a-fA-F]/ { split($0, a, " "); k = h2d(a[1]); want_key = 0; next }
-	/value/ { v = $0; sub(/.*value[^:]*:[ \t]*/, "", v); if (v ~ /[0-9a-fA-F]/) acc(v); next }
-	/^[ \t]*[0-9a-fA-F][0-9a-fA-F]([ \t]+[0-9a-fA-F][0-9a-fA-F])*[ \t]*$/ { acc($0) }
-	END {
-		if (json) {
-			if (index(buf, "\"formatted\"")) buf = fmtonly(buf)
-			k = -1; p = 1; L = length(buf)
-			while (p <= L) {
-				s = substr(buf, p)
-				kp = index(s, "\"key\"")
-				vp = index(s, "\"value\"")
-				if (kp == 0 && vp == 0) break
-				if (kp != 0 && (vp == 0 || kp < vp)) {
-					np = p + kp + 4
-					k = jnum(buf, np)
-				} else {
-					np = p + vp + 6
-					v = jnum(buf, np)
-					if (k >= 0) tot[k] += v
-				}
-				# Always move past the token just read, even when no
-				# number followed it, or this loop never terminates.
-				p = (gp > np) ? gp : np
-			}
-		}
-		for (i = 0; i < nslot; i++) printf "  %-15s %d\n", n[i+1], tot[i] + 0
-	}
-	')
-	printf '%s\n' "$out"
-
-	# Every slot zero against a pinned map means the parser is the likelier
-	# suspect, not the program. Reading zeros off live counters cost a whole
-	# debugging round once, so show what bpftool actually printed instead of
-	# leaving the next reader to discover the format the hard way.
-	if ! printf '%s\n' "$out" | grep -qv ' 0$'; then
-		say ""
-		say "  every slot of $_map reads zero. If traffic did cross $IFACE while"
-		say "  the program was attached, suspect this parser before the program."
-		say "  bpftool printed:"
-		printf '%s\n' "$raw" | cut -c1-200 | head -4 | sed 's/^/    /'
-	fi
-}
+#   bs_dump_slots <map name> <space-separated labels>
 
 # The relocation constants CO-RE patched in, and the bytes read with them.
 # Diagnostic, and it comes out with the slots it explains - see 23.14.
@@ -549,7 +325,7 @@ dump_relo() {
 	[ -e "$MAPDIR/xdp_ft_relo" ] || return 0
 	say ""
 	say "relocation constants, as libbpf patched them against this kernel:"
-	dump_slots xdp_ft_relo "$RELO_SLOTS" || return 0
+	bs_dump_slots xdp_ft_relo "$RELO_SLOTS" || return 0
 	say ""
 	say "  l3_off and iif_off are the controls. Their reads agreed with the"
 	say "  packet on every lookup, so whatever they say a correct offset looks"
@@ -564,7 +340,7 @@ dump_dirbyte() {
 	[ -e "$MAPDIR/xdp_ft_dirbyte" ] || return 0
 	_l=""; _i=0
 	while [ "$_i" -lt 256 ]; do _l="$_l b$_i"; _i=$((_i + 1)); done
-	_out=$(dump_slots xdp_ft_dirbyte "${_l# }" 2>/dev/null | awk '$2 != 0') || return 0
+	_out=$(bs_dump_slots xdp_ft_dirbyte "${_l# }" 2>/dev/null | awk '$2 != 0') || return 0
 	[ -n "$_out" ] || return 0
 	say ""
 	say "byte at dir_off, every value seen (index is the byte, decimal):"
@@ -580,14 +356,14 @@ dump() {
 	[ -e "$MAPDIR/xdp_ft_stats" ] || { say "not loaded"; return 1; }
 	adopt_slots_from_map
 	legend
-	dump_slots xdp_ft_stats "$SLOTS" || return 1
+	bs_dump_slots xdp_ft_stats "$SLOTS" || return 1
 	dump_relo
 	dump_dirbyte
 }
 
 detach() {
 	# Both modes: a program attached in skb mode is not cleared by `xdp off`
-	# alone. Same pair cleanup() in verify-992a.sh removes.
+	# alone. Same pair cleanup() in verify-xdp.sh removes.
 	unhook
 	rm -rf "$PINDIR" "$MAPDIR" 2>/dev/null || true
 	say "detached and unpinned"
@@ -601,20 +377,20 @@ detach() {
 # the program.
 unhook() {
 	# Both modes: a program attached in skb mode is not cleared by `xdp off`
-	# alone. Same pair cleanup() in verify-992a.sh removes.
+	# alone. Same pair cleanup() in verify-xdp.sh removes.
 	"$IP" link set dev "$IFACE" xdp off 2>/dev/null || true
 	"$IP" link set dev "$IFACE" xdpgeneric off 2>/dev/null || true
 }
 
 # An interrupt during the sample would otherwise leave a program attached to
-# the WAN interface. verify-992a.sh traps for the same reason.
+# the WAN interface. verify-xdp.sh traps for the same reason.
 trap 'echo; echo "interrupted - reverting"; detach; exit 130' INT TERM
 
 case "${1:-check}" in
 check)  check ;;
 probe|dryrun)
 	check || exit 1
-	load  || exit 1
+	bs_xdp_load_attach || exit 1
 	say "sampling ${SECS}s - put traffic through $IFACE now"
 	RX0=$(cat "/sys/class/net/$IFACE/statistics/rx_packets" 2>/dev/null || echo 0)
 	sleep "$SECS"

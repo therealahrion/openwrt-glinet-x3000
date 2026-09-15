@@ -1,6 +1,6 @@
-# BPF sources embedded in `verify-992a.sh`
+# BPF sources for `verify-xdp.sh`
 
-`verify-992a.sh` uses three pre-compiled eBPF objects so the router needs no
+`verify-xdp.sh` uses three pre-compiled eBPF objects so the router needs no
 compiler. They live in `bpf/` next to the script; the script falls back to
 fetching them from the repo over HTTPS if that directory is missing.
 
@@ -24,6 +24,30 @@ clang -O2 -g -target bpf -c xdp_pass.c -o bpf/xdp_pass.bpf
 clang -O2 -g -target bpf -c xdp_drop.c -o bpf/xdp_drop.bpf
 clang -O2 -g -target bpf -c tc_rawip.c -o bpf/tc_rawip.bpf
 ```
+
+The tail probe is built differently and the difference matters, so it has its
+own line:
+
+```sh
+clang -Os -g -target bpfel -c bpf/xdp_tail_probe.bpf.c -o /tmp/t.o
+llvm-strip --strip-debug --keep-section=.BTF /tmp/t.o -o bpf/xdp_tail_probe.bpf
+```
+
+`-Os` and the strip keep it small enough to hand-paste as hex when a router has
+no way to fetch it, and `--keep-section=.BTF` is not optional: the map is
+BTF-defined, and libbpf refuses the object without it. Build from a short path -
+the source filename is recorded in `.BTF.ext`, so building from a long scratch
+directory bakes that path into the committed object.
+
+Checksums, which `verify-xdp.sh` verifies before loading and refuses to run
+without matching. Update these and the objects together:
+
+| object | sha256 |
+|---|---|
+| `xdp_pass.bpf` | `a862ec14a5928c05863155946a4f7b0591e623b33dfa2ffc4b0f39876a497499` |
+| `xdp_drop.bpf` | `c8df00ebec9a03bc4224120120bef008a0b44a6b67fabbd6dd837b5403fa0379` |
+| `tc_rawip.bpf` | `0b45aeded4ecfc9beb21fcb216196b15c4d2dc66021e2c70f9fdc9271c7af0d2` |
+| `xdp_tail_probe.bpf` | `2e34ea12f2189b307f6ccfcee5daf55f1632554ac6d6272a68d812198f639f31` |
 
 ---
 
@@ -119,3 +143,33 @@ char _license[] SEC("license") = "GPL";
 Note `bpf_trace_printk` takes at most three variadic arguments; a fourth is a
 compile error (`too many arguments`), which is why the output is split across
 two calls.
+
+## `xdp_tail_probe.bpf.c` — tells 999's native hook from 992's generic one
+
+The source is committed next to the object at `bpf/xdp_tail_probe.bpf.c`, so it
+is not reproduced here. What it does, and why it is the discriminator:
+
+It calls `bpf_xdp_adjust_tail(ctx, 64)`, records the return value in slot 2 of a
+three-entry array map, undoes the growth if it somehow succeeded - it runs on
+live forwarded traffic and must not leave a packet longer than it arrived - and
+returns `XDP_PASS`.
+
+999 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
+SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`, so `xdp_data_hard_end()`
+(`include/net/xdp.h:147`) lands at the end of the datagram and there is no room
+to grow: the call must return `-EINVAL`. The generic path runs the same program
+over an skb whose allocation kmalloc rounded up, so the same call finds tailroom
+and returns 0.
+
+That difference is the only thing that separates the two paths from userspace.
+Both attach through the same `ndo_bpf` and both report `prog/xdp id N` with no
+`xdpgeneric` qualifier, so `ip -d link` cannot tell them apart.
+
+It also checks `frame_sz`, which is the part worth having. An overstated
+`frame_sz` is what lets `bpf_xdp_adjust_tail()`'s memset run past the end of the
+buffer, and it would show up here as a successful grow. Measured on the flashed
+image 2026-09-15: `xdpdrv` returned `-22`, `xdpgeneric` returned `0` -
+`xdp-methods-tested.md` 24.18.
+
+It has no CO-RE relocations and reads nothing out of any kernel struct, so a
+kernel bump cannot break it the way it can break `xdp_ft_wwan.bpf`.

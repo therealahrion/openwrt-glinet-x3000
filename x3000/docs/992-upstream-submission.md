@@ -41,7 +41,7 @@ first.
 **Measured on an RM520N-GL, 2026-09-12.** This is the run to quote: one tool, one
 invocation, four windows under the same sustained downlink, with the same
 `xdp_pass` program throughout so the only variable is which pointer it is stored
-behind. `x3000/docs/verify-992a.sh --traffic`, sections 4, 6 and 8b. PASS=28,
+behind. `x3000/docs/verify-xdp.sh --traffic`, sections 4, 6 and 8b. PASS=28,
 FAIL=0.
 
 | attach | wwan0 datagrams | IP InReceives | aggregation | dropped | bytes/skb |
@@ -474,11 +474,11 @@ memory, because maintainers change and stale addresses waste reviewer time.
     git send-email --dry-run --to=<from get_maintainer> --cc=netdev@vger.kernel.org v1/*.patch
 
 Also before sending: confirm `net-next` is open, and re-run
-`x3000/docs/verify-992a.sh` against the rebased kernel so the numbers in the
+`x3000/docs/verify-xdp.sh` against the rebased kernel so the numbers in the
 commit messages describe the code actually being submitted rather than the
 6.12.103 build they were taken from.
 
-**Use `x3000/docs/verify-992a.sh`, do not hand-roll this.** Its section 4 already
+**Use `x3000/docs/verify-xdp.sh`, do not hand-roll this.** Its section 4 already
 measures baseline aggregation and its section 6 measures it with a program
 attached in driver mode, with `rx_errors` checked alongside in section 7. Three
 separately hand-written samplers during this work produced 2.09x, 2.12x and 2.07x

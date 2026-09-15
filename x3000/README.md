@@ -382,10 +382,10 @@ x3000/
                                    deadlock for the MHI maintainers.
 │   ├── 992-upstream-submission.md Plan for sending 991 and 992 to netdev,
                                    with the reviewer answers worked out.
-│   ├── verify-992a.sh             On-router verifier for the 991/992/993
+│   ├── verify-xdp.sh              On-router verifier for the 991-999 XDP
                                    platform. Extend this rather than
                                    writing another one-off sampler.
-│   ├── verify-992a-sources.md     The BPF programs that script embeds.
+│   ├── verify-xdp-sources.md      The BPF programs that script embeds.
 │   ├── bpf/                       Their compiled objects, fetched by the
                                    script at run time.
 │   ├── gro-backlog-ab.sh          Load-driven A/B harness for GRO and

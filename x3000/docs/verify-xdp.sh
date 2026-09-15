@@ -1,13 +1,13 @@
 #!/bin/sh
 # =============================================================================
-# GL-X3000 (MT7981A, aarch64 LE) — verify the reworked 992 XDP hook, the kernel
-# config claims, and the telegraf footprint.  Self-contained: the BPF objects
-# are embedded, so nothing needs to be compiled on the box.
+# GL-X3000 (MT7981A, aarch64 LE) — verify the XDP hooks this tree carries on
+# the modem's receive path (992's generic hook, 999's native one), the kernel
+# config claims, and the telegraf footprint. Nothing is compiled on the box.
 #
-#   sh verify-992a.sh              read-only + safe attach tests
-#   sh verify-992a.sh --with-drop  additionally test XDP_DROP (5s WAN blackout)
-#   sh verify-992a.sh --with-tc    additionally test tc-BPF L3/L4 on raw IP
-#   sh verify-992a.sh --traffic    start a WAN download so steps 4/6 have data
+#   sh verify-xdp.sh              read-only + safe attach tests
+#   sh verify-xdp.sh --with-drop  additionally test XDP_DROP (5s WAN blackout)
+#   sh verify-xdp.sh --with-tc    additionally test tc-BPF L3/L4 on raw IP
+#   sh verify-xdp.sh --traffic    start a WAN download so steps 4/6 have data
 #
 # The BPF objects live in bpf/ next to this script. If they are not there the
 # script fetches them from the repo over HTTPS; override with BPF_DIR= or
@@ -143,20 +143,33 @@ trap 'echo; echo "interrupted — reverting"; cleanup; exit 130' INT TERM
 # Fetched rather than embedded: OpenWrt's busybox ships without the base64
 # applet, so a base64 blob in this script cannot be decoded on the router.
 # They are plain little-endian eBPF bytecode, portable to any architecture;
-# sources and build command are in verify-992a-sources.md next to this file.
+# sources and build command are in verify-xdp-sources.md next to this file.
 BPF_URL=${BPF_URL:-https://raw.githubusercontent.com/therealahrion/openwrt-glinet-x3000/openwrt-25.12/x3000/docs/bpf}
 case "$0" in */*) _here=${0%/*} ;; *) _here=. ;; esac
 BPF_DIR=${BPF_DIR:-$_here/bpf}
 
+# The sha256 of each object as committed. This script used to fetch without
+# checking, which meant a copy cached in $D from an older revision was used
+# silently - the same trap xdp-ft-wwan.sh already guarded against. The fetch
+# and the check now come from boxstate.sh, so there is one implementation
+# instead of two and the thinner one is gone. Update these alongside the
+# objects in bpf/.
+obj_want_sha() {
+	case "$1" in
+	xdp_pass)       echo a862ec14a5928c05863155946a4f7b0591e623b33dfa2ffc4b0f39876a497499 ;;
+	xdp_drop)       echo c8df00ebec9a03bc4224120120bef008a0b44a6b67fabbd6dd837b5403fa0379 ;;
+	tc_rawip)       echo 0b45aeded4ecfc9beb21fcb216196b15c4d2dc66021e2c70f9fdc9271c7af0d2 ;;
+	xdp_tail_probe) echo 2e34ea12f2189b307f6ccfcee5daf55f1632554ac6d6272a68d812198f639f31 ;;
+	esac
+}
+
 fetch_objs() {
-	for o in xdp_pass xdp_drop tc_rawip; do
-		if [ -s "$BPF_DIR/$o.bpf" ]; then
-			cat "$BPF_DIR/$o.bpf" > "$D/$o.o"
-		elif command -v curl >/dev/null 2>&1; then
-			curl -fsSL -o "$D/$o.o" "$BPF_URL/$o.bpf" 2>/dev/null
-		elif command -v wget >/dev/null 2>&1; then
-			wget -q -O "$D/$o.o" "$BPF_URL/$o.bpf" 2>/dev/null
-		fi
+	BS_OBJDIR=$D BS_BPF_DIR=$BPF_DIR BS_BPF_URL=$BPF_URL
+	for o in xdp_pass xdp_drop tc_rawip xdp_tail_probe; do
+		BS_OBJNAME=$o.bpf
+		BS_OBJ=$D/$o.o
+		BS_WANT_SHA=$(obj_want_sha "$o")
+		bs_fetch_obj || return 1
 	done
 }
 fetch_objs
@@ -452,6 +465,79 @@ fi
 info "storage / memory:"
 df -h / /overlay 2>/dev/null | sed 's/^/          /'
 free -m 2>/dev/null | sed 's/^/          /'
+
+hdr "13. native vs generic: bpf_xdp_adjust_tail has no room under 999"
+
+# The one probe that separates 999's native hook from 992's generic one. Both
+# attach through the same ndo_bpf and both report "prog/xdp id N" with no
+# xdpgeneric qualifier, so ip -d link cannot tell them apart - that was this
+# test's original method and it was wrong.
+#
+# 999 allocates XDP_PACKET_HEADROOM + datagram + SKB_DATA_ALIGN(sizeof(struct
+# skb_shared_info)) and nothing more, so xdp_data_hard_end() lands at the end
+# of the datagram and growing the tail must fail with -EINVAL. The generic path
+# runs the same program over an skb whose allocation kmalloc rounded up, so the
+# same call finds tailroom and succeeds. Two different answers to one question
+# is only possible if they are different code.
+#
+# Measured 2026-09-15: xdpdrv -22, xdpgeneric 0. See xdp-methods-tested.md 24.18.
+tail_probe() {   # tail_probe <xdpdrv|xdpgeneric>
+	mount | grep -q '/sys/fs/bpf' || mount -t bpf bpf /sys/fs/bpf
+	rm -rf "$TP_PIN" 2>/dev/null
+	mkdir -p "$TP_PIN"
+	bpftool prog load "$D/xdp_tail_probe.o" "$TP_PIN/prog" \
+		type xdp pinmaps "$TP_PIN" 2>/dev/null || { skip "$1: prog load failed"; return 1; }
+	bpftool net attach "$1" pinned "$TP_PIN/prog" dev "$WANIF" 2>/dev/null ||
+		{ skip "$1: attach refused"; rm -rf "$TP_PIN"; return 1; }
+
+	# Never read a counter that has not been shown to move. This gate exists
+	# because three runs on 2026-09-15 reported zero and were read as a kernel
+	# fault when the generator had silently sent nothing.
+	if bs_traffic_gate "$WANIF" ping -c 10 "$PINGHOST"; then
+		_seen=$(bpftool map lookup pinned "$TP_PIN/tailprobe" key 0 0 0 0 2>/dev/null |
+			sed -n 's/.*"value": *//p' | tr -d ' ,')
+		_ret=$(bpftool map lookup pinned "$TP_PIN/tailprobe" key 2 0 0 0 2>/dev/null |
+			sed -n 's/.*"value": *//p' | tr -d ' ,')
+		info "$1: saw $_seen packets, adjust_tail returned $_ret"
+	else
+		_seen=; _ret=
+	fi
+
+	bpftool net detach "$1" dev "$WANIF" 2>/dev/null
+	rm -rf "$TP_PIN"
+	[ -n "$_ret" ]
+}
+
+TP_PIN=/sys/fs/bpf/tailprobe
+PINGHOST=${PINGHOST:-1.1.1.1}
+# 18446744073709551594 is 2**64 - 22, which is how an unsigned map slot spells
+# -EINVAL. Compared as a string: busybox arithmetic on a 64-bit value that
+# large is not worth relying on inside a test.
+EINVAL_U64=18446744073709551594
+
+if [ ! -s "$D/xdp_tail_probe.o" ]; then
+	skip "13: no xdp_tail_probe object"
+elif tail_probe xdpdrv; then
+	_drv=$_ret
+	if [ "$_drv" = "$EINVAL_U64" ]; then
+		ok "native: adjust_tail refused with -EINVAL - frame_sz is the true allocation"
+	elif [ "$_drv" = "0" ]; then
+		bad "native: adjust_tail SUCCEEDED - frame_sz is overstated, or this is not 999"
+		info "  an overstated frame_sz lets the memset run past the end of the buffer"
+	else
+		bad "native: adjust_tail returned $_drv - neither 0 nor -EINVAL"
+	fi
+	if tail_probe xdpgeneric; then
+		if [ "$_ret" = "$_drv" ]; then
+			bad "both paths returned $_ret - they are not being told apart"
+			info "  the DRV attach may have fallen back to generic"
+		else
+			ok "generic returned $_ret against native's $_drv - different code ran"
+		fi
+	fi
+else
+	skip "13: the native probe did not run"
+fi
 
 stop_traffic
 

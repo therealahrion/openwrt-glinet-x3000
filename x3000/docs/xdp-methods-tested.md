@@ -1602,7 +1602,7 @@ was not the paste, as first assumed: **busybox on this image has no `base64`
 applet**. `base64 -d > file <<EOF` then creates the empty file anyway and the
 "not found" error scrolls past, so the objects were zero bytes and `libxdp`
 reported the misleading `BPF object format invalid`. The objects themselves were
-fine - libbpf 1.3 opened them off-box. `x3000/docs/verify-992a.sh` had already
+fine - libbpf 1.3 opened them off-box. `x3000/docs/verify-xdp.sh` had already
 documented this and says so in its own header: *"OpenWrt's busybox ships without
 the base64 applet, so a base64 blob in this script cannot be decoded on the
 router."* Confirmed on the box: `command -v base64` finds nothing.
@@ -1960,7 +1960,7 @@ bytes, about half again what v1 measures on this architecture.
 
 ### 20.3 991 and 992 verified end to end by the repo's own verifier
 
-`x3000/docs/verify-992a.sh --traffic`: **PASS=25, FAIL=0, skipped=3.** The skips
+`x3000/docs/verify-xdp.sh --traffic`: **PASS=25, FAIL=0, skipped=3.** The skips
 are the optional `--with-drop` and `--with-tc` paths, plus "this iproute2 does
 not print xdp-features", which is a tooling limitation and explains why
 `ip -d link show wwan0` lists no `xdpfeatures` line.
@@ -2050,7 +2050,7 @@ explicitly disables the other. Evidence column points at the section or the
 | native XDP | HWLRO | **mutually exclusive**, driver-enforced | `mtk_xdp_setup()` returns `-EOPNOTSUPP` "XDP not supported with HWLRO". A successful `xdp-filter load -m native eth1` therefore proves HWLRO is off here (18.4) |
 | GRO and LRO | generic / skb XDP, any device | **incompatible**, silently | `generic_xdp_install()` (`dev.c:5949-5976`) stores on `dev->xdp_prog` and calls `dev_disable_lro()`; `netif_elide_gro()` (`netdevice.h:2433`) is true for any `dev->xdp_prog`; `dev_gro_receive()` tests it at `gro.c:488` (17.1) |
 | `gro_cells` | `dev->xdp_prog` | **incompatible. Measured.** | `gro_cells_receive()` tests the same predicate at `gro_cells.c:23` and drops to bare `netif_rx()`. measured twice - **1.00x skb against 24.8x detached** (2026-09-09, recorded in `lean-overlay.md`) and 1.06x against 2.20x at a lower link rate (2026-09-11). Correct-but-silent, and not fixable in the core: see 22 |
-| `gro_cells` | 992's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-992a section 6 |
+| `gro_cells` | 992's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-xdp section 6 |
 | BTF | BPF CO-RE tooling | **required, present** | `DEBUG_INFO_BTF=y`, `_MODULES=y`; `/sys/kernel/btf/vmlinux` 3846 KB; per-module BTF present (20.5) |
 | BTF | `bpf_xdp_flow_lookup` kfunc | **required** | `net/netfilter/Makefile:147-151` gates `nf_flow_table_bpf.o` on `DEBUG_INFO_BTF_MODULES` / `DEBUG_INFO_BTF`. Without this repo's BTF platform the kfunc does not exist at all |
 | flowtable kfunc | native XDP on `eth0`/`eth1` | **incompatible, structurally** | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, ...)` then `nf_flowtable_by_dev()`, keyed on the `net_device *` **pointer** (`nf_flow_table_xdp.c:27-33`). The rxq carries `eth->dummy_dev` (`mtk_eth_soc.c:2115`), never inserted in any flowtable. Permanent `-ENOENT`; a correct `fib_tuple->ifindex` does not help, because the *table* is selected by the pointer (16.2, 18.7) |
@@ -2063,7 +2063,7 @@ explicitly disables the other. Evidence column points at the section or the
 | `XDP_REDIRECT` | cake / SQM | **incompatible** | both paths end in `generic_xdp_tx()` then `netdev_start_xmit()` with no qdisc: `filter.c:4655` for `bpf_redirect()`, `devmap.c:721` for `bpf_redirect_map()` (17.2) |
 | **992's `XDP_TX`** | **cake / SQM** | **incompatible** - see 21.3 | `do_xdp_generic()` dispatches `case XDP_TX` to `generic_xdp_tx()` at `dev.c:5287`, which is the same qdisc-bypassing path |
 | XDP | tc ingress | **XDP wins** | `do_xdp_generic` at `dev.c:5621`, `sch_handle_ingress` at 5661 - so a redirect escapes tc ingress shaping too (17.2) |
-| AF_XDP | 992 | **compatible, deliberately** | libxdp's `xsk_def_prog` emits only `bpf_redirect_map()`, so refusing `XDP_REDIRECT` would refuse AF_XDP. Routing through `do_xdp_generic()` provides it. verify-992a section 11: no pstore crash records |
+| AF_XDP | 992 | **compatible, deliberately** | libxdp's `xsk_def_prog` emits only `bpf_redirect_map()`, so refusing `XDP_REDIRECT` would refuse AF_XDP. Routing through `do_xdp_generic()` provides it. verify-xdp section 11: no pstore crash records |
 | AF_XDP | cake / SQM | **incompatible** | it is a redirect, so the row above applies |
 | wireless (mt76 + mac80211) | XDP of any kind | **generic only** | no mac80211 source file mentions `xdp` in backports 6.18.39, and none of its three `net_device_ops` tables has `ndo_bpf`; `grep -c xdp` is 0 for mt76's `dma.c`, `mt76.h`, `mac80211.c`. So attaching costs GRO and LRO by the row above, for a hook that runs after decrypt, defrag and A-MSDU split (17.1) |
 | WED | flows crossing `wwan0` | **unreachable** | WED's forwarding half cannot carry a flow that crosses the modem (17.3) |
@@ -2081,7 +2081,7 @@ Each of these is a claim the build currently rests on without evidence.
 | software nft flow offload | cake | that offloaded flows still traverse the egress qdisc, so cake keeps shaping. `lean-overlay.md` says in as many words to verify this before trusting it | bufferbloat run with `flow_offloading` on and off, latency under load |
 | BBRv3 | cake / `fq_codel` | that BBR's internal pacing and the qdisc's do not fight | throughput and latency A/B against `cubic` at the same shaper settings |
 | ~~flowtable kfunc~~ | ~~XDP on `wwan0`~~ | **Settled - 23.1.** The assumption held: generic XDP takes its rxq from `netif_get_rxqueue(skb)` (`dev.c:5039`, called 5084), the real netdev, and `wwan0` is in the fw4 flowtable | **Done.** `xdp-ft-wwan.sh probe` calls the kfunc on `wwan0`. 98.8% to 99.0% hit across seven windows, both families, and `l3proto` and `iifidx` read back from the returned tuple agree with the packet on every lookup |
-| AF_XDP | native XDP on `eth0`/`eth1` | that XSK redirect works on the wired path as it does on `wwan0` | bind a socket, check for pstore records as verify-992a section 11 does |
+| AF_XDP | native XDP on `eth0`/`eth1` | that XSK redirect works on the wired path as it does on `wwan0` | bind a socket, check for pstore records as verify-xdp section 11 does |
 | aggregation | arrival rate | that `gro_cells` aggregation scales with load. A 60x reading was withdrawn because it implies an 84 KB skb against a 65536 ceiling, but it is possible if those datagrams were under 1092 bytes, which was never measured | one run at a fast link with the fixed `gro_measure()`, which now reports bytes per skb and `rx_dropped`. **Partly read, 23.11:** a 63x window implies a mean datagram near 1040 bytes, which is consistent with the ceiling and small for a speedtest. Still unexplained, and it belongs to the GRO work rather than to section 23 |
 
 ### 21.3 Two things this table clarified
@@ -2113,7 +2113,7 @@ alongside it, but the rate-scaling behaviour itself is no longer in doubt.
 
 **2026-09-13 closes the bytes-per-skb condition this section set.** The first
 full-platform run after the patch set was regenerated with quilt reported, from
-`verify-992a.sh` section 4 at an offered load of about 119 Mbit/s: `aggregation=8.11x`
+`verify-xdp.sh` section 4 at an offered load of about 119 Mbit/s: `aggregation=8.11x`
 with `bytes per delivered skb=11606`. That is the instrumented reading 21.3 was
 waiting for, so the arithmetic can now be closed rather than bounded from one side.
 
@@ -4948,7 +4948,7 @@ two of them in the measurement math itself.
   `-2147483648` while `%.0f` prints it correctly. No awk `printf %d` in any of
   the six is applied to a raw byte counter.
 - **Division-by-zero is guarded everywhere it can occur**, including the site I
-  suspected first: `verify-992a.sh:241` wraps its awk in
+  suspected first: `verify-xdp.sh:241` wraps its awk in
   `[ "$_ds" -gt 0 ] && [ "$_dp" -gt 0 ]` with an else branch. I was wrong about
   that one.
 - **`meas()` captures `_lab=$1` at line 339, before `set --` at 361-362.** The
@@ -5194,7 +5194,7 @@ receive anyway: `iosm_ipc_wwan.c:233` and `rmnet_handlers.c:48`. Stock
 the store necessary.
 
 **This was never measured, and the harness would not have caught it.**
-`verify-992a.sh` and `xdp-ft-wwan.sh` both attach counting or redirecting
+`verify-xdp.sh` and `xdp-ft-wwan.sh` both attach counting or redirecting
 programs that do not rewrite bytes 0..5 or 12..13, so every run to date sat on
 the safe side of the trigger set by accident.
 
@@ -6534,7 +6534,84 @@ must apply after them. The cpumap payoff is gated on 998 (W0045). The
 verification plan is five tests, T0056 through T0060 on the matrix, against a
 build (B0011) that does not exist yet.
 
-**One thing this makes stale**: `x3000/docs/verify-992a.sh` tests the generic
+**One thing this makes stale**: `x3000/docs/verify-xdp.sh` tests the generic
 hook 999 replaces. Its attach steps still work - a program still attaches - but
 what it verifies is no longer the path the driver takes. It needs a pass before
 it is trusted again, and that is not done.
+
+### 24.18 999 confirmed on hardware, and three runs that measured nothing - 2026-09-15
+
+**999 works. E1, measured on the flashed image.** This is the first result in
+this document that comes from the native XDP path on `wwan0` actually running.
+
+#### The measurement
+
+One program, attached two ways, same interface, same traffic. It calls
+`bpf_xdp_adjust_tail(ctx, 64)`, records the return value, undoes the growth if
+it succeeded, and returns `XDP_PASS`.
+
+| attach | rx_packets delta | packets seen | `adjust_tail(+64)` returned |
+|---|---|---|---|
+| `xdpdrv` (999's native hook) | +25 | 25 | `18446744073709551594` |
+| `xdpgeneric` (core `do_xdp_generic`) | +17 | 17 | `0` |
+
+`18446744073709551594` is `2**64 - 22`, so the value is **-22, `-EINVAL`**.
+
+That is the predicted discrimination, and it was predicted from source before
+any of it was built. 999 allocates exactly `XDP_PACKET_HEADROOM + dgram_len +
+SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`, so `xdp_data_hard_end()`
+(`include/net/xdp.h:147`) lands at the end of the datagram and there is no room
+to grow. The generic path runs the same program over an skb whose allocation
+kmalloc rounded up, so the same call finds tailroom and succeeds.
+
+#### What this establishes
+
+- **The program runs on the native path.** `bpf_prog_run_xdp()` on a real
+  `xdp_buff`, not `do_xdp_generic()` on an skb. The two attaches give different
+  answers to the same question, which is only possible if they are different
+  code.
+- **`frame_sz` is correct.** This is the one that matters. 24.2 and the design
+  note both call an overstated `frame_sz` the sharp edge, because it lets
+  `bpf_xdp_adjust_tail()`'s memset run past the end of the buffer. An
+  overstatement would have shown up here as a successful grow. It refused.
+- **No packet bypassed the hook.** Seen matched the driver's own rx_packets
+  delta exactly in both runs, 25 and 17.
+- **`XDP_PASS` keeps the link up.** Traffic flowed throughout; rx_packets rose
+  during both windows and the link was healthy after detach.
+
+#### What it does not establish
+
+`XDP_DROP` allocating no skb is not measured, only argued. `XDP_REDIRECT` into a
+cpumap, which is the reason to want any of this and the only thing that
+exercises 998, is not measured. `bpf_xdp_adjust_head()` is not measured - the
+probe used here dropped it for size. No performance number of any kind exists.
+T0057 through T0059 on the matrix remain open.
+
+#### The instrument lied three times first
+
+Worth recording plainly, because the failure was mine and it was invisible.
+
+Three consecutive runs reported zero packets through the program, on both
+attach paths. I read that first as "999's hook is not running", then as "the
+traffic is leaving by another interface", and went looking at routing tables.
+Both were wrong. The cause was the traffic generator:
+
+```
+# ping -c 20 -i 0.2 -W 2 1.1.1.1
+ping: invalid number '0.2'
+```
+
+Busybox's ping takes `-i SECS` but will not parse a fractional value, so it
+printed usage and sent nothing. I had redirected its output to `/dev/null 2>&1`,
+so the failure was silent, and I read the silence as a result about the kernel.
+
+The tell was in the data the whole time and I walked past it twice: the counter
+line showed **transmit** unchanged as well as receive. An interface that is not
+receiving is a receive problem; an interface that is not transmitting either,
+while `ping` reports replies, is a generator that never ran.
+
+Two things follow. First, a counter must be shown to move before any derived
+measurement is believed - which is why `verify-xdp.sh` now gates every BPF
+counter behind an observed rx_packets delta rather than assuming the traffic
+happened. Second, never discard a generator's output and status. Both changes
+are in the durable script rather than in the next one-off.

@@ -238,15 +238,17 @@ and how to read its state on a running router:
                   Ethernet misparse never happens rather than being
                   repaired afterwards.
   Impact(s):      On by default whenever a program is attached; with none
-                  attached the path is byte-for-byte upstream's. Changes
+                  attached the path is byte-for-byte upstream's. Confirmed
+                  running natively on hardware 2026-09-15. Changes
                   how receive memory is accounted, since build_skb() on a
                   frag reports a different truesize than netdev_alloc_skb,
                   which lands upstream of 991's gro_cells.
   Limitation(s):  XDP_TX is not zero-copy - no ndo_xdp_xmit here, so the
                   frame re-enters the ordinary transmit path. No tail
                   slack, so a program growing the packet gets -EINVAL.
-                  The cpumap payoff needs 998. Not built, not measured,
-                  and upstream has said it does not want XDP on
+                  The cpumap payoff needs 998, and that is the part
+                  still unmeasured, along with XDP_DROP's saved
+                  allocation. Upstream has said it does not want XDP on
                   non-Ethernet devices - this is a counter-example to the
                   premise they gave, not a rebuttal of the decision.
   Attribution(s): Mine, written for this fork. Design, hazards and the
