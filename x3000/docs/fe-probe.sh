@@ -9,12 +9,19 @@
 # NEEDS THE REBUILT IMAGE. OpenWrt's shared config carries
 # "# CONFIG_DEVMEM is not set" (target/linux/generic/config-6.12:1405), so on
 # a stock build /dev/mem does not exist and no userspace tool can reach a
-# physical address at all. This tree overrides that from the subtarget layer,
-# in target/linux/mediatek/filogic/config-6.12:
+# physical address at all. This tree overrides that with three symbols split
+# across two files:
 #
-#   CONFIG_DEVMEM=y                       the device node exists
-#   CONFIG_STRICT_DEVMEM=y                system RAM stays unreachable
-#   # CONFIG_IO_STRICT_DEVMEM is not set  driver-claimed MMIO stays readable
+#   x3000/config.common
+#     CONFIG_KERNEL_DEVMEM=y              the device node exists
+#   target/linux/mediatek/filogic/config-6.12
+#     CONFIG_STRICT_DEVMEM=y                system RAM stays unreachable
+#     # CONFIG_IO_STRICT_DEVMEM is not set  driver-claimed MMIO stays readable
+#
+# The split is forced. OpenWrt declares KERNEL_DEVMEM and appends it to the
+# merged kernel config after the fragments, so a CONFIG_DEVMEM=y written in the
+# fragment is silently overridden and the image ships with no /dev/mem. The
+# other two have no KERNEL_ equivalent, so the fragment is their only home.
 #
 # All three lines are load-bearing. Without the third, the kernel refuses
 # reads of any region a driver has claimed, and mtk_eth_soc claims this whole

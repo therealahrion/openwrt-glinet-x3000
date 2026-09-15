@@ -455,7 +455,7 @@ In order. The first step replaces guesswork about recipients entirely - do not
 hand-curate that list, and do not trust any list I or anyone else writes from
 memory, because maintainers change and stale addresses waste reviewer time.
 
-    cd ~/x3000-lean            # or a fresh net-next clone, which is better
+    cd ~/x3000                 # or a fresh net-next clone, which is better
 
     # 1. who gets it - authoritative, reads MAINTAINERS from the tree
     scripts/get_maintainer.pl --nogit --nogit-fallback \

@@ -5629,6 +5629,11 @@ question any more - it is a `devmem` read, with the PPE0 registers upstream
 already drives as a positive control and unused offsets in the same window as a
 negative control. `x3000/docs/fe-probe.sh` does exactly that and nothing else.
 
+> **Superseded in part, see 24.13.** This build has no `/dev/mem` at all
+> (`CONFIG_DEVMEM` is unset in OpenWrt's shared config), so the read was not
+> available when this was written. Three config symbols fix that; the
+> placement of one of them is not where it looks like it should go.
+
 **Read-only, and it must stay that way.** Writing an undocumented frame-engine
 register on a live router is how the WAN goes away. Reading is not free either -
 on some designs an unimplemented address inside a peripheral window raises an
@@ -5872,3 +5877,164 @@ checking rather than by reading the diff:
 
 **W0044 is withdrawn**, having existed for about an hour. The two patches it
 covered are cited in 997's message instead.
+
+### 24.13 The PCE question became answerable, and getting there cost two wrong answers - 2026-09-15
+
+24.8 ended by saying the MT7981 PCE question "is not a datasheet question any
+more - it is a `devmem` read." That was right about the shape of the answer and
+wrong about whether the answer could be had: **there is no `devmem` on this
+build, and there never was.** Closing that gap took one retraction of a claim I
+had written into the probe's own help text, and one config change I placed in
+the wrong file and shipped.
+
+Everything below is **E2** where it is a source read, **E1** where it was run.
+The register values themselves are still unread - that is the next section's
+job, once an image carrying the corrected config is flashed.
+
+#### What actually blocked the read
+
+Not `CONFIG_IO_STRICT_DEVMEM`, which is what I guessed and, worse, wrote into
+`fe-probe.sh` as the likely cause. The blocker is one line in OpenWrt's shared
+kernel config:
+
+`target/linux/generic/config-6.12:1405` carries `# CONFIG_DEVMEM is not set`.
+With it off, `drivers/char/mem.c:764` skips the minor-1 entry, so devtmpfs never
+creates the node; a node made by hand opens `-ENXIO` at `:723`. The char major
+is still registered (`:756`), which is why `/proc/devices` is not the place to
+look. No userspace tool can reach a physical address on such a kernel - not
+`devmem`, not `dd`, not anything - so the backend question the probe spent two
+rounds on was never the real one.
+
+**The `IO_STRICT_DEVMEM` claim is withdrawn.** It is real in general and was
+inert here: it `depends on STRICT_DEVMEM` (`lib/Kconfig.debug:1886`),
+`STRICT_DEVMEM` was off (`generic/config-6.12:6546`), and with it off
+`page_is_allowed()` is the no-op stub at `drivers/char/mem.c:79-82`, so nothing
+filtered anything. The `CONFIG_IO_STRICT_DEVMEM=y` at `generic/config-6.12:2850`
+was a dead line. Verified against three independent v6.12.x trees.
+
+One correction to the question as I posed it: `read_mem()` calls
+`page_is_allowed()` (`mem.c:141`), not `range_is_allowed()`, which is
+mmap-only (`:362`). The conclusion is the same, both stub out to 1.
+
+#### The placement trap, which is the part worth remembering
+
+The fix is three symbols. Getting them to take effect is not obvious, and I got
+it wrong and shipped an image without noticing:
+
+| symbol | where it must live | why |
+|---|---|---|
+| `CONFIG_KERNEL_DEVMEM=y` | `x3000/config.common` | OpenWrt declares it, so a value written in the target fragment is overridden |
+| `CONFIG_STRICT_DEVMEM=y` | `filogic/config-6.12` | no `KERNEL_` equivalent exists, so the fragment is its only home |
+| `# CONFIG_IO_STRICT_DEVMEM is not set` | `filogic/config-6.12` | same |
+
+The mechanism, read from `include/`:
+
+1. `config/Config-kernel.in:1385` declares `KERNEL_DEVMEM` as a bare `bool`
+   with **no `default` line**, so a defconfig pass writes
+   `# CONFIG_KERNEL_DEVMEM is not set` into the top-level `.config`.
+2. `include/kernel-defaults.mk:116` runs
+   `awk '/^(#[[:space:]]+)?CONFIG_KERNEL/{sub("CONFIG_KERNEL_","CONFIG_");print}'`
+   over that `.config` and **appends** the result to `.config.target` - which is
+   the file the generic and subtarget fragments were already merged into. Note
+   the regex matches the negated form too.
+3. `scripts/kconfig.pl`'s `load_config()` is called without `mod_plus` for that
+   file, so a later line overwrites an earlier one.
+
+Net effect: `CONFIG_DEVMEM=y` in the subtarget fragment is silently replaced by
+`# CONFIG_DEVMEM is not set` from the appended `KERNEL_` line. The build
+succeeds, the image boots, and `/dev/mem` is simply absent. `STRICT_DEVMEM` then
+falls with it, since it `depends on MMU && DEVMEM`.
+
+**This is what the 2026-09-15 build produced**, and the only reason it was
+caught is that the build script echoed the real kernel `.config` at the end
+rather than trusting the merged fragment. A gate that reads the artifact instead
+of the input is worth the two lines it costs.
+
+The general rule, which was not written down anywhere before: a kernel symbol
+OpenWrt declares as `KERNEL_<X>` must be set from `config.common`, because the
+declared value always lands last; a kernel symbol it does not declare can only
+be set from the target fragment. Checking which case applies is one grep of
+`config/Config-kernel.in`.
+
+#### What the three symbols buy, and what they cost
+
+`STRICT_DEVMEM=y` is not belt-and-braces, it is what makes the whole thing
+proportionate. `devmem_is_allowed()` (`lib/devmem_is_allowed.c`, selected by
+arm64 at `arch/arm64/Kconfig:153`) returns 1 for a page that is not RAM and 0
+for one that is, so the window narrows to memory-mapped I/O and kernel and
+process memory stay unreachable. Without it, `/dev/mem` is an unfiltered
+read-write handle on all of physical memory in exchange for one register read.
+
+`IO_STRICT_DEVMEM` must then be explicitly off, because enabling `STRICT_DEVMEM`
+is exactly what would make the shared config's dead `=y` line live -
+`resource_is_exclusive()` (`kernel/resource.c:1819`) would call every
+driver-claimed range exclusive, and `mtk_eth_soc` claims this entire window
+through `devm_platform_ioremap_resource()`. The probe would read nothing.
+
+#### 998, written and dropped
+
+Before the config route was understood I wrote a temporary patch, 998, that read
+the same fourteen offsets from inside `mtk_eth_soc` through the ioremap
+`mtk_probe()` already holds, exposed at `/sys/kernel/debug/mtk_fe_probe`. It
+worked on paper - applied at `--fuzz=0` against the fully patched tree, compiled
+clean standalone - and it was the wrong answer, because enabling `/dev/mem`
+takes three config lines and no carried patch, and `/dev/mem` is worth having
+for the next register question as well. It was removed before it ever built.
+Recorded here so the idea is not re-derived: a driver-side debugfs read is the
+fallback if `/dev/mem` is ever unavailable again, not the first move.
+
+#### The patch series, verified rather than assumed
+
+Reconstructed the real tree - pristine `v6.12.103` plus every patch in this tree
+that touches any file 990-997 touch, in OpenWrt's documented order
+(backport, pending, hack, then target). The enumeration is complete:
+`net/core/dev.c` is touched by exactly one earlier patch,
+`hack-6.12/721-net-add-packet-mangeling`; `net/core/gro_cells.c` by none;
+`include/linux/netdevice.h` by three; `mhi_wwan_mbim.c` by none before mine.
+
+| patch | result |
+|---|---|
+| 990, 991, 992, 993 | clean |
+| 995 | applies, 6 hunks at offset +47 |
+| 996 | applies, 3 hunks at offset +5 |
+| 997 | clean, zero offset, applied after 996 |
+
+All at `--fuzz=0`. The offsets are stale recorded line numbers, not conflicts:
+995 is +47 because 991 and 992 grow `mhi_wwan_mbim.c` above its hunks, and 996
+is +5 because `hack/721` adds five lines to `dev.c` above its first edit. Left
+alone; `make target/linux/refresh` is what zeroes them if that is ever wanted.
+
+**One real defect found, in 997's own commit message.** It claimed to share no
+file with 996. It does - both edit `net/core/dev.c`. They do not conflict, since
+996 works on `dev_set_threaded()` and `netif_napi_add_weight()` near line 6726
+and 997 on `dev_fill_forward_path()` near 749, roughly 6000 lines apart, which
+is why 997 lands at zero offset even after 996. The sentence is corrected in
+place and now says how it was checked.
+
+Post-patch source consistency, checked in the extracted tree and confirmed again
+on the box's own build: `NAPI_STATE_NO_THREAD` is appended last in the enum at
+bit 10 with no existing bit renumbered, `NAPIF_STATE_NO_THREAD` is defined
+alongside, and the four use sites resolve - `netdevice.h` 2, `dev.c` 4,
+`gro_cells.c` 1, plus 997's unique `stack->num_paths--` 1, 992's `mhi_mbim_xdp`
+5 and 991's `gro_cells` 7. Those six counts came back exactly on the 2026-09-15
+build. **E1.**
+
+#### Method notes from the probe itself
+
+Two bugs in `fe-probe.sh` that are worth not repeating:
+
+* **Tab indentation is not paste-safe.** A leading TAB pasted into an
+  interactive shell is a readline completion request. It dumped the box's entire
+  command list into the middle of the heredoc, twice, at exactly the two
+  tab-indented lines inside `rd()`, so the file written was not the file sent.
+  The script is spaces-only now and says why in its own header.
+* **`devmem` is a busybox applet, not a coreutils one.** Installing coreutils
+  never provides it. The rewrite takes `devmem`, `busybox devmem`, or `dd` plus
+  `od` or `hexdump`, and reports which backend it chose.
+
+On access width, since it matters for MMIO: a `dd bs=4 count=1` read lands in
+`copy_from_kernel_nofault()`, which picks its width from the alignment of the
+source and destination pointers alone (`mm/maccess.c:26-41`). On a 4-aligned
+address the u64 loop cannot run and the u32 loop does exactly one 32-bit load,
+which is the right width. Changing the block size breaks that, which is now a
+note in the script.

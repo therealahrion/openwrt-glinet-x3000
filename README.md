@@ -488,7 +488,7 @@ and how to read its state on a running router:
   </pre>
 
 * **Physical register reads for frame-engine work**
-  `target/linux/mediatek/filogic/config-6.12`
+  `x3000/config.common`, `target/linux/mediatek/filogic/config-6.12`
 
   <pre>
   Description:    Three kernel symbols that make /dev/mem exist and be
@@ -496,9 +496,11 @@ and how to read its state on a running router:
                   creates the device node, STRICT_DEVMEM keeps system RAM
                   unreachable through it, and IO_STRICT_DEVMEM is turned
                   back off so a range a driver has already claimed can
-                  still be read. OpenWrt's shared config disables the
-                  first and enables the last, and the subtarget config
-                  overrides both.
+                  still be read. They sit in two different files because
+                  OpenWrt declares KERNEL_DEVMEM and appends it after the
+                  kernel config fragments, so DEVMEM only takes effect
+                  from config.common; the other two have no KERNEL_
+                  equivalent and belong in the fragment.
   Benefit(s):     Undocumented SoC registers can be read from a shell
                   rather than from a debug patch and a rebuild. The frame
                   engine window at 0x15100000 is the case that forced it:
@@ -517,7 +519,9 @@ and how to read its state on a running router:
                   script reads and never writes. Leaving IO_STRICT_DEVMEM
                   off is what makes a driver-claimed range readable; that
                   is the whole point here, and it is also a wider door
-                  than the upstream default.
+                  than the upstream default. Putting DEVMEM in the
+                  fragment builds and boots and silently has no device;
+                  the split above is not a style choice.
   Attribution(s): Mine. The probe, the offsets it reads and how to read
                   the result:
                       - <a href="x3000/docs/fe-probe.sh">x3000/docs/fe-probe.sh</a>

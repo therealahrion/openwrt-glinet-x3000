@@ -219,6 +219,26 @@ CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES=y
 # Drop this line once the stall is understood.
 CONFIG_KERNEL_MHI_BUS_DEBUG=y
 
+# --- /dev/mem, for reading memory-mapped SoC registers --------------------
+# This has to live here rather than in the target's kernel config fragment,
+# and the reason is not obvious. OpenWrt declares KERNEL_DEVMEM in
+# config/Config-kernel.in:1385 with no "default" line, so a defconfig pass
+# writes "# CONFIG_KERNEL_DEVMEM is not set" into .config. Then
+# include/kernel-defaults.mk:116 copies every CONFIG_KERNEL_* line out of
+# .config, strips the prefix, and APPENDS it to .config.target -- after the
+# generic and subtarget fragments have already been merged into that file.
+# Later lines win, so a CONFIG_DEVMEM=y written in the fragment is silently
+# overridden and the built kernel has no /dev/mem. I shipped exactly that
+# mistake once; the image built clean and the device was simply absent.
+#
+# The two companion symbols stay in the fragment, because OpenWrt declares no
+# KERNEL_ equivalent for either and so nothing overrides them there:
+#   CONFIG_STRICT_DEVMEM=y                narrows access to non-RAM pages
+#   # CONFIG_IO_STRICT_DEVMEM is not set  keeps driver-claimed MMIO readable
+# See the Enhancements entry in the repo-root README for what the three do
+# together and what they cost.
+CONFIG_KERNEL_DEVMEM=y
+
 # --- qdisc / classifier kmods (vermagic-locked: bake now or never) -----
 # cake for the Phase-1 WAN shaper (hand-driven via tc — no sqm), the
 # eBPF classifier hook, ifb for ingress redirection, xdp-sockets-diag
