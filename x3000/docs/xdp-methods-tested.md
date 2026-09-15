@@ -1305,6 +1305,13 @@ said this. There is no pre-allocation saving available on the modem path, and
 creating one would mean rebuilding the MBIM RX path around a page pool, not
 adding a hook.
 
+**Half of that last sentence was wrong, and 24.17 corrects it.** Removing the
+*copy* does need a page-pool rewrite, and that part stands. But reaching *native
+XDP* does not: the copy already lands in a privately-owned buffer, and 992
+already put 256 bytes of headroom in front of it, so the only thing missing was
+allocating a bare frag instead of an skb and deferring `build_skb()` past the
+verdict. That is 999.
+
 Also confirmed: `do_xdp_generic()` implements `XDP_REDIRECT` itself via
 `xdp_do_generic_redirect((*pskb)->dev, ...)` and `XDP_TX` via
 `generic_xdp_tx()`, returning `XDP_DROP` to signal the skb was consumed
@@ -6038,3 +6045,496 @@ source and destination pointers alone (`mm/maccess.c:26-41`). On a 4-aligned
 address the u64 loop cannot run and the u32 loop does exactly one 32-bit load,
 which is the right width. Changing the block size breaks that, which is now a
 note in the script.
+
+### 24.14 The PCE registers read as unimplemented, and 996 is proven on the box - 2026-09-15
+
+Two results, both **E1**, both from the image flashed today.
+
+#### 996 works: the threaded toggle is inert, not fatal
+
+`echo 1 > /sys/class/net/wwan0/threaded` did not take the WAN down. The file
+reads back `1`, and `ps w | grep 'napi/'` shows no kthread at all. On 2026-09-14
+that same write killed the WAN twice.
+
+That is W0041 form 2 doing exactly what 23.21 proposed and 23.28 wrote: the
+sysfs ABI is unchanged, so anything that reads the file sees what it always saw,
+and no gro_cells NAPI is ever handed an unbound kthread. It also retires the
+last argument for W0042 - 23.21 said the `threaded` control "must stay at 0
+until W0042 replaces gro_cells with a driver-owned NAPI", and that is no longer
+true. W0042 now stands or falls on its own merits, which after 23.23 are thin.
+
+#### The frame-engine read: what it took to get one at all
+
+24.8 said the MT7981 PCE question "is not a datasheet question any more - it is
+a `devmem` read". Three things had to be fixed before that sentence became true,
+and each was a wrong answer of mine first.
+
+1. **`CONFIG_DEVMEM=n`**, covered in 24.13. Fixed, but the fix went in the wrong
+   file and shipped an image with no `/dev/mem` at all.
+2. **`read()` cannot reach MMIO on arm64.** This is the one I should have caught
+   before writing a `dd` backend. arm64 defines its own `valid_phys_addr_range()`
+   (`arch/arm64/include/asm/io.h:327`, implemented at `arch/arm64/mm/mmap.c:41`),
+   which returns `memblock_is_region_memory(addr, size) &&
+   memblock_is_map_memory(addr)` - true for RAM only. `read_mem()` checks it at
+   `drivers/char/mem.c:112` and returns `-EFAULT` before the register is
+   touched. `mmap_mem()` is gated by `valid_mmap_phys_addr_range()` instead
+   (`mmap.c:60`), which permits any address inside `PHYS_MASK`.
+
+   So `dd`, `od`, `hexdump` and `xxd` cannot read a physical register here,
+   however they are invoked, and installing more of them cannot help: the
+   refusal is in the kernel, before any tool's bytes move. `busybox devmem` was
+   never merely a packaging detail - it `mmap`s, and that was the requirement
+   all along. My note about `copy_from_kernel_nofault()` picking a u32 load was
+   analysing a layer the read never reaches; it is withdrawn.
+3. **The tool.** `busybox devmem` is not enabled in this build. The answer is
+   the **`io` package** (`utils/io` in the official packages feed, "Raw memory
+   i/o utility"), which `mmap`s at `io.c:354`. `apk add io`, no rebuild.
+
+   One hazard worth carrying forward: at `io.c:236` any second positional
+   argument turns a read into a **write**, and `-r` does not override it because
+   the check runs after option parsing. `io -4 0x15100600 1` writes. Every call
+   in `fe-probe.sh` passes exactly two arguments, `-4` and the address. `-l` is
+   an option, consumed by getopt, so it cannot trip that path.
+
+#### Two probe-design errors the run exposed
+
+* **The positive controls were not registers.** I used `ppe_base + 0x000` and
+  `+0x004`. The lowest PPE register is `MTK_PPE_GLO_CFG` at offset `0x200`
+  (`mtk_ppe_regs.h:7`); nothing is at `+0x000`. The corrected controls are
+  `MTK_PPE_GLO_CFG` (`0x2200` absolute) and `MTK_PPE_TB_BASE` (`0x2220`), the
+  latter written with `ppe->foe_phys` at `mtk_ppe.c:1014` - a DMA address that
+  cannot be zero.
+* **The negative controls were SRAM.** I picked `FE+0x7f000` as "high unused".
+  `MT7981_CAPS` carries `MTK_SRAM` and `MTK_ETH_SRAM_OFFSET` is `0x40000`
+  (`mtk_eth_soc.h:145`), and MT7981 is NETSYS v2, so `eth->sram_base =
+  eth->base + 0x40000` (`mtk_eth_soc.c:4907`). **The top half of the window is
+  on-chip SRAM.** Those rows were reading live buffer contents, which is why
+  they came back structured. Worth knowing in its own right: the FE window is
+  registers below `0x40000` and SRAM above it.
+
+#### The read path, verified
+
+| offset | register | value |
+|---|---|---|
+| `0x2200` | `MTK_PPE_GLO_CFG` | `0x0000020d` - bit 0 is `MTK_PPE_GLO_CFG_EN` |
+| `0x221c` | `MTK_PPE_TB_CFG` | `0x00114fbc` |
+| `0x2220` | PPE0 `TB_BASE` | `0x41e00000` - a DRAM address, `ppe->foe_phys` |
+| `0x2620` | PPE1 `TB_BASE` | `0x42000000` - 2MB above PPE0's |
+| `0x4604` | QDMA `GLO_CFG` | `0xd5804575` |
+
+Two independently programmed FOE table addresses, correctly spaced, is about as
+strong as this gets. The reads reflect real hardware state.
+
+#### The result
+
+`io -4 -l 0x800 0x15100000` dumps the whole low register region in one call.
+Of 512 words from `FE+0x000` to `FE+0x7fc`, **50 read non-zero**.
+
+* **46 of those 50 are not named anywhere in upstream `mtk_eth_soc`.** The dense
+  block at `0x1c0`-`0x1ec` is the clearest case: structured values like
+  `0x84321a43`, and upstream has no name for any of it. So on this part,
+  *"upstream does not drive it" does not imply "it reads zero"* - which is the
+  assumption 24.8's whole argument-from-device-tree-absence rested on, and it is
+  now measured rather than assumed.
+* **10 offsets that upstream does name read zero**: `0x04`, `0x0c`, `0x220`,
+  `0x224`, `0x228`, `0x238`, `0x298`, `0x318`, `0x328`, `0x404` - the CDM/GDM
+  FSM registers and the PSE queue-status pair at `0x180`/`0x1a0`. These
+  provably exist and were idle. So *"reads zero" does not imply "not
+  implemented"* either. Both directions of the naive inference are dead.
+* **All eight PCE offsets read zero**: `0x258`, `0x25c`, and `0x600` through
+  `0x614`.
+* The longest contiguous zero run in the region is **`0x514`-`0x7fc`, 748 bytes
+  or 187 consecutive words**, and the entire `GLO_MEM` cluster sits inside it.
+  `0x258`/`0x25c` sits in a shorter run and is not part of it.
+
+**What this licenses.** The region MediaTek's PCE driver drives on MT7988 reads,
+on MT7981, exactly like unimplemented address space: 187 consecutive dead words
+in a window that elsewhere returns structured values for dozens of registers
+upstream never names. That is the first actual evidence this question has ever
+had, and it points away from the tables being present.
+
+**What it does not license.** It is not proof of absence from the die. A
+configuration block that exists but was never written would read zero too, and
+this very run contains ten registers that exist and read zero. The distinction I
+would want - that those ten are status and FSM registers whose idle value is
+zero, whereas `GLO_MEM_CFG` is a configuration register that should carry a
+reset default - is an inference about register semantics, not something the read
+demonstrates. The 187-word run is the strongest part of the argument, because a
+real block usually has *something* with a non-zero reset value, but "usually" is
+doing work there.
+
+So: **24.8's open question resolves to a weak but real negative.** The strong
+claim I retracted in 24.8 - that the blocks are absent from the die - stays
+retracted; I am not re-adopting it from the other side on this evidence.
+
+#### What this closes, and what it emphatically does not
+
+This closes **one** thread: MediaTek's PCE, the indirect table window at
+`GLO_MEM_CFG` that their vendor driver drives on MT7988. Nothing more.
+
+I first wrote that it closed "the NETSYS v3 / PCE backport line", which is
+wrong, and wrong in a way worth spelling out because the two get conflated
+every time. **`mt7987_data`, which patch 750 already puts in this tree, is
+`.version = 3` with `.rx.desc_size = sizeof(struct mtk_rx_dma_v2)` and no
+TOPS or PCE device-tree node anywhere.** MT7987 is v3 without the PCE. So the
+PCE is not what v3 means in this driver, and a dead `GLO_MEM` window on MT7981
+says nothing whatever about the rest of it.
+
+The separable threads, as they now stand:
+
+| thread | what it is | status after today |
+|---|---|---|
+| **PCE / vendor 5-tuple offload** | `GLO_MEM`, `PPE_TPORT_TBL` | weak negative, E1. This one is closed. |
+| **`mtk_rx_dma_v2` / rxd5-rxd6** | 8-word RX descriptors carrying `RX_DMA_GET_SPORT_V2`, `MTK_RXD5_PPE_CPU_REASON`, `MTK_RXD5_FOE_ENTRY` | **untouched by today's probe.** Open. |
+| **PPE v3 / 80-byte FOE entries** | `MTK_FOE_ENTRY_V3_SIZE`, `MTK_PPE_TB_CFG_ENTRY_80B` | **untouched by today's probe.** Open. |
+
+> **Both of the open rows are closed in 24.15**, on measurement: there is no v3
+> PDMA block on this silicon, and that is also what makes the PPE thread inert.
+
+Two things sharpen the second and third rather than dimming them.
+
+**MT7981 already carries half the descriptor story.** Reading the `soc_data`
+table across every SoC in tree: MT7981 is `.tx.desc_size =
+sizeof(struct mtk_tx_dma_v2)` and `.rx.dma_l4_valid = RX_DMA_L4_VALID_V2` -
+identical to MT7987 and MT7988. The *only* descriptor-format difference from
+MT7988 is the RX side. The v2/v3 split is not the clean generational boundary
+the naming implies.
+
+**The MT7987 delta is small, enumerable, and already sitting in this tree.**
+Against `mt7981_data`, `mt7987_data` differs in seven fields: `reg_map`
+(`mt7988_reg_map` vs `mt7986_reg_map`, and both declare `ppe_base = 0x2000`),
+`version`, `hash_offset`, `has_accounting`, `foe_entry_size`,
+`rx.desc_size` and `rx.irq_done_mask`. `offload_version` and `ppe_num` are
+already **identical** at 2. That is the shape of a backport, not a wall.
+
+And today's dump argues *for* those threads rather than against: 46 of the 50
+live offsets in `FE+0x000`-`0x7fc` are unnamed anywhere in upstream. MT7981's
+frame engine implements materially more register surface than this driver
+drives. That is the opposite of the picture where v3 features need silicon
+MT7981 lacks.
+
+**Next checks, in order of cheapness**: diff `mt7988_reg_map` against
+`mt7986_reg_map` - both are in this tree, so it costs nothing; decode the
+`PPE0 TB_CFG = 0x00114fbc` read against the `MTK_PPE_TB_CFG_*` field
+definitions, particularly `ENTRY_80B`; and read the PDMA block at
+`0x4100`-`0x4250` the way the FE window was read today. None of those needs a
+datasheet and none is blocked by the PCE result.
+
+**Read-only throughout.** Nothing in this section involved a write to the frame
+engine, and nothing should.
+
+### 24.15 The NETSYS v3 backport question, closed on measurement - 2026-09-15
+
+24.14 left three threads and called the PPE one "the live one". Reading further
+closes all three, and the interesting part is that they are not independent: the
+descriptor result is what kills the PPE one.
+
+Everything here is **E1** where it is a register read from the flashed image and
+**E2** where it is a source read at `v6.12.103` plus patch 750.
+
+#### The corrected SoC table
+
+Pulled from `soc_data` across the tree, with MT7987 from patch 750 rather than
+inferred. This supersedes the table in 24.8, which was thinner and wrong in one
+place.
+
+| SoC | ver | offload | ppe_num | hash_off | acct | foe_entry_size | tx desc | rx desc | irq_done_mask | reg_map |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MT7981 | 2 | 2 | 2 | 4 | true | V2 = 96 B | `mtk_tx_dma_v2` | `mtk_rx_dma` | `RX_DONE_INT` | mt7986 |
+| MT7986 | 2 | 2 | 2 | 4 | true | V2 = 96 B | `mtk_tx_dma_v2` | `mtk_rx_dma` | `RX_DONE_INT` | mt7986 |
+| MT7987 | 3 | 2 | 2 | 4 | true | V3 = 128 B | `mtk_tx_dma_v2` | `mtk_rx_dma_v2` | `RX_DONE_INT_V2` | mt7988 |
+| MT7988 | 3 | 2 | 3 | 4 | true | V3 = 128 B | `mtk_tx_dma_v2` | `mtk_rx_dma_v2` | `RX_DONE_INT_V2` | mt7988 |
+
+`offload_version` is **2 on all four, MT7988 included**, and `hash_offset` and
+`has_accounting` are identical everywhere. MT7981 already runs the v2 TX
+descriptor and `RX_DMA_L4_VALID_V2`. The MT7981-to-MT7987 delta is five fields:
+`version`, `foe_entry_size`, `rx.desc_size`, `rx.irq_done_mask`, `reg_map`.
+
+#### The reg_map diff: the PDMA moves, and nothing else does
+
+`mt7986_reg_map` against `mt7988_reg_map`: 36 fields, 26 identical, **10
+differing, and all ten are PDMA** - the block relocates wholesale by `+0x2800`,
+`0x4100`/`0x4200` becoming `0x6900`/`0x6a00`. `ppe_base`, `pse_iq_sta`,
+`pse_oq_sta`, `gdm1_cnt`, `tx_irq_*` and all fifteen QDMA fields are unchanged.
+MT7987 is the smaller v3 part - two PPEs, like MT7981 - and its PDMA is still at
+`0x6900`, so the relocation tracks the NETSYS generation rather than die size.
+
+#### MT7981 has no v3 PDMA. Measured.
+
+`io -4 -l 0x200 0x15106900` on the flashed image returns non-zero data, which
+looked promising for about ten seconds. It **repeats with a period of exactly
+0x80**: 18 overlapping 16-byte lines tested, all identical, only five distinct
+lines in the whole 0x200 dump, and eight of them pure `0xdeadbeef`.
+
+A register block cannot do that. `mt7988_reg_map` puts `rx_ptr` at `0x6900` and
+`glo_cfg` at `0x6a04`, `0x104` apart; if those were distinct registers then
+`0x6a00` could not be byte-identical to `0x6900`. And `0xdeadbeef` is a software
+poison pattern, not a hardware reset value. The address decodes, but what is
+behind it is a 128-byte buffer aliased four times.
+
+The control makes the contrast exact. At `0x4100`, the block this SoC actually
+uses: `rx_ptr = 0x15160000` - **FE base + 0x60000, inside the frame engine's own
+SRAM**, which is what `MTK_SRAM` in `MT7981_CAPS` buys; `rx_cnt_cfg = 0x200`,
+512 entries; `pcrx_ptr = 0x1b3` with the next word `0x1b4`, CPU and DMA ring
+indices one apart on a live ring; and `0x4200`-`0x42ac` dense, varied and
+non-repeating. That is a register file. `0x6900` is not.
+
+**`rx_dma_v2` is unreachable on this silicon.** Not "undocumented", not
+"unestablished" - the registers are not there.
+
+#### And that is what closes the PPE thread too
+
+24.14 said PPE v3 had no obstacle: `ppe_base` identical across all four SoCs,
+`ENTRY_80B` a live configurable bit in a register that reads
+`TB_CFG = 0x00114fbc` (bit 3 set, bit 20 `INFO_SEL` set), and the FOE table in
+DRAM at `TB_BASE = 0x41e00000` rather than in fixed SRAM, so 96 to 128 bytes is
+an allocation change. All of that is true. It is also beside the point.
+
+`struct mtk_foe_entry` is **already 128 bytes** in C - `ib1` plus `data[31]` -
+on every SoC. `foe_entry_size` is only a table stride: the allocation at
+`mtk_ppe.c:904`, the memset at `:960`, three memcpys at `:604`, `:636`, `:720`,
+and the index at `mtk_eth_soc.h:1359`. The extra 32 bytes have exactly **one**
+consumer upstream: `w3info` and `amsdu`, the last two `u32` of
+`struct mtk_foe_mac_info`, marked `/* netsys_v3 */`.
+
+And the only writer of those is `mtk_foe_entry_set_wdma()`, which does
+`switch (eth->soc->version) { case 3: ... }` - **keyed on `version`, not on
+`foe_entry_size`.**
+
+So the two-line experiment is inert. Raising `mt7981_data.foe_entry_size` to
+`MTK_FOE_ENTRY_V3_SIZE` and flipping the `ENTRY_80B` gate to key off entry size
+costs 16384 entries x 32 bytes x 2 PPEs = **1 MiB of extra DRAM** and changes no
+behaviour whatsoever, because nothing writes the bytes it buys.
+
+Raising `version` to 3 is what would enable them - and `version` is exactly what
+cannot move, because ~20 gates in `mtk_eth_soc.c` hang off it, including
+`mtk_rx_get_desc()` reading `rxd5`/`rxd6` at `:1120` from a PDMA that does not
+produce them, and `MTK_RX_DONE_INT_V2 = BIT(14)` in place of MT7981's
+`RX_DONE_DLY`. That breaks receive.
+
+The payoff was thin regardless: `MTK_FOE_WINFO_WCID_V3` is 16 bits against V2's
+10, and `BSS_V3` 8 against 6, plus A-MSDU info - wider Wi-Fi client and BSS
+identifiers for WED. On an AP serving far fewer than 1024 stations, worth
+nothing.
+
+#### Verdict
+
+**The NETSYS v3 backport line is closed, on measurement rather than inference,
+for three separate reasons:**
+
+| thread | why it is closed | grade |
+|---|---|---|
+| PCE / vendor 5-tuple offload | 187 consecutive dead words where MT7988 has the table window | E1, weak negative |
+| `rx_dma_v2` / rxd5-rxd6 | no v3 PDMA block exists; `0x6900` is memory aliased with period 0x80 | E1, firm |
+| PPE v3 / 128-byte entries | unblocked but inert - the only consumer keys on `version`, and `version` cannot move because of the row above | E2, firm |
+
+This is the answer 24.8 asked for and could not get. What I retracted there - the
+claim that MT7981 lacks the silicon - was retracted because it rested on reading
+driver configuration and calling it hardware. The claim now rests on reading the
+hardware. The narrow version was right for the wrong reasons; it is now right for
+the right ones, and the die-level question ("are the blocks physically absent")
+remains open and no longer matters, because the driver-level answer is settled
+either way.
+
+**What stays open.** `MTK_PPE_MIB_SER_R3` at `0x1510234c` was never read, and it
+is the one v3-ish PPE register with a read-only test. It would not change the
+verdict - the `version` gate closes the thread regardless - but it is one command
+if the question is ever reopened.
+
+### 24.16 W0045: the XDP frame rebuild assumes Ethernet, and cpumap is where it bites - 2026-09-15
+
+Found by asking the question 997 came from - where else does core net treat a
+non-Ethernet device as Ethernet - rather than by looking for it. **E2
+throughout**, read at `v6.12.103`.
+
+**Correction, entered the same day: this is not a discovery, and 24.1 already
+had it.** Reviewing Jiayuan Chen's `net: xdp: don't assume an Ethernet header in
+generic XDP` on 2026-08-18, Alexander Lobakin wrote:
+
+> Most XDP programs expect Ethernet header at the beginning of a frame. Unless
+> you write a custom one which doesn't. But then you may face that XDP_TX,
+> XDP_REDIRECT won't work properly -- cpumap Rx, each .ndo_xdp_xmit()
+> implementation -- all expect Ethernet header at the beginning.
+
+"cpumap Rx" is this section. A maintainer named the exact failure a month
+earlier, in a thread that was refused, and used it as a reason the whole
+direction was not worth taking. I found it independently and wrote it up as
+though it were new, which is the same mistake this document's own preamble to
+24 describes: I had the answer in my own file and did not open it.
+
+What survives the correction, and what does not. **The mechanism stands** - it
+was read from source, not inferred, and 998 fixes a real drop. **The novelty
+claim does not**, and neither does "worth sending upstream on its own merits"
+without qualification: the patch walks into a stated position rather than into
+an absence of precedent. Two things do distinguish it from what was refused. It
+is the native path rather than the generic one - a different function in a
+different file - and it does not ask the core to relax an assumption on behalf
+of a device class that has no native XDP, because 999 supplies one. Whether
+that is enough is not something I can predict, and the patch header now says so
+instead of claiming merit.
+
+#### The defect
+
+`__xdp_build_skb_from_frame()` (`net/core/xdp.c`) ends with
+
+```c
+	/* Essential SKB info: protocol and skb->dev */
+	skb->protocol = eth_type_trans(skb, dev);
+```
+
+unconditionally. There is no `dev->type` test in that file or in
+`kernel/bpf/cpumap.c` - `grep -c 'ARPHRD\|dev->type'` returns 0 for both. An
+`xdp_frame` carries no link-layer information of its own, so the device is the
+only thing that can answer the question, and it is never asked.
+
+On a raw-IP link `eth_type_trans()` reads the IP version nibble as the first
+octet of a destination MAC. IPv4's `0x45` has the multicast bit set, so the
+frame comes out `PACKET_MULTICAST`; IPv6's `0x60` does not, so it comes out
+`PACKET_OTHERHOST`. `ip_forward()` drops anything that is not `PACKET_HOST` at
+`net/ipv4/ip_forward.c:93`, still under the comment "that should never happen".
+
+This is 992's defect one layer up, in core net rather than in a driver.
+
+#### Where it is reachable, and why nobody has hit it
+
+| caller | device | affected |
+|---|---|---|
+| `kernel/bpf/cpumap.c:348` | `xdpf->dev_rx`, the **ingress** device | **yes**, for any raw-IP ingress |
+| `drivers/net/veth.c:727` | veth peer | no, `ARPHRD_ETHER` |
+| `xdp_build_skb_from_frame()` wrapper - mana, atlantic, netvsc | their own netdev | no, all Ethernet |
+
+**Native path only.** The generic path tags its skbs into the same `ptr_ring`
+with `__ptr_test_bit(0, &ptr)` (`cpumap.c:127` and `:313`) and never rebuilds
+them, so a device with only generic XDP cannot reach this. That is why it has
+gone unnoticed, and it is also why it matters here: it becomes reachable the
+moment a raw-IP driver gains native XDP.
+
+#### Why this is a precondition for 999, not a consequence of it
+
+cpumap redirect is the principal reason to want native XDP on `wwan0`. The MBIM
+receive path runs on one CPU; cpumap is the mechanism for moving per-packet work
+off it. So the first thing anyone would reach for once native XDP exists is the
+first thing that would silently drop every forwarded packet. **W0045 has to land
+first, or native XDP on this link delivers nothing measurable.**
+
+That reorders the queue. W0045 is small, core-net-only, upstreamable on its own
+merits, and needs no hardware.
+
+**Written as 999 the same day** (24.17), which is what makes this reachable
+rather than theoretical - and 999's own verification plan reproduces W0045
+deliberately, by redirecting into a cpumap without 998 applied before confirming
+it with 998.
+
+#### The fix, and the three details that are load-bearing
+
+998 asks `dev->type` and, when it is not `ARPHRD_ETHER`, does the same work
+`eth_type_trans()` does minus the header it does not have.
+
+* **`skb_reset_mac_header()` is required, not decorative.**
+  `build_skb_around()` does not set `mac_header`, `eth_type_trans()` would have,
+  and `__netif_receive_skb_core()` derives `mac_len` from it. Leaving it unset
+  gives a garbage `mac_len` on a device where it should be 0.
+* **`pkt_type` is set explicitly.** On the Ethernet path it comes from comparing
+  the destination MAC. With no MAC there is nothing to derive it from, and
+  `PACKET_HOST` is correct by construction.
+* **There is no pull.** `eth_type_trans()` removes `ETH_HLEN` because it
+  consumed a header. Here there is none, and pulling would eat the first 14
+  bytes of the IP packet.
+
+`xdp_l3_protocol()` is the derivation the raw-IP drivers already carry for
+packets they build themselves - `mhi_wwan_mbim.c:355`, `rmnet_handlers.c:22`,
+`iosm_ipc_wwan.c:233` each have a copy - so a frame round-tripped through XDP is
+labelled the way one that was not would be. It returns 0 for anything neither
+IPv4 nor IPv6, so an undecodable payload finds no ptype handler and is dropped
+rather than guessed at.
+
+#### Status
+
+`net/core/xdp.c` and `kernel/bpf/cpumap.c` are **pristine** in this tree - no
+patch here and none in OpenWrt's generic set touches either - so the context is
+upstream's. Verified to apply at `--fuzz=0` with 990 through 997 applied, and
+all three core-net patches coexist: 996's four `NAPI_STATE_NO_THREAD` sites in
+`dev.c`, 997's `stack->num_paths--`, and 998's `ARPHRD_ETHER` in `xdp.c`. The
+helper was compiled standalone and checked on IPv4, IPv6, a junk nibble and a
+zero-length frame.
+
+**Not built, not flashed, and not reproducible on this box yet** - nothing on
+`wwan0` reaches the native path until 999 is built, which is the whole point.
+999 is written (24.17) and its verification plan reproduces this deliberately:
+redirect into a cpumap with 998 reverted, confirm the drop, reapply, confirm the
+recovery.
+
+#### One other lever, recorded as reasoning rather than a finding
+
+**Zero-headroom native XDP.** `xdp_prepare_buff()` does not validate headroom,
+so an `xdp_buff` could point straight into the NTB at each datagram with
+`data_hard_start = data`. `XDP_DROP` and `XDP_PASS` would work and drops would
+skip skb allocation entirely. The hard limit is
+`xdp_convert_buff_to_frame()` needing `sizeof(struct xdp_frame)` = 40 bytes, so
+`XDP_TX` and `XDP_REDIRECT` are out - which means it does not reach the cpumap
+win above. Cheap ingress filtering, not the prize. **Untested; E3.**
+
+### 24.17 Native XDP on wwan0 is written, and W0026's premise was wrong - 2026-09-15
+
+Recorded here because it is a project event; the mechanism, the hazards and the
+verification plan live in `x3000/docs/native-xdp-wwan-design.md`, which is
+canonical for this subject and should not be duplicated.
+
+**The premise correction.** W0026 has been carried as "the page-pool rewrite of
+the RX refill is the only route to XNF01 there", on the understanding that MBIM
+datagrams share an NTB with no per-packet headroom. They do not, and never did.
+Pristine `mhi_wwan_mbim.c:319-324` copies every datagram out of the NTB into its
+own `netdev_alloc_skb()` - no clone, no shared page, no refcount to manage - and
+992 added `XDP_PACKET_HEADROOM` to that allocation. So every ingredient
+`xdp_prepare_buff()` wants was already present, and 256 bytes clears the 40-byte
+`sizeof(struct xdp_frame)` floor that `XDP_REDIRECT` needs. The gap was never the
+buffer; it was that the buffer got wrapped in an skb before the program ran
+instead of after.
+
+**999** closes it: `netdev_alloc_frag()` in place of `netdev_alloc_skb()`, the
+program on an `xdp_buff`, and `build_skb()` only on `XDP_PASS`. The copy is
+unchanged. `XDP_DROP` allocates no skb at all; `XDP_REDIRECT` can reach a cpumap.
+
+**Native is more correct here, not merely faster**, which is the opposite of the
+usual trade. `bpf_prog_run_generic_xdp()` reads bytes 0..5 and 12..13 as an
+Ethernet destination and ethertype (`dev.c:5093-5134`); on raw IP those offsets
+are inside the IP header, and 992 carries three stores and a long comment to
+repair the result. Running on an `xdp_buff` never enters that code, so the whole
+class of misparse is absent rather than corrected.
+
+**Two bugs caught in review before shipping**, both worth recording because both
+would have survived a casual read. `mhi_mbim_rx_error()` was called at line 439
+and defined at 533 - a straight compile failure, fixed with a forward
+declaration. And the `XDP_PASS` path routed a `build_skb()` allocation failure
+through the `abort:` label, which would have traced an out-of-memory condition
+as an XDP program exception via `trace_xdp_exception()`.
+
+**Three honest limits**, all in the patch header rather than discovered later:
+`XDP_TX` is not zero-copy, because there is no `ndo_xdp_xmit` here and
+`generic_xdp_tx()` is not exported to modules, so the frame re-enters the
+ordinary transmit path; there is no tail slack, so `bpf_xdp_adjust_tail()`
+growth returns `-EINVAL`; and `truesize` accounting changes, which lands
+upstream of 991's gro_cells and needs re-measuring rather than assuming.
+
+**What it does to 24.1.** That section recorded Kicinski refusing a nearby patch
+with "There is no native XDP on any non-ether device, making generic xdp work on
+those is silly", and read it as closing the whole XDP-on-the-modem question.
+999 is a direct counter-example to the premise in that first sentence: it makes
+a non-Ethernet device a native XDP device, and it does so without asking the
+core for anything, because the buffer discipline was already there. That changes
+the argument available; it does not overturn the conclusion, which was three
+maintainers' stated position and remains theirs. Lobakin's list of what would
+break on such a device - cpumap Rx and `ndo_xdp_xmit` - turned out to be
+exactly 998 and the XDP_TX limitation above, which is a point in his favour and
+worth saying plainly.
+
+**Status: E2, applies at `--fuzz=0` over 990 through 998. Not built, not
+flashed, not measured.** It shares `mhi_wwan_mbim.c` with 991, 992 and 995 and
+must apply after them. The cpumap payoff is gated on 998 (W0045). The
+verification plan is five tests, T0056 through T0060 on the matrix, against a
+build (B0011) that does not exist yet.
+
+**One thing this makes stale**: `x3000/docs/verify-992a.sh` tests the generic
+hook 999 replaces. Its attach steps still work - a program still attaches - but
+what it verifies is no longer the path the driver takes. It needs a pass before
+it is trusted again, and that is not done.

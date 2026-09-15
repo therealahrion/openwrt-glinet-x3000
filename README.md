@@ -25,8 +25,8 @@ from the [Build X3000 image workflow](../../actions/workflows/x3000-image.yml)
 `...-squashfs-sysupgrade.bin` (factory image is rejected by stock
 GL.iNet U-Boot; sysupgrade is the only path in).
 
-If you'd rather build the image yourself — including a private variant
-with your own internal CA, custom apk feed, or extra packages baked
+To build the image instead of flashing a release — including a private
+variant with an internal CA, a custom apk feed, or extra packages baked
 in — **read [`x3000/README.md`](x3000/README.md)**. It documents what's
 different from a stock OpenWrt build, the modem fixes vjt's fork already
 carries, the build prerequisites, the public/private variant split, and
@@ -35,7 +35,7 @@ the post-flash modem configuration. The whole build comes down to:
 ```
 git clone https://github.com/therealahrion/openwrt-glinet-x3000.git
 cd openwrt-glinet-x3000
-./x3000/build.sh public          # or `private` with your own overlay
+./x3000/build.sh public          # or `private`, which takes a local overlay
 ```
 
 ## Patches and Enhancements
@@ -184,6 +184,74 @@ and how to read its state on a running router:
   Attribution(s): Mine, written for this fork. Background, sections 23.18
                   and 24.12:
                       - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+  </pre>
+
+* **998 - XDP frame rebuild stops assuming Ethernet**
+  `target/linux/mediatek/patches-6.12/998-net-xdp-no-ethernet-assumption-rebuilding-skb.patch`
+
+  <pre>
+  Description:    __xdp_build_skb_from_frame() ends with an unconditional
+                  eth_type_trans(), which is right only when the ingress
+                  device has an Ethernet header. An xdp_frame carries no
+                  link-layer information, so the device is the only thing
+                  that can answer, and it was never asked. 998 asks it,
+                  and on a non-Ethernet device does the same work minus
+                  the header it does not have.
+  Benefit(s):     XDP_REDIRECT into a cpumap survives on a raw-IP link.
+                  Without it eth_type_trans() reads the IP version nibble
+                  as a destination MAC, IPv4 lands as PACKET_MULTICAST
+                  and IPv6 as PACKET_OTHERHOST, and ip_forward() drops
+                  every forwarded datagram.
+  Impact(s):      A no-op for every Ethernet device and every existing
+                  caller's normal case. On by default; core net only.
+  Limitation(s):  Native XDP only. The generic path tags its skbs into
+                  the same ring and never rebuilds them, so nothing can
+                  reach this today on a device that has no native XDP.
+                  It is a precondition for 999 rather than a result of
+                  it: native XDP on wwan0 delivers nothing through cpumap
+                  until this lands too. Not novel, either - Alexander
+                  Lobakin named cpumap Rx as exactly what breaks on a
+                  non-Ethernet device, on a netdev thread that was
+                  refused in August 2026, so this is the concrete
+                  instance of a consequence upstream has already weighed.
+  Attribution(s): Mine, written for this fork. The chain, the callers,
+                  why the generic path escapes it, and the upstream
+                  thread that had it first:
+                      - <a href="x3000/docs/xdp-methods-tested.md">x3000/docs/xdp-methods-tested.md</a>
+  </pre>
+
+* **999 - native XDP on the modem's receive path**
+  `target/linux/mediatek/patches-6.12/999-net-wwan-mhi_wwan_mbim-native-xdp-datagrams.patch`
+
+  <pre>
+  Description:    Replaces 992's generic XDP hook with a native one. Each
+                  de-aggregated datagram is copied into a bare page frag
+                  and the program runs on an xdp_buff; an skb is built
+                  only if the verdict is XDP_PASS. Possible because the
+                  driver has always copied every datagram out of the NTB
+                  into its own allocation, and 992 added the headroom.
+  Benefit(s):     XDP_DROP allocates no skb at all, where the generic
+                  path allocated one, ran the program on it and freed it.
+                  XDP_REDIRECT can reach a cpumap, which is how per-packet
+                  work moves off the single CPU the MHI DL tasklet runs
+                  on. Native is also more correct here: generic XDP's
+                  Ethernet misparse never happens rather than being
+                  repaired afterwards.
+  Impact(s):      On by default whenever a program is attached; with none
+                  attached the path is byte-for-byte upstream's. Changes
+                  how receive memory is accounted, since build_skb() on a
+                  frag reports a different truesize than netdev_alloc_skb,
+                  which lands upstream of 991's gro_cells.
+  Limitation(s):  XDP_TX is not zero-copy - no ndo_xdp_xmit here, so the
+                  frame re-enters the ordinary transmit path. No tail
+                  slack, so a program growing the packet gets -EINVAL.
+                  The cpumap payoff needs 998. Not built, not measured,
+                  and upstream has said it does not want XDP on
+                  non-Ethernet devices - this is a counter-example to the
+                  premise they gave, not a rebuttal of the decision.
+  Attribution(s): Mine, written for this fork. Design, hazards and the
+                  verification plan:
+                      - <a href="x3000/docs/native-xdp-wwan-design.md">x3000/docs/native-xdp-wwan-design.md</a>
   </pre>
 
 * **firewall4 — flow offload on a modem WAN**
@@ -479,7 +547,7 @@ and how to read its state on a running router:
                   luci-compat today; it is there for what comes later.
   Limitation(s):  The theme is pinned to a tag, so a newer Argon release
                   means bumping custom-feeds.txt. No uci-defaults script
-                  of ours sets the theme: the package ships its own, which
+                  here sets the theme: the package ships its own, which
                   fires once on a fresh config and afterwards leaves a
                   theme chosen in LuCI alone.
   Attribution(s): Mine. The inventory row, and how to read the theme on a

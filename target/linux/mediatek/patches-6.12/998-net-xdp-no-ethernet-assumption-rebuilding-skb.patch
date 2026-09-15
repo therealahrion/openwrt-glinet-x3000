@@ -1,0 +1,187 @@
+From: Ahrion Gallegos <ahrionmgallegos@gmail.com>
+Subject: net: xdp: do not assume an Ethernet header when rebuilding an skb
+
+__xdp_build_skb_from_frame() finishes with
+
+	/* Essential SKB info: protocol and skb->dev */
+	skb->protocol = eth_type_trans(skb, dev);
+
+unconditionally. That is right only when the ingress device actually has
+an Ethernet header in front of the payload, and there is nothing in the
+function that checks. An xdp_frame carries no link-layer information of
+its own, so the only thing that can answer the question is the device,
+and the device is never asked.
+
+On a raw-IP device the result is silent and total. eth_type_trans() reads
+the IP version nibble as the first octet of a destination MAC. IPv4's
+0x45 has the multicast bit set, so the frame comes out PACKET_MULTICAST;
+IPv6's 0x60 does not, so it comes out PACKET_OTHERHOST. Neither is
+PACKET_HOST, and ip_forward() rejects anything that is not, at
+net/ipv4/ip_forward.c:93, under a comment reading "that should never
+happen". Every forwarded datagram is dropped.
+
+Where it bites: kernel/bpf/cpumap.c:348 calls this with xdpf->dev_rx, the
+*ingress* device, so an XDP_REDIRECT into a cpumap from any raw-IP netdev
+loses the traffic. drivers/net/veth.c:727 is the other caller and is
+unaffected, being ARPHRD_ETHER; so are the driver-side users of the
+xdp_build_skb_from_frame() wrapper. For every existing caller in the
+Ethernet case this change is a no-op.
+
+Worth stating because it explains why nobody has hit it: this is the
+native path only. The generic path tags skbs into the same ptr_ring with
+__ptr_test_bit(0, &ptr) (cpumap.c:127 and :313) and never rebuilds them,
+so a device with only generic XDP cannot reach the bug. It becomes
+reachable the moment a raw-IP driver gains native XDP -- and cpumap
+redirect is one of the main reasons such a driver would want it, since it
+is how per-packet work moves off the single CPU the modem's RX path runs
+on. So the first thing that would be tried is the first thing that would
+fail.
+
+The fix asks the device and, when it is not Ethernet, does the same work
+eth_type_trans() does minus the header it does not have.
+
+Three details are load-bearing rather than stylistic:
+
+  * skb_reset_mac_header() is required, not decorative.
+    build_skb_around() above does not set mac_header, eth_type_trans()
+    would have, and __netif_receive_skb_core() derives mac_len from it.
+    Leaving it unset gives a garbage mac_len on a device where it should
+    be 0.
+  * pkt_type is set explicitly. On the Ethernet path it is derived from
+    comparing the destination MAC; with no MAC to compare there is
+    nothing to derive it from, and PACKET_HOST is correct by
+    construction for a device that receives only its own traffic.
+  * There is no pull. eth_type_trans() removes ETH_HLEN because it
+    consumed a header; here there is no header to consume, and pulling
+    would eat the first 14 bytes of the IP packet.
+
+xdp_l3_protocol() is the same derivation the raw-IP drivers already carry
+for the packets they build themselves -- mhi_wwan_mbim.c:355,
+rmnet_handlers.c:22 and iosm_ipc_wwan.c:233 each have their own copy --
+so a frame round-tripped through XDP is labelled the way one that was not
+would be. It returns 0 for anything that is neither IPv4 nor IPv6, so an
+undecodable payload finds no ptype handler and is dropped rather than
+guessed at.
+
+Not board-specific and not MediaTek-specific: it affects every
+ARPHRD_NONE and ARPHRD_RAWIP netdev on any driver, which is every WWAN
+modem in tree. It is a precondition for the driver-side native XDP patch
+rather than a consequence of it: that patch delivers nothing through
+cpumap until this is fixed as well.
+
+Not an independent discovery, and the prior art is an argument against
+sending it. Alexander Lobakin named this exact failure on netdev on
+2026-08-18, reviewing Jiayuan Chen's "net: xdp: don't assume an Ethernet
+header in generic XDP":
+
+  Most XDP programs expect Ethernet header at the beginning of a frame.
+  Unless you write a custom one which doesn't. But then you may face
+  that XDP_TX, XDP_REDIRECT won't work properly -- cpumap Rx, each
+  .ndo_xdp_xmit() implementation -- all expect Ethernet header at the
+  beginning.
+
+"cpumap Rx" is this patch. That thread was refused -- pw-bot: cr, no v2
+-- with Jakub Kicinski writing that there is no native XDP on any
+non-ether device, so making generic XDP work on them is silly, and Toke
+Hoiland-Jorgensen that the "XDP is Ethernet only" assumption should be
+left alone. So this is the concrete instance of a consequence three
+maintainers have already weighed and declined to treat as a bug, not a
+defect nobody had noticed.
+
+Two things separate it from the patch that was refused. It is the native
+path rather than the generic one -- a different function in a different
+file -- and it does not ask the core to relax an assumption on behalf of
+a device class with no native XDP, because the driver patch this sits
+under supplies one. Whether that is enough is not for me to predict; it
+is the argument, and it should be made explicitly rather than discovered
+in review.
+
+Evidence: E2 throughout, read at v6.12.103. net/core/xdp.c and
+kernel/bpf/cpumap.c are pristine in this tree -- no patch here or in
+OpenWrt's generic set touches either -- so the context is upstream's.
+Verified to apply at --fuzz=0 with 990 through 997 already applied.
+Shares no file with any of them.
+
+Out-of-tree patch for the GL-X3000 lean build.
+
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -14,6 +14,7 @@
+ #include <linux/idr.h>
+ #include <linux/rhashtable.h>
+ #include <linux/bug.h>
++#include <linux/if_arp.h>
+ #include <net/page_pool/helpers.h>
+ 
+ #include <net/hotdata.h>
+@@ -650,6 +651,31 @@ int xdp_alloc_skb_bulk(void **skbs, int
+ }
+ EXPORT_SYMBOL_GPL(xdp_alloc_skb_bulk);
+ 
++/* Derive the L3 protocol of a raw-IP frame from its version nibble.
++ *
++ * Matches what the raw-IP drivers already do for the packets they build
++ * themselves -- mhi_wwan_mbim.c, rmnet_handlers.c and iosm_ipc_wwan.c each
++ * carry their own copy of this -- so a frame that has been round-tripped
++ * through XDP arrives labelled the same way one that has not.
++ *
++ * 0 for anything else: an undecodable payload should find no ptype handler
++ * and be dropped, rather than be guessed at.
++ */
++static __be16 xdp_l3_protocol(const struct sk_buff *skb)
++{
++	if (unlikely(!skb->len))
++		return 0;
++
++	switch (skb->data[0] & 0xf0) {
++	case 0x40:
++		return htons(ETH_P_IP);
++	case 0x60:
++		return htons(ETH_P_IPV6);
++	default:
++		return 0;
++	}
++}
++
+ struct sk_buff *__xdp_build_skb_from_frame(struct xdp_frame *xdpf,
+ 					   struct sk_buff *skb,
+ 					   struct net_device *dev)
+@@ -687,8 +713,36 @@ struct sk_buff *__xdp_build_skb_from_fra
+ 					   nr_frags * xdpf->frame_sz,
+ 					   xdp_frame_is_frag_pfmemalloc(xdpf));
+ 
+-	/* Essential SKB info: protocol and skb->dev */
+-	skb->protocol = eth_type_trans(skb, dev);
++	/* Essential SKB info: protocol and skb->dev.
++	 *
++	 * eth_type_trans() is right only when the ingress device actually has
++	 * an Ethernet header in front of the payload. An xdp_frame carries no
++	 * link-layer information of its own, so the only way to know is to ask
++	 * the device.
++	 *
++	 * On a raw-IP device -- every WWAN modem netdev, among others --
++	 * running eth_type_trans() here reads the IP version nibble as the
++	 * first octet of a destination MAC. IPv4's 0x45 has the multicast bit
++	 * set, so the frame comes out PACKET_MULTICAST; IPv6's 0x60 does not,
++	 * so it comes out PACKET_OTHERHOST. Neither is PACKET_HOST, and
++	 * ip_forward() drops anything that is not, under a comment reading
++	 * "that should never happen".
++	 */
++	if (dev->type == ARPHRD_ETHER) {
++		skb->protocol = eth_type_trans(skb, dev);
++	} else {
++		/* The same work eth_type_trans() does, minus the header it does
++		 * not have: no pull, and no destination-MAC comparison to
++		 * derive pkt_type from, so it is PACKET_HOST by construction.
++		 * mac_header must be set because build_skb_around() above left
++		 * it unset and __netif_receive_skb_core() derives mac_len from
++		 * it.
++		 */
++		skb->dev = dev;
++		skb_reset_mac_header(skb);
++		skb->pkt_type = PACKET_HOST;
++		skb->protocol = xdp_l3_protocol(skb);
++	}
+ 
+ 	/* Optional SKB info, currently missing:
+ 	 * - HW checksum info		(skb->ip_summed)

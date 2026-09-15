@@ -239,6 +239,19 @@ CONFIG_KERNEL_MHI_BUS_DEBUG=y
 # together and what they cost.
 CONFIG_KERNEL_DEVMEM=y
 
+# --- io: raw memory i/o utility -------------------------------------------
+# The only tool in the feeds that can read a memory-mapped register on this
+# architecture. dd, od, hexdump and xxd all go through read(), and arm64's
+# valid_phys_addr_range() (arch/arm64/mm/mmap.c:41) restricts that path to
+# RAM, so read_mem() returns -EFAULT before the register is touched. io
+# mmaps (io.c:354), which is gated by valid_mmap_phys_addr_range() instead
+# and permits any address in the physical mask.
+#
+# Hazard: io writes as well as reads, and the guard is not where it looks.
+# At io.c:236 any second positional argument turns a read into a write, and
+# -r does not override it. Always "io -4 <addr>" and nothing after.
+CONFIG_PACKAGE_io=y
+
 # --- qdisc / classifier kmods (vermagic-locked: bake now or never) -----
 # cake for the Phase-1 WAN shaper (hand-driven via tc — no sqm), the
 # eBPF classifier hook, ifb for ingress redirection, xdp-sockets-diag

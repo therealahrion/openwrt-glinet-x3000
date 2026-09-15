@@ -3,200 +3,103 @@
 #
 # Question it answers: does this SoC implement the register region MediaTek's
 # PCE driver uses on MT7988? That driver takes no reg of its own -- its DT node
-# is pce@15100000 with fe_mem = <&eth> -- so it pokes offsets inside the frame
-# engine's own window, which MT7981 has at the same base and the same size.
+# is pce@15100000 with fe_mem = <&eth> -- so it reaches offsets inside the
+# frame engine's own window, which MT7981 has at the same base and size.
 #
-# NEEDS THE REBUILT IMAGE. OpenWrt's shared config carries
-# "# CONFIG_DEVMEM is not set" (target/linux/generic/config-6.12:1405), so on
-# a stock build /dev/mem does not exist and no userspace tool can reach a
-# physical address at all. This tree overrides that with three symbols split
-# across two files:
+# Result as of 2026-09-15: all eight PCE offsets read zero, inside a 748-byte
+# contiguous zero run, in a window that returns structured values for dozens of
+# registers upstream never names. See xdp-methods-tested.md section 24.14 for
+# what that does and does not license.
 #
-#   x3000/config.common
-#     CONFIG_KERNEL_DEVMEM=y              the device node exists
-#   target/linux/mediatek/filogic/config-6.12
-#     CONFIG_STRICT_DEVMEM=y                system RAM stays unreachable
-#     # CONFIG_IO_STRICT_DEVMEM is not set  driver-claimed MMIO stays readable
+# REQUIREMENTS
+#   CONFIG_KERNEL_DEVMEM=y in x3000/config.common, plus CONFIG_STRICT_DEVMEM=y
+#   and IO_STRICT_DEVMEM off in the subtarget fragment. See the Enhancements
+#   entry in the repo-root README.
+#   The "io" package (CONFIG_PACKAGE_io=y, or apk add io).
 #
-# The split is forced. OpenWrt declares KERNEL_DEVMEM and appends it to the
-# merged kernel config after the fragments, so a CONFIG_DEVMEM=y written in the
-# fragment is silently overridden and the image ships with no /dev/mem. The
-# other two have no KERNEL_ equivalent, so the fragment is their only home.
+# WHY io AND NOT dd
+#   read() cannot reach MMIO on arm64. valid_phys_addr_range()
+#   (arch/arm64/mm/mmap.c:41) returns memblock_is_region_memory() &&
+#   memblock_is_map_memory(), true for RAM only, so read_mem() gives up with
+#   -EFAULT at drivers/char/mem.c:112. mmap_mem() is gated by
+#   valid_mmap_phys_addr_range() (mmap.c:60) instead, which permits any address
+#   in the physical mask. io mmaps at io.c:354; dd, od, hexdump and xxd do not.
 #
-# All three lines are load-bearing. Without the third, the kernel refuses
-# reads of any region a driver has claimed, and mtk_eth_soc claims this whole
-# window, so every row below would fail. The second is what keeps the price of
-# having /dev/mem at all down to MMIO instead of all of physical memory:
-# devmem_is_allowed() returns 1 for a page that is not RAM and 0 for one that
-# is (lib/devmem_is_allowed.c).
+# WINDOW LAYOUT
+#   Registers below FE+0x40000; on-chip SRAM from FE+0x40000 up, because
+#   MT7981_CAPS carries MTK_SRAM and MTK_ETH_SRAM_OFFSET is 0x40000
+#   (mtk_eth_soc.h:145, mtk_eth_soc.c:4907). Do not use the top half as a
+#   negative control -- it holds live buffer contents.
 #
-# Until an image carrying that config is flashed, this exits at the /dev/mem
-# check below.
+# READ ONLY, and io does not make that easy: at io.c:236 a second positional
+# argument turns a read into a WRITE, and -r does not override it. Every call
+# below passes exactly two arguments. Never add a third. Writing an
+# undocumented frame engine register on a live router is how the WAN goes away.
 #
-# READS ONLY. Never add a write to this script. Writing an undocumented frame
-# engine register on a live router is how the WAN goes away.
-#
-# Reading is not guaranteed free either: on some designs a read of an
-# unimplemented address inside a peripheral window raises an imprecise abort
-# rather than returning zero. It is usually benign within a mapped window, and
-# I cannot promise it here. Run it when a reboot is cheap.
-#
-# Indented with SPACES on purpose. A leading tab pasted into an interactive
-# shell triggers readline completion and dumps the whole command list into the
-# middle of the heredoc, which silently corrupts the script being written.
+# Indented with SPACES on purpose: a leading tab pasted into an interactive
+# shell triggers readline completion and corrupts the heredoc being written.
 
-FE=0x15100000    # eth: ethernet@15100000, length 0x80000 on mt7981 and mt7988
+FE=0x15100000
 
 say() { printf '%s\n' "$*"; }
 hr()  { say "------------------------------------------------------------"; }
 
-# Pick a 32-bit physical read backend.
-#
-# devmem is a BUSYBOX applet, not a coreutils one, so installing coreutils does
-# not provide it. busybox may also carry the applet without a /usr/bin symlink
-# for it, which is why the second probe calls it through busybox by name. The
-# third backend needs only dd plus one of od or hexdump, and coreutils and
-# busybox both supply those.
-BACKEND=
-DUMP=
-if command -v devmem >/dev/null 2>&1; then
-  BACKEND=devmem
-elif command -v busybox >/dev/null 2>&1 && busybox devmem 2>&1 | grep -qi usage; then
-  BACKEND=busybox
-elif command -v dd >/dev/null 2>&1; then
-  if command -v od >/dev/null 2>&1; then
-    BACKEND=dd
-    DUMP=od
-  elif command -v hexdump >/dev/null 2>&1; then
-    BACKEND=dd
-    DUMP=hexdump
-  fi
-fi
-
-if [ -z "$BACKEND" ]; then
-  say "no usable backend. Need one of:"
-  say "  devmem, a busybox applet enabled with CONFIG_BUSYBOX_CONFIG_DEVMEM"
-  say "  busybox carrying that applet"
-  say "  dd plus od or hexdump"
+command -v io >/dev/null 2>&1 || {
+  say "io not installed:  apk add io   (or opkg install io)"
   exit 1
-fi
-
-if [ ! -r /dev/mem ]; then
-  say "/dev/mem is not readable, so nothing below can run."
-  say ""
-  say "On an OpenWrt build this is almost always CONFIG_DEVMEM=n rather than a"
-  say "permissions problem: the char major is still registered but the minor"
-  say "is skipped, so the node is never created. Confirm with"
-  say "'zcat /proc/config.gz | grep CONFIG_DEVMEM'."
-  say ""
-  say "If that says it is not set, this image predates the config change in"
-  say "target/linux/mediatek/filogic/config-6.12 and needs a rebuild."
+}
+[ -r /dev/mem ] || {
+  say "/dev/mem not readable. This image predates the config change; see the"
+  say "Enhancements entry in the repo-root README."
   exit 1
-fi
-
-# One little-endian 32-bit word on stdout, no address column, from either tool.
-dump_word() {
-  if [ "$DUMP" = od ]; then
-    od -An -tx4 -N4
-  else
-    hexdump -n 4 -e '1/4 "%08x"'
-  fi
 }
 
-rd() {  # rd <offset> <label>
-  _off=$1
-  _lab=$2
-  _addr=$(printf '0x%08x' $(( FE + _off )))
-  case "$BACKEND" in
-    devmem)
-      _v=$(devmem "$_addr" 32 2>/dev/null)
-      ;;
-    busybox)
-      _v=$(busybox devmem "$_addr" 32 2>/dev/null)
-      ;;
-    dd)
-      _skip=$(( (FE + _off) / 4 ))
-      _raw=$(dd if=/dev/mem bs=4 count=1 skip=$_skip 2>/dev/null | dump_word)
-      _v=$(printf '%s' "$_raw" | tr -d ' \n')
-      [ -n "$_v" ] && _v=0x$_v
-      ;;
-  esac
-  if [ -z "$_v" ]; then
-    printf '  %-26s %s  READ FAILED\n' "$_lab" "$_addr"
-  else
-    printf '  %-26s %s  %s\n' "$_lab" "$_addr" "$_v"
-  fi
+rd() {  # rd <hex offset without 0x> <label>
+  _a=$(printf '0x%08x' $(( FE + 0x$1 )))
+  # stderr to /dev/null on purpose: an error message has fields too, and
+  # letting awk take $2 from one would print it as if it were a register value.
+  _v=$(io -4 "$_a" 2>/dev/null | awk 'NR==1 && NF>=2 {print $2}')
+  [ -n "$_v" ] && _v=0x$_v || _v="READ FAILED"
+  printf '  %-22s %s  %s\n' "$2" "$_a" "$_v"
 }
 
 hr
-say "frame engine window probe -- READ ONLY"
-say "base $FE, length 0x80000"
-if [ -n "$DUMP" ]; then
-  say "backend $BACKEND via $DUMP"
-  say "  Access width: the read lands in copy_from_kernel_nofault(), which"
-  say "  picks its width from the alignment of the source and destination"
-  say "  pointers alone. At bs=4 count=1 on a 4-aligned address the u64 loop"
-  say "  cannot run and the u32 loop does exactly one 32-bit load, which is"
-  say "  the right width for these registers. Do not change the block size."
-else
-  say "backend $BACKEND"
-fi
+say "frame engine window probe -- READ ONLY, io/mmap backend"
+say "base $FE; registers below +0x40000, SRAM above"
 hr
-
-say "environment"
-if [ -r /proc/iomem ]; then
-  _io=$(grep -i '15100000' /proc/iomem 2>/dev/null)
-  if [ -n "$_io" ]; then
-    printf '%s\n' "$_io" | sed 's/^/  /'
-  else
-    say "  no /proc/iomem line covers the base"
-  fi
-else
-  say "  /proc/iomem not readable"
-fi
-if [ -r /proc/config.gz ] && command -v zcat >/dev/null 2>&1; then
-  zcat /proc/config.gz 2>/dev/null \
-    | grep -E '^(# )?CONFIG_(DEVMEM|STRICT_DEVMEM|IO_STRICT_DEVMEM)[ =]' \
-    | sed 's/^/  /'
-else
-  say "  /proc/config.gz absent, cannot report the DEVMEM config symbols"
-fi
+grep -i '15100000' /proc/iomem 2>/dev/null | sed 's/^/  /'
 say ""
-
-say "positive controls -- upstream drives these, so they must read sanely"
-rd 0x2000 "PPE0 base (ppe_base)"
-rd 0x2004 "PPE0 +0x04"
-rd 0x2400 "PPE1 base"
+say "CONTROLS -- the driver programs these, so they must be non-zero."
+say "If they are not, nothing below means anything."
+rd 2200 "PPE0 GLO_CFG"
+rd 221c "PPE0 TB_CFG"
+rd 2220 "PPE0 TB_BASE"
+rd 2620 "PPE1 TB_BASE"
+rd 4604 "QDMA GLO_CFG"
 say ""
-say "the registers the PCE driver uses on MT7988"
-rd 0x0258 "PPE_TPORT_TBL_0"
-rd 0x025c "PPE_TPORT_TBL_1"
-rd 0x0600 "GLO_MEM_CFG"
-rd 0x0604 "GLO_MEM_CTRL"
-rd 0x0608 "GLO_MEM_DATA_IDX(0)"
-rd 0x060c "GLO_MEM_DATA_IDX(1)"
-rd 0x0610 "GLO_MEM_DATA_IDX(2)"
-rd 0x0614 "GLO_MEM_DATA_IDX(3)"
+say "SUBJECT -- the registers MediaTek's PCE driver uses on MT7988"
+rd 0258 "PPE_TPORT_TBL_0"
+rd 025c "PPE_TPORT_TBL_1"
+rd 0600 "GLO_MEM_CFG"
+rd 0604 "GLO_MEM_CTRL"
+rd 0608 "GLO_MEM_DATA_IDX0"
+rd 060c "GLO_MEM_DATA_IDX1"
+rd 0610 "GLO_MEM_DATA_IDX2"
+rd 0614 "GLO_MEM_DATA_IDX3"
 say ""
-say "negative controls -- offsets nothing is known to implement."
-say "whatever pattern these show is what 'not implemented' looks like here."
-rd 0x7f000 "high unused"
-rd 0x7f004 "high unused +4"
-rd 0x0700 "0x700 unused"
+say "FLOOR -- register half, clear of every block in mt7986_reg_map"
+rd 0700 "0x0700"
+rd 0f00 "0x0f00"
+rd 1800 "0x1800"
+rd 3f00 "0x3f00"
+rd 5000 "0x5000"
 hr
-say "How to read this:"
-say "  If GLO_MEM_* matches the negative controls exactly (all 0, or all"
-say "  0xffffffff), that is consistent with the region not being implemented."
-say "  If GLO_MEM_* differs from the negative controls and looks structured,"
-say "  the region responds and the PCE tables may well be present but unwired."
+say "For the full picture rather than these rows, dump the region in one call:"
+say "  io -4 -l 0x800 $FE > /tmp/fe.dump"
+say "  grep -v ':  00000000 00000000 00000000 00000000\$' /tmp/fe.dump"
 say ""
-say "  If the positive controls also read 0 or FAILED, the backend is the"
-say "  problem and no row here means anything."
-say ""
-say "  If every row fails with a permission error rather than reading zero,"
-say "  suspect CONFIG_IO_STRICT_DEVMEM. OpenWrt's shared config sets it, and"
-say "  with it live the kernel refuses reads of any driver-claimed range --"
-say "  which this whole window is. The subtarget config turns it back off"
-say "  for exactly that reason; confirm with"
-say "  'zcat /proc/config.gz | grep IO_STRICT_DEVMEM'."
+say "How to read it: a subject register reading zero is only meaningful"
+say "against the floor AND against how much of the region is alive. Both"
+say "naive inferences are false here -- 46 live offsets are unnamed by"
+say "upstream, and 10 offsets upstream does name read zero."
 hr
