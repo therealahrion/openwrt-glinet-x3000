@@ -4983,6 +4983,55 @@ stations - but if awk itself were absent the `eval` produces nothing and the
 are now reset to 0 before each eval. A zero is a visible wrong answer; a
 double-count is an invisible one.
 
+#### Does any of this invalidate a result already taken?
+
+Almost none of it, and the reason is worth stating because it is not luck.
+
+**Defect 1 could not corrupt anything silently.** An empty field would have
+produced an arithmetic syntax error on screen, not a wrong number - and
+`/proc/net/softnet_stat` carries 15 fields on every line, so it never fired.
+Defect 3 needed a missing `awk`, which was always present.
+
+**Defect 2 is the one that touched real numbers**, and which numbers depends on
+whether a quantity divides by the window at all:
+
+| quantity | divides by the clock? |
+|---|---|
+| `rx_dropped`, `softnet_dropped`, `time_squeeze`, `rx_errors` | **no** - raw counter deltas |
+| `agg` (`dp/ds`), `bytes/skb` (`db/ds`) | **no** - ratios; the divisor cancels |
+| `retries/1k` (`dsr*1000/dsp`), `frames`, `failed` | **no** - ratios and raw deltas |
+| `rtt` | **no** - comes from `ping` |
+| Mbit/s, dgram/s, skb/s | **yes** |
+
+So every load-bearing conclusion survives:
+
+- **Twenty-four windows, zero drops.** A raw counter delta. Untouched.
+- **No backlog depth removes a drop.** Same.
+- **Aggregation tracks rate, not stream count.** `agg` is `dp/ds` and has no
+  divisor at all; the correlation with `dgram/s` is scale-invariant, so a
+  divisor wrong by a constant factor cannot move it.
+- **4.97x aggregation, 2370 skbs for 11790 datagrams.** Ratios.
+- **The throughput comparisons that failed their drift control three times.**
+  Those use the divisor - but `gro-backlog-ab.sh`'s error was the *nominal*
+  window, a systematic underestimate of the same size in every window. It
+  inflates every absolute rate by the read overhead, well under 1%, and cancels
+  out of any window-to-window comparison.
+
+**One result is genuinely weakened: the encap A/B in 23.19.** It ran under
+`wifi-encap.sh` with the `date +%s` clock, so its Mbit/s columns carry up to 5%
+of *random* per-window error rather than a shared bias. Its conclusion was a null
+- 875 against 886, a 1.3% gap, called "no cost worth measuring". That conclusion
+still holds, because the A/B alternated four cycles per condition and random
+error averages down by the root of the count, leaving roughly 2.5% against a 1.3%
+observed gap. **What has to be restated is the resolution, not the verdict:** the
+rig resolved worse than it was credited with, so "no measurable cost" means no
+cost above a few percent, not no cost above one.
+
+**Nothing needs re-running.** The fix improves every future window; it does not
+retire a single past one. The only measurement still outstanding is W0043, and
+that is blocked on the wrong *traffic* rather than a bad clock - it touches only
+UDP this box forwards, and every window so far has been TCP terminating here.
+
 #### What this does not cover
 
 `shellcheck` finds shape, not meaning. It had nothing to say about any of the
