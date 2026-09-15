@@ -27,6 +27,12 @@
 # Overridable: WANIF, URL, STREAMS, WINDOW, PINGTGT. Most iterations need a
 # different environment, not a different script.
 #
+# STREAMS is a CEILING, not a demand. The load ramps up one stream at a time and
+# keeps only those the source will actually serve, so a source that caps
+# concurrent connections per address - which the default URL does, at two -
+# settles the run at whatever it allows and says so. There is no number to tune
+# by hand and no run to throw away because half the fetchers were thrashing.
+#
 # What it is looking for. At ~20k datagrams/s this link overflows a queue and
 # drops about 0.2% of them. Which queue depends on GRO:
 #   rx_dropped moves, softnet_dropped stays 0  -> the gro_cells queue
@@ -162,29 +168,81 @@ sq() {
 # bytes are actually arriving before measuring anything, and keep the fetcher
 # stderr so the next occurrence is evidence instead of a mystery.
 LOADLOG=/tmp/.gro_ab_load.log
+
+# How many fetch failures have been logged so far.
+#
+# busybox grep -c prints 0 and exits non-zero when nothing matches, so the
+# substitution can come back empty rather than "0"; the guard is not decoration.
+fail_count() {
+	_c=$(grep -c '^fetch exit' $LOADLOG 2>/dev/null)
+	[ -n "$_c" ] || _c=0
+	echo "$_c"
+}
+
+# Bring the load up one stream at a time, keeping only the streams the source
+# will actually serve.
+#
+# The 2026-09-14 run asked for four streams against the default URL and got two:
+# the other two sat in a retry loop failing with exit 8 every 2.5 seconds for
+# the whole run. Public speed-test sources cap concurrent connections per
+# address, and nothing here knew that number. The first attempt at a fix only
+# refused to run, which left the operator to guess STREAMS by hand - a
+# workaround, not a fix, and it hard-codes one server's limit into this script.
+#
+# Ramping up instead of down means the script never passes through a broken
+# state and never has to be told the limit: it adds a stream, watches for three
+# seconds, and keeps it only if no new failure appears. Whatever the source
+# allows is what the run uses, and the number is reported rather than assumed.
+#
+# A stable two streams is a perfectly good load. What ruined the earlier run was
+# not the count but the churn - streams thrashing on retry make the offered load
+# wander, which reads as throughput drift across windows and is indistinguishable
+# from the setting under test mattering.
 start_load() {
 	: > $LOADLOG
+	PIDS=""
+	_kept=0
 	_n=0
 	while [ "$_n" -lt "$STREAMS" ]; do
+		_n=$((_n+1))
+		_before=$(fail_count)
 		( while :; do
 			wget -qO /dev/null "$URL" 2>>$LOADLOG ||
 				{ echo "fetch exit $? at $(date +%T)" >>$LOADLOG; sleep 2; }
 		done ) &
-		PIDS="$PIDS $!"
-		_n=$((_n+1))
+		_new=$!
+		sleep 3
+		_after=$(fail_count)
+		if [ "$_after" -gt "$_before" ]; then
+			# This stream could not be added. Stop here rather than trying
+			# more: a source that refused the Nth will refuse the N+1th, and
+			# every extra attempt is another retry loop competing for the
+			# link it is supposed to be loading.
+			kill "$_new" 2>/dev/null
+			say "load: source refused stream $_n - settling at $_kept"
+			break
+		fi
+		PIDS="$PIDS $_new"
+		_kept=$((_kept+1))
 	done
-	sleep 5
-	# A live PID is not a working download. The 2026-09-14 run reported
-	# "load: 4 of 4 stream drivers running" while two of the four were in a
-	# retry loop failing every 2.5 seconds, because this counted subshells
-	# rather than fetches. The subshell stays alive precisely BECAUSE its
-	# wget keeps failing - the `while :;` loop is what keeps it there - so
-	# the old check was closest to a lie exactly when the load was worst.
-	_live=0
-	for p in $PIDS; do kill -0 $p 2>/dev/null && _live=$((_live+1)); done
-	_fails=$(grep -c '^fetch exit' $LOADLOG 2>/dev/null)
-	[ -n "$_fails" ] || _fails=0
-	say "load: $_live of $STREAMS stream drivers up, $_fails fetch failure(s) so far"
+
+	if [ "$_kept" -eq 0 ]; then
+		say ""
+		say "FATAL: not one stream could fetch $URL."
+		say "       Fetcher output:"
+		sed -n '1,6p' $LOADLOG | sed 's/^/         /'
+		say "       Try it by hand: wget -O /dev/null \"$URL\""
+		cleanup
+		exit 1
+	fi
+	if [ "$_kept" -lt "$STREAMS" ]; then
+		say "load: $_kept stream(s) holding of $STREAMS asked for - the source"
+		say "      caps concurrent connections. This is fine: a stable smaller"
+		say "      load measures correctly, where a thrashing larger one does not."
+	else
+		say "load: $_kept of $STREAMS stream(s) holding, no fetch failures"
+	fi
+	LOAD_BASE=$(fail_count)
 
 	_t0=$(cat /sys/class/net/$WANIF/statistics/rx_bytes)
 	sleep 3
@@ -195,42 +253,26 @@ start_load() {
 		say "FATAL: only $_mb Mbit/s arriving on $WANIF, so there is no load to measure."
 		say "       Every window would have reported noise. Fetcher output:"
 		sed -n '1,6p' $LOADLOG | sed 's/^/         /'
-		say "       Try the URL by hand: wget -O /dev/null \"$URL\""
 		cleanup
 		exit 1
 	fi
-
-	# Partial failure is the case that produced an unreadable run and was not
-	# caught. Some bytes arrive, so the check above passes, but the offered
-	# load is a fraction of STREAMS and it wanders as retries land - which
-	# shows up as throughput drift across windows and is indistinguishable
-	# from the setting under test actually mattering.
-	_f2=$(grep -c '^fetch exit' $LOADLOG 2>/dev/null)
-	[ -n "$_f2" ] || _f2=0
-	if [ "$_f2" -gt 0 ]; then
-		say ""
-		say "STOP: $_f2 fetch failure(s) in the first 8s - the offered load is"
-		say "      only part of the $STREAMS streams asked for, and it will wander"
-		say "      as retries land. Throughput and rtt would drift across windows"
-		say "      and read as though the setting under test caused it."
-		say ""
-		say "      Most likely the source is limiting concurrent connections from"
-		say "      one address. Measured 2026-09-14: 4 streams against the default"
-		say "      URL failed two of them continuously with exit 8 while the other"
-		say "      two downloaded fine."
-		say ""
-		say "      Retry with fewer streams, or a source that tolerates concurrency:"
-		say "          STREAMS=2 sh \$0"
-		say "          URL=<other source> sh \$0"
-		say "      Set LOAD_I_ACCEPT_A_PARTIAL_LOAD=1 to measure anyway - the drop"
-		say "      counters stay valid, the throughput and rtt columns do not."
-		if [ "${LOAD_I_ACCEPT_A_PARTIAL_LOAD:-0}" != 1 ]; then
-			cleanup
-			exit 1
-		fi
-		say "      LOAD_I_ACCEPT_A_PARTIAL_LOAD=1 - continuing under protest."
-	fi
 	say "load confirmed: about $_mb Mbit/s arriving on $WANIF"
+}
+
+# Failures AFTER the ramp settled are the ones that invalidate a run: they mean
+# a stream that was serving has started thrashing, so the offered load moved
+# under the windows. Baselined at LOAD_BASE so the ramp's own probe failures,
+# which are expected and already handled, are not counted twice.
+load_drift_check() {
+	_now=$(fail_count)
+	_since=$(( _now - ${LOAD_BASE:-0} ))
+	if [ "$_since" -gt 0 ]; then
+		say ""
+		say "WARNING: $_since fetch failure(s) since the load settled. A stream"
+		say "         dropped out mid-run, so the offered load moved and the"
+		say "         throughput and rtt columns above are not comparable across"
+		say "         windows. The drop counters are still valid."
+	fi
 }
 
 # ---- one measurement window -----------------------------------------------
@@ -502,6 +544,7 @@ say ""
 # the cellular data matters.
 if [ "$1" = --baseline ]; then
 	meas "baseline"
+	load_drift_check
 	cleanup
 	say "Read it this way:"
 	say "  time_squeeze 0 under a saturating window means NAPI never ran out of"
@@ -530,6 +573,8 @@ done
 # version of that: one repeat, enough to size the drift against the effect.
 bs_set_sysctl net.core.netdev_max_backlog 1000
 meas "backlog-1000 (drift control)"
+
+load_drift_check
 
 # No explicit put-back here: bs_restore in cleanup() holds the value this run
 # started with, and re-setting it by hand was how the old code could restore a

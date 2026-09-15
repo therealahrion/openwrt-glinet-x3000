@@ -4553,14 +4553,38 @@ That is the same class of error as `bs_gro()` reading a feature bit: an
 instrument that cannot distinguish the state it is supposed to detect. Three of
 these have now turned up in this document in one day.
 
-Fixed in `gro-backlog-ab.sh`:
+Fixed in `gro-backlog-ab.sh`, in two passes - the first of which was not a fix:
 
-- `start_load()` counts real fetch failures and reports "N drivers up, K fetch
-  failure(s)" instead of a PID count.
-- **Any failure in the first 8 seconds now stops the run**, naming the likely
-  cause and the two escapes (`STREAMS=2`, or a different `URL`).
-  `LOAD_I_ACCEPT_A_PARTIAL_LOAD=1` overrides, with the warning that the drop
-  counters stay valid while throughput and rtt do not.
+**Attempt one refused to run.** It counted real fetch failures instead of PIDs
+and stopped the sweep if any appeared in the first eight seconds, telling the
+operator to retry with `STREAMS=2`. That worked - the gate fired on its first
+live use and stopped a doomed run in eight seconds - but it left the operator to
+discover the source's concurrency limit by hand, and it hard-coded one server's
+behaviour into a harness that should not care. A tool that refuses is better
+than one that lies, and still worse than one that works.
+
+**Attempt two ramps the load up instead.** `start_load()` now adds one stream at
+a time, waits three seconds, and keeps it only if no new failure appeared:
+
+- `STREAMS` becomes a **ceiling rather than a demand**. Whatever the source
+  serves is what the run uses, and the number is printed rather than assumed.
+- The script never passes through a broken state and never needs to be told the
+  limit. Against the default URL it settles at two without being asked.
+- Zero streams kept is the only fatal case, and it means the URL or the link is
+  wrong rather than busy.
+- `load_drift_check()` runs after the windows and warns if any fetch failed
+  *after* the ramp settled, baselined at `LOAD_BASE` so the ramp's own probe
+  failures are not counted twice. That is the case that invalidates a run: a
+  stream that was serving drops out and the offered load moves under the
+  windows.
+
+The insight the first attempt missed is that **the count was never the problem.**
+A stable two streams measures correctly. What ruined the run was churn - streams
+thrashing on retry make the offered load wander, which reads as throughput drift
+and is indistinguishable from the setting under test mattering.
+
+Verified offline against a stub source that caps concurrency: asked for four,
+kept four of four, two of two, one of one, and took the fatal path at zero.
 - The sweep now **repeats backlog-1000 as a drift control at the end**, so the
   spread attributable to drift is measured in the same run as the effect. This
   is the cheap form of the alternation 23.19 arrived at for the Wi-Fi A/B.
