@@ -1,6 +1,6 @@
 # BPF sources for `verify-xdp.sh`
 
-`verify-xdp.sh` uses three pre-compiled eBPF objects so the router needs no
+`verify-xdp.sh` uses four pre-compiled eBPF objects so the router needs no
 compiler. They live in `bpf/` next to the script; the script falls back to
 fetching them from the repo over HTTPS if that directory is missing.
 

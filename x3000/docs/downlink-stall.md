@@ -1,6 +1,8 @@
 # The wwan0 downlink stall
 
-Status: root-caused and fixed. The modem's MHI data channels run in burst-mode
+Status: root-caused, and worked around in the shipped image. The controlled
+reverse test is still outstanding - see "Still open". The modem's MHI data
+channels run in burst-mode
 doorbell, and under sustained load nothing on this hardware ever rings the bell,
 so the downlink deadlocks holding a full ring of buffers the modem was never
 told about. Patch 880 forces unconditional doorbell writes; it is enabled on
@@ -78,7 +80,8 @@ healthy-under-load control.
 
 ## Why it is not mine
 
-The kernel-side difference between this tree and `jeeves-r8` is exactly:
+As of the 2026-09-09 capture, the kernel-side difference between this tree and
+`jeeves-r8` was exactly:
 
 - `870-tcp-bbr3.patch`, `890-...gro-cells-rx.patch`, `891-...native-xdp.patch`
   (none of the three exist in `jeeves-r8`)
@@ -105,10 +108,14 @@ argument:
   `mhi_net_rx_refill_work()` is **byte-identical to upstream** too. Neither
   patch touches `mhi_queue*`, `mbim->mru`, `rx_queue_sz` or
   `mhi_get_free_desc_count`.
-- 891's one allocation change is `netdev_alloc_skb(ndev, headroom + dgram_len)`
-  where `headroom` is `XDP_PACKET_HEADROOM` only while a program is attached.
-  With none attached - normal operation - it is zero and the allocation is
-  identical to upstream.
+- The receive-path patches change the per-datagram allocation only while an
+  XDP program is attached. With none attached - normal operation - the
+  allocation is identical to upstream. 891 did this with
+  `netdev_alloc_skb(ndev, headroom + dgram_len)` and a zero `headroom`; 893
+  has since replaced that line with a branch whose no-program arm is
+  `netdev_alloc_skb(link->ndev, dgram_len)`, which is the upstream call
+  exactly. What each of 890 through 893 does is in `xdp-methods-tested.md`;
+  it is not restated here.
 
 BBR3 is TX-side TCP congestion control and cannot stop a modem writing DMA;
 the freeze also kills ICMP, which BBR does not touch. `PCI_DEBUG` only adds log
@@ -422,21 +429,18 @@ Confirmed on the 2026-09-10 clean flash: `force_db_brst_disable` reads `Y` and
 both channels log "forcing doorbell writes" at 14 s, with nothing about mhi on
 `/proc/cmdline`.
 
-It cannot go on the kernel command line. `mhi` is a loadable module here
-(`kmod-mhi-bus`), and OpenWrt's kmodloader takes module options from
-`/etc/modules.conf` and from inline options in `/etc/modules.d/` files - it
-contains no `/proc/cmdline` parsing at all. The kernel accepts an
-`mhi.force_db_brst_disable=1` bootarg silently as an unused module parameter and
-it then never reaches the module.
+It cannot go on the kernel command line, and of the two files kmodloader does
+read it has to be `/etc/modules.d/`. That mechanism is build machinery and is
+stated once, in `x3000/README.md`; it is not restated here.
 
-Of the two files this originally used `/etc/modules.conf`, because kmodloader
-applies that one in `scan_module_folders()` on every invocation, including a
-manual `modprobe` after an `rmmod`, whereas `/etc/modules.d/` options are read
-only on the boot-loader path. It moved on 2026-09-10 for a reason that matters
-more in practice: `/etc/modules.conf` is a ubox conffile, and once a modified
-copy is on the router sysupgrade preserves it, so a later image can no longer
-change the value without `-n` or an edit on the device. That was confirmed on
-the clean flash - the on-disk hash stopped matching ubox's recorded checksum.
+What belongs here is why it moved. This originally used `/etc/modules.conf`,
+because kmodloader applies that one in `scan_module_folders()` on every
+invocation, including a manual `modprobe` after an `rmmod`, whereas
+`/etc/modules.d/` options are read only on the boot-loader path. It moved on
+2026-09-10 for a reason that matters more in practice: `/etc/modules.conf` is a
+ubox conffile, and once a modified copy is on the router sysupgrade preserves
+it, so a later image can no longer change the value. That was confirmed on the
+clean flash - the on-disk hash stopped matching ubox's recorded checksum.
 Nothing owns or preserves a file invented under `/etc/modules.d/`: it is a
 conffile of no package, and `keep.d/base-files-essential` lists only
 `/etc/hosts`, `/etc/passwd`, `/etc/sysctl.conf` and similar. So the image always

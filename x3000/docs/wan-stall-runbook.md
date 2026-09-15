@@ -29,7 +29,7 @@ If the router is affected too:
 
 | what the columns show | what it means |
 |---|---|
-| `dl_db` frozen while `dl_wp` keeps moving, `irq91` flat | the burst-mode doorbell case; 880 is the fix |
+| `dl_db` frozen while `dl_wp` keeps moving, `irq91` flat | the burst-mode doorbell case; 880 is the workaround |
 | `dl_qd` collapsing toward 0 | host ran out of RX buffers, which would make it mine |
 | RSRP or SINR falling apart in `5g-info` | the radio; no code change helps |
 | `er3_bk` climbing toward 1023 | the event drain loop fell behind |
@@ -59,7 +59,7 @@ would look like the fix.
 
 Check what it is set to:
 
-    cat /sys/module/mhi/parameters/force_db_brst_disable    # Y on a stock image
+    cat /sys/module/mhi/parameters/force_db_brst_disable    # Y on a current image from this tree
     dmesg | grep 'forcing doorbell writes'                  # names channels 100 and 101
 
 The A/B that is still missing runs the other way: turn it **off** while

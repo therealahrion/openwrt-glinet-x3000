@@ -136,7 +136,7 @@ and how to read its state on a running router:
 | **Attribution(s)** | N/A, written for this fork. |
 | **Reference(s)** | Design, hazards and the verification plan:<br>[x3000/docs/native-xdp-wwan-design.md](x3000/docs/native-xdp-wwan-design.md) |
 
-#### firewall4 — flow offload on a modem WAN
+#### 900 — firewall4 flow offload on a modem WAN
 
 | | |
 |:--|:--|
@@ -182,7 +182,7 @@ and how to read its state on a running router:
 |:--|:--|
 | **Path(s)** | [`x3000/config.common`](x3000/config.common) |
 | **Description** | Kernel BTF plus the XDP and tc-BPF userspace, so eBPF programs can be built, loaded and inspected on the router itself. Adds `DEBUG_INFO`, `DEBUG_INFO_BTF`, `BTF_MODULES`, `XDP_SOCKETS`, `BPF_EVENTS`, `CGROUP_BPF`, KPROBES and `PERF_EVENTS` to the kernel, and bpftool-full, libbpf, tc-bpf, xdp-loader, xdpdump, xdp-filter, kmod-sched-bpf and kmod-xdp-sockets-diag to the image. |
-| **Benefit(s)** | Portable eBPF binaries run unmodified here instead of being cross-compiled against a matching kernel elsewhere, and 891's XDP hook has something to attach. |
+| **Benefit(s)** | Portable eBPF binaries run unmodified here instead of being cross-compiled against a matching kernel elsewhere, and 893's XDP hook has something to attach. |
 | **Impact(s)** | Debug info has to stay un-reduced for BTF to build, which costs image size. Kernel modules are tied to this exact build, so they are baked in rather than installable afterwards. |
 | **Limitation(s)** | xdp-filter parses an Ethernet header, so it belongs on the wired ports rather than the raw-IP wwan0. |
 | **Attribution(s)** | N/A |
@@ -241,7 +241,7 @@ and how to read its state on a running router:
 | | |
 |:--|:--|
 | **Path(s)** | [`x3000/config.common`](x3000/config.common), [`x3000/files-common/etc/uci-defaults/`](x3000/files-common/etc/uci-defaults/) |
-| **Description** | Compressed-RAM swap (kmod-zram with the LZO, LZ4 and ZSTD backends, defaulting to lzo-rle at 256 MB), irqbalance to spread hardware interrupts across both cores, and packet steering enabled for all CPUs. First-boot scripts switch each one on, because all three ship disabled. |
+| **Description** | Compressed-RAM swap (kmod-zram with the LZO, LZ4 and ZSTD backends, defaulting to lz4 at 256 MiB), irqbalance to spread hardware interrupts across both cores, and packet steering enabled for all CPUs. First-boot scripts switch each one on, because all three ship disabled. |
 | **Benefit(s)** | 512 MB of RAM goes further, and receive work is not pinned to one of only two cores. |
 | **Impact(s)** | irqbalance moves hardware interrupt affinity while packet steering moves the NAPI threads and the steering mask, so the two can pull against each other - turn irqbalance off first if steering measurements come out noisy. |
 | **Limitation(s)** | All three live in /etc/config, which survives sysupgrade, so the running values can differ from what the image sets. Whether steering helps on this box has not been measured under load. |

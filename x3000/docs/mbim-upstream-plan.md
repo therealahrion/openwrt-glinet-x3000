@@ -6,6 +6,17 @@ the GRO claim a measurement instead of an argument.
 
 Nothing here has been sent.
 
+**Superseded in part, 2026-09-15.** 893 replaces 891's generic hook with a
+native one, built, flashed and proven on hardware - E1, `xdp-methods-tested.md`
+24.18. The series below is still 890 plus a hook, but the hook to send is 893,
+not 891, and that has to be a stated decision rather than an omission. Two
+consequences: section 6's `XDP_MODE_DRV` objection is dissolved rather than
+answered, because with 893 the hook really is native; and section 2's conclusion
+that the `do_xdp_generic()` delegation is the only shape keeping both halves of
+the contract is retracted - 893 keeps both, with the program still on
+`link->xdp_prog` so `netif_elide_gro()` never fires, and avoids the Ethernet
+misparse entirely. 890 is untouched by any of this and still stands on its own.
+
 **Direction, settled 2026-09-12 against the 6.12.103 tree: send the driver series.
 There is no core fix to send instead.** The 2026-09-11 entry here said the
 opposite; it was a plan resting on an unread call path. Section 2 records what the
@@ -350,11 +361,13 @@ other and aggregation held flat at 2.11-2.15x across them.
     driver mode against 2.09x with nothing attached, and 1.02x with the
     same program attached in skb mode.
 
-    The honest limit is stated in patch 2: MBIM NTB aggregation means
-    datagrams share one 32KB DMA buffer and each is copied out before the
-    program runs. This buys the earliest available drop point and
-    driver-context filtering, not the zero-copy page-flip path XDP has on
-    real NICs.
+    The honest limit is stated in patch 2: each datagram is copied out of
+    the NTB before the program runs, so this is not the zero-copy page-flip
+    path XDP has on real NICs. The copy is what makes each datagram
+    exclusively owned, which is what makes a hook on it possible at all.
+    An earlier draft of this paragraph said the datagrams share one 32KB
+    DMA buffer when the program runs. They do not: upstream already copies
+    each one out into its own buffer.
 
     Tested on a GL.iNet GL-X3000 (MT7981A, aarch64) with a Quectel
     RM520N-GL on mainline mhi_pci_generic + mhi_wwan_mbim, kernel 6.12.103.
@@ -362,7 +375,7 @@ other and aggregation held flat at 2.11-2.15x across them.
     stayed at zero throughout and no crash records appeared in pstore.
 
     Since exercised by a non-trivial program rather than a no-op: an XDP
-    object carrying three per-CPU maps, twenty-seven CO-RE field
+    object carrying three maps, two of them per-CPU, sixty-six CO-RE
     relocations against kernel BTF, and a bpf_xdp_flow_lookup() kfunc call
     per packet, run over seven windows across both address families at up
     to 456861 packets in a window. Two results bear on this patch. The

@@ -12,9 +12,13 @@ QModem vendor `pcie_mhi` stack. It does not any more: the modem is on mainline
 downlink MTU black-hole in field log #1 especially. Those findings have not been
 re-tested on the MBIM path and should not be acted on until they are.
 
-For the offload, XDP and flow-table material, `xdp-methods-tested.md` is the
-newer and more carefully verified document; where the two disagree, that one
-wins.
+**This whole file is a dated research record, 2026-09-04 to 2026-09-06. No
+status or "baked" claim in it is current.** `lean-overlay.md` is the authority
+on what the build contains; `xdp-methods-tested.md` is the authority on offload,
+XDP and flow-table technical claims. Where this file and either of those
+disagree, they win. What survives here is the reasoning - why DPDK was rejected,
+why AutoFDO is out of reach on Cortex-A53, the L4S and DualPI2 survey, the
+mt76 file-by-file assessment - none of which is recorded anywhere else.
 
 ## 1. The four layers — where every technique lives
 
@@ -401,7 +405,10 @@ claim checked against the on-disk tree (`target/linux/generic/config-6.12`,
 * Steering fully compiled: `RPS=y, XPS=y, RFS_ACCEL=y, NET_FLOW_LIMIT=y`
   — every runtime balancing knob is backed.
 * **WED** (WiFi↔eth hardware dispatch): `NET_MEDIATEK_SOC_WED=y`.
-* **Native XDP** in mtk_eth_soc (LAN side; modem rmnet = generic XDP only).
+* **Native XDP** in mtk_eth_soc (LAN side). *Retracted 2026-09-15: the second
+  half of this line said the modem could only ever have generic XDP. 893 runs
+  native XDP on the modem's receive path, proven on hardware - see
+  `xdp-methods-tested.md` 24.17 and 24.18.*
 * No cpufreq driver for MT7981 (`# CONFIG_CPU_FREQ is not set`, no OPP
   table in dtsi) → cores run at fixed max clock; there is no governor
   ramp-up latency to eliminate.
@@ -431,7 +438,9 @@ claim checked against the on-disk tree (`target/linux/generic/config-6.12`,
   is kernel-side and unaffected.
 
 **Decision point (vermagic, not performance): WireGuard is NOT in the
-image** — all four symbols unset. If WG is ever wanted it must be baked
+image** — all four symbols unset. *Overtaken: `kmod-wireguard`,
+`wireguard-tools` and `luci-proto-wireguard` are all set in
+`x3000/config.common` now.* If WG is ever wanted it must be baked
 pre-flash (`kmod-wireguard` auto-pulls the aarch64 NEON
 chacha/poly1305 lib kmods, which OpenWrt does package). Post-flash
 install is blocked by vermagic like any kmod.
@@ -467,7 +476,7 @@ patch, plus the MediaTek vendor feed.
   LED patch — zero performance patches. Generic
   hack/pending/backport-6.12 deltas: cpuinfo cosmetics, Motorcomm
   PHY/ethernet drivers (hardware this board does not have), regulator infra —
-  zero datapath. Meanwhile WE carry `870-tcp-bbr3.patch`, which they
+  zero datapath. Meanwhile this tree carries `870-tcp-bbr3.patch`, which they
   don't: this tree is *ahead* of the flagship optimization fork.
 * **The one real find — fullcone NAT** (`fullconenat` /
   `fullconenat-nft` packages + a firewall4 patch in ImmortalWrt): not
@@ -551,8 +560,8 @@ above: there is no known kernel-datapath patch for this SoC on this
 kernel that this tree is missing. The two real opportunities this pass
 produced are the **MHI GRO patch** and the **mt76 bump**.
 
-## REVIEW LIST (originated 2026-09-05; STATUS updated — see also the
-## reconciliation ledger above, which is authoritative)
+## REVIEW LIST (originated 2026-09-05; superseded — `lean-overlay.md` is the
+## authority on current build state)
 
 | Item | Kind | Status |
 |---|---|---|
@@ -957,10 +966,12 @@ no dualpi2/prague/etf) verified directly against this repo's 25.12 checkout.
 ## Branch state (2026-09-06): lean tree
 
 `openwrt-25.12` was reset to **vjt's latest tree + the lean optimization
-overlay** — see `x3000/docs/lean-overlay.md` for the exact contents and
-verification. QModem, qosify, sqm, zram, the modem-stack toggle and the
-rmnet MTU hotplug from the sections above are gone from this branch;
-they remain in git history (`ec64d13e08` and earlier). The research and
-field findings above stay valid as reference — the QModem-specific fixes
-(#1 MTU, #2 driver audit, #4 AT-MTU) do not apply to the ModemManager/
-MBIM data path this tree now builds.
+overlay**. What that overlay contains is `x3000/docs/lean-overlay.md`'s
+subject and is not restated here - it has moved on since this date. QModem,
+qosify, sqm, the modem-stack toggle and the rmnet MTU hotplug from the
+sections above are gone from this branch; they remain in git history
+(`ec64d13e08` and earlier). zram was in that list until 2026-09-15 and was
+wrong: it is in the image and active. The research and field findings above
+stay valid as reference — the QModem-specific fixes (#1 MTU, #2 driver audit,
+#4 AT-MTU) do not apply to the ModemManager/MBIM data path this tree now
+builds.

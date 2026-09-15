@@ -63,25 +63,34 @@ this repo's lean overlay. Paths are relative to
 
 **Sections 0 through 17 carry line numbers from earlier trees.** Sections 5 and 9
 already note this for themselves. Drift against the shipped kernel, re-measured
-2026-09-12 against a pristine `v6.12.103` checkout with this tree's patch set
-diffed against it:
+2026-09-15 by summing the hunk deltas of every patch in the tree that touches
+each file. **871, 872 and 873 changed these numbers**, so the 2026-09-12 table
+this replaces is retired:
 
 | source area | offset from pristine v6.12.103 | why |
 |---|---|---|
-| `net/core/dev.c` | **exactly +5 below line 3693** | one patch touches this file: `generic/hack-6.12/721-net-add-packet-mangeling.patch`, +5 lines at `xmit_one()`. Nothing else in the tree patches `dev.c` |
-| `include/linux/netdevice.h` | **+10 below line 2242** | patches 651 (+0), 721 (+1, +5, +4), 731 (+0) |
-| `net/core/gro.c`, `gro_cells.c`, `filter.c`, `kernel/bpf/*`, `net/xdp/*`, `net/netfilter/*` | **0** | unpatched in this tree; citations resolve as written |
+| `net/core/dev.c` | **+23 below line 746, +28 below 3688, +30 below 6695, +40 below 6718, +46 below 6794** | three patches touch it now: 872 (+23 at `dev_fill_forward_path()`), `generic/hack-6.12/721-net-add-packet-mangeling.patch` (+5 at `xmit_one()`), and 871 (+2, +10, +6 around `dev_set_threaded()` and `netif_napi_add_weight()`) |
+| `include/linux/netdevice.h` | **+1 below 392, +2 below 405, +12 below 2242** | 871 (+1, +1 at the NAPI state enum), then 721 (+1, +5, +4), 651 (+0), 731 (+0) |
+| `net/core/gro_cells.c` | **+17 below line 82** | 871 adds the opt-out in `gro_cells_init()` |
+| `net/core/xdp.c` | **+1 below 14, +26 below 650, +54 below 687** | 873 |
+| `net/core/gro.c`, `filter.c`, `include/net/xdp.h`, `kernel/bpf/*`, `net/xdp/*`, `net/netfilter/*` | **0** | unpatched in this tree; citations resolve as written |
 | `drivers/net/ethernet/mediatek/` | 300 to 600 | where the patches accumulate |
-| `drivers/net/wwan/mhi_wwan_mbim.c` | shifts with 890/891 | cite against pristine and say so, as sections 20 and 22 do |
+| `drivers/net/wwan/mhi_wwan_mbim.c` | shifts with 890/891/892/893 | cite against pristine and say so, as sections 20 and 22 do |
 
 So a `dev.c` citation in this file can be checked arithmetically rather than
-re-found: subtract 5 and it must match pristine v6.12.103. Fifteen citations were
-checked that way on 2026-09-12 and all fifteen matched, including
-`do_xdp_generic` 5621/5616, `sch_handle_ingress` 5661/5656, `generic_xdp_tx`
-5242/5237, `napi_threaded_poll_loop` 7004/6999 and the `dev_xdp_mode()` mode line
-9457/9452. **Section 19 is the resolved index** - citations verified against the
-shipped trees on 2026-09-11. Anything not listed there should be re-found by
-symbol name, not by line number:
+re-found, as long as the right band is used: a citation in the 5000s is pristine
++28, not +5. **The +5 rule that stood here until 2026-09-15 is wrong by 23 lines
+for everything below `dev_fill_forward_path()`**, which is every `dev.c` address
+in this document. The fifteen citations checked on 2026-09-12 - `do_xdp_generic`
+5621/5616, `sch_handle_ingress` 5661/5656, `generic_xdp_tx` 5242/5237,
+`napi_threaded_poll_loop` 7004/6999, the `dev_xdp_mode()` mode line 9457/9452 -
+were right for the tree of that date and their *shipped* halves have since moved;
+their pristine halves are unchanged and are the ones to trust.
+
+**Section 19 is the resolved index** - citations verified against the shipped
+trees on 2026-09-11, which is before 871, 872 and 873 existed, so its shipped
+column needs re-resolving before it is trusted again. Anything not listed there
+should be re-found by symbol name, not by line number:
 
     K=$(echo build_dir/target-*/linux-*/linux-6.12*)
     grep -n '<symbol>' "$K/<path>"
@@ -463,6 +472,10 @@ Caveat: it only helps where XDP runs *natively* — i.e. the wired ports. On
 
 ## 7. Recommendation
 
+> **Done, then superseded.** 891 was rebuilt on Method A, and 893 has since
+> replaced that hook with a native one - 24.17. Kept for the argument, not as a
+> recommendation.
+
 Switch 891's hook to **Method A**. It is one function replaced (`exp-a` is
 written and compiles clean), no kernel patch, and it:
 
@@ -480,6 +493,9 @@ For tc-BPF: use the raw-IP program shape above on `wwan0`, and keep
 ---
 
 ## 8. Still untested
+
+> **All three were settled on hardware:** the config confirmation in 20.5, the
+> link and everything else across 18, 20 and 23.
 
 - The full `vmlinux` + `modules` link (running; it will confirm modpost resolves
   `do_xdp_generic` and the Method-B export against a real `Module.symvers`).
@@ -1336,7 +1352,7 @@ What does still work there: `XDP_DROP`, `XDP_TX`, and `bpf_redirect()` /
 netdev to `xdp_do_redirect(dev, xdp, prog)` as a separate argument (line 1981);
 only helpers that read `rxq->dev` are affected.
 
-### 16.3 On wwan0 the helpers work and the pre-skb win does not exist
+### 16.3 On wwan0 the helpers work, and the pre-skb win was ruled out wrongly
 
 The modem path is the mirror image. 891 runs the program through
 `do_xdp_generic()`, and `bpf_prog_run_generic_xdp()` takes its rxq from
@@ -1370,7 +1386,7 @@ correct - redirect is fully wired, with the real device.
 
 |                                    | eth0 / eth1 (native) | wwan0 (891)   | br-lan, AP netdevs |
 |------------------------------------|----------------------|---------------|--------------------|
-| Hook runs before `sk_buff` alloc   | yes                  | no            | no                 |
+| Hook runs before `sk_buff` alloc   | yes                  | yes, via 893  | no                 |
 | `ctx->ingress_ifindex` usable      | no - dummy dev, 0    | yes           | yes                |
 | `bpf_xdp_flow_lookup()` usable     | no - dummy dev       | yes           | not in flowtable   |
 | `bpf_fib_lookup()` usable          | no                   | yes           | yes                |
@@ -1382,8 +1398,9 @@ Neither `mac80211` nor the bridge implements `ndo_bpf` - no `ndo_bpf` and no
 `br-lan` and the AP netdevs are generic-XDP-only.
 
 Reading down the columns: the ports where a program runs early cannot look a
-flow up, and the port where it can look a flow up cannot run early. And every
-packet that matters on this box crosses `wwan0`.
+flow up, and the port where it can look a flow up could not run early - until
+893, which gives `wwan0` both. See 24.17. And every packet that matters on this
+box crosses `wwan0`.
 
 ### 16.5 What survives, and it is not nothing
 
@@ -1620,7 +1637,7 @@ between the two trees; the fix is entirely in `wed.c`.
 | Attach point | Native XDP | Runs pre-skb | Flow lookup | Cost to attach | Verdict |
 |---|---|---|---|---|---|
 | `eth0`/`eth1` | yes | yes | no - dummy dev | link bounce, both ports | static filter only - see 18 |
-| `wwan0` | yes (891) | no - MBIM copy | yes | none | shape A, but see 17.2 |
+| `wwan0` | yes (891, then 893) | yes, via 893 | yes | none | shape A, but see 17.2 |
 | AP netdevs | no | no | n/a | **GRO and LRO off** | not worth it |
 | `br-lan` | no | no | n/a | GRO and LRO off | not worth it |
 
@@ -1812,7 +1829,7 @@ runtime; and it owns the NAPI the whole wired receive path runs inside.
 **#101 and #102 are unaffected**, and they do not need any of tonight's numbers.
 16.2 and 16.3 decide them, and both chains were re-read end to end against the
 shipped trees - see 19. A flow-aware fast path cannot be built on `eth0`/`eth1`,
-and `wwan0` has no pre-allocation win to capture.
+and `wwan0`'s pre-allocation win was ruled out wrongly - 893 captures it, 24.17.
 
 **14.3's independent argument for parking them is weaker than it reads.** Its
 headline rests on the `busy` columns, which are less exposed than its
@@ -1949,7 +1966,7 @@ number in sections 0-17.
 | the three `net_device_ops` tables, none with `ndo_bpf` | backports `mac80211/iface.c` | 896 / 934 / 1002 |
 | `grep -rl xdp net/mac80211/*.c *.h` = **no matches** | backports 6.18.39 | - |
 
-**Still not resolved.** One: `nf_tables_api.c:8460`, cited in section 9 for the
+**Still not resolved.** One: `nf_tables_api.c:8460`, cited in section 5 for the
 `hooknum != NF_NETDEV_INGRESS` rejection. The hook validation that returns
 `-EOPNOTSUPP` is at `2300`, `2311` and `2315` in this tree, and the claim the doc
 makes is consistent with that code, but I could not map it to a single line - so
@@ -2065,8 +2082,10 @@ Both working trees clean, both tracking
 - The zero-byte BPF objects were busybox lacking `base64`, not a paste failure
   (18.1, now fixed).
 - `/sys/class/net/wwan0/threaded` reads 0. 890 gives `wwan0` real NAPI instances
-  through gro_cells, which is what makes the `threaded` control meaningful at all
-  - it does not turn threading on. Measured: `napi/mtk_eth-5`, `napi/mtk_eth-6`
+  through gro_cells, which is what briefly made the `threaded` control do
+  something - a hazard rather than a feature, 23.21. 871 makes those NAPIs
+  decline threading, so the write is inert again, 24.14. It does not turn
+  threading on. Measured: `napi/mtk_eth-5`, `napi/mtk_eth-6`
   and six `napi/phy0-*` threads exist; there is no `napi/wwan0-*`.
 - `napi/mtk_eth-5` **and** `-6` both exist, confirming 18.4's reading that the
   driver registers one NAPI per direction on `eth->dummy_dev`.
@@ -2101,7 +2120,7 @@ explicitly disables the other. Evidence column points at the section or the
 | `gro_cells` | 891's hook | **compatible by construction. Measured.** | program held on `link->xdp_prog`, invisible to `netif_elide_gro()`. verify-xdp section 6 |
 | BTF | BPF CO-RE tooling | **required, present** | `DEBUG_INFO_BTF=y`, `_MODULES=y`; `/sys/kernel/btf/vmlinux` 3846 KB; per-module BTF present (20.5) |
 | BTF | `bpf_xdp_flow_lookup` kfunc | **required** | `net/netfilter/Makefile:147-151` gates `nf_flow_table_bpf.o` on `DEBUG_INFO_BTF_MODULES` / `DEBUG_INFO_BTF`. Without this repo's BTF platform the kfunc does not exist at all |
-| flowtable kfunc | native XDP on `eth0`/`eth1` | **incompatible, structurally** | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, ...)` then `nf_flowtable_by_dev()`, keyed on the `net_device *` **pointer** (`nf_flow_table_xdp.c:27-33`). The rxq carries `eth->dummy_dev` (`mtk_eth_soc.c:2115`), never inserted in any flowtable. Permanent `-ENOENT`; a correct `fib_tuple->ifindex` does not help, because the *table* is selected by the pointer (16.2, 18.7) |
+| flowtable kfunc | native XDP on `eth0`/`eth1` | **incompatible, structurally** | `bpf_xdp_flow_lookup()` ends in `bpf_xdp_flow_tuple_lookup(xdp->rxq->dev, ...)` then `nf_flowtable_by_dev()`, keyed on the `net_device *` **pointer** (`nf_flow_table_xdp.c:27-33`). The rxq carries `eth->dummy_dev` (`mtk_eth_soc.c:2115`), never inserted in any flowtable. Permanent `-ENOENT`; a correct `fib_tuple->ifindex` does not help, because the *table* is selected by the pointer (16.2, 18.4) |
 | hardware flow offload (PPE) | flowtable kfunc | **mutually exclusive** | 10.2 |
 | software flow offload | any per-packet netfilter rule on the same traffic | **mutually exclusive** | an offloaded flow is intercepted at the ingress hook and stops reaching prerouting and forward, so a per-packet rule sees the opening packets of each connection and then nothing. Observed 2026-09-12 with the flowtable on `br-lan`, `eth0` and `wwan0` and 10 of 34 conntrack entries in `OFFLOAD`. This is what rules out NFQUEUE-style inspection while offload is on; MSS clamping is unaffected because it acts at SYN |
 | software flow offload | GRO, and the driver RX path generally | **compatible** | offload shortcuts conntrack and the netfilter chains, not the driver or `gro_cells`. So it changes nothing measured here: every throughput and aggregation run terminated on the router through INPUT, which is never offloaded |
@@ -2191,13 +2210,13 @@ harness at a faster source.
 
 1. **Never attach in skb mode on this box.** It costs GRO and LRO everywhere, and
    on `wwan0` it costs the whole point of 890. Use native mode, which on the wired
-   ports is genuinely pre-skb and on `wwan0` is 891's hook.
+   ports is genuinely pre-skb, and on `wwan0` is 893's native hook.
 2. **A drop is the only verdict that is free.** `XDP_PASS` keeps everything;
    `XDP_DROP` additionally skips the skb, the stack and RPS. `XDP_TX` and
    `XDP_REDIRECT` both cost the shaper.
 3. **The flowtable kfunc is reachable from `wwan0` and not from the wired ports.**
-   That is the opposite of where the pre-skb saving is, which is why no
-   flow-aware fastpath fits this hardware (16.4).
+   That was the opposite of where the pre-skb saving was, until 893 put both
+   on `wwan0` - 24.17.
 4. **The BTF platform is load-bearing, not decorative.** It is what makes the
    flowtable kfunc exist at all, and what let the BBRv3 identity be proven from
    the module itself when OpenWrt had stripped the version tag (20.2).
@@ -2401,7 +2420,7 @@ One correction to the probe's own counters. The split between "miss" and
 (`nf_flow_table_bpf.c:49`) and the caller sets `opts->error` from it (`:96`), so
 an ordinary miss sets the error too. The 423 are flow misses.
 
-### 23.2 The redirect fires on nothing
+### 23.2 The redirect fires on nothing, in this configuration
 
 The dry run decides everything the fastpath would - direction, container walk,
 flags, teardown, `xmit_type`, egress ifindex, both NAT values - counts what it
@@ -2417,8 +2436,14 @@ would have done, and returns `XDP_PASS` without writing a byte. 236046 packets:
 | `not_direct` | **233093** |
 | `would_redirect` | **0** |
 
-142 + 2784 + 27 + 233093 = 236046. Every flow on this box is
+142 + 2784 + 27 + 233093 = 236046. Every flow in this window is
 `FLOW_OFFLOAD_XMIT_NEIGH`; not one is `XMIT_DIRECT`.
+
+> **Scope corrected, 2026-09-14 - see 23.17.** "Every flow on this box" was a
+> property of this configuration, not of the box. With the bridge ports created
+> in the flowtable by the `fw4` template rather than added to a live one, a wired
+> client reads `XMIT_DIRECT` on 100% of flowtable hits. What this window measured
+> is still what it measured.
 
 That is fatal to Shape A as 16.5 specified it, because the specification reads
 "builds an Ethernet header itself from `tuple.out.h_source` / `h_dest`" - and
@@ -3287,7 +3312,7 @@ instrument that settled it in one window was four `__builtin_preserve_field_info
 calls reporting what the loader actually wrote. **Where a value is patched at
 load time, print the patched value before theorising about it.**
 
-### 23.16 The macro was the bug, and XMIT_DIRECT was never reachable - 2026-09-14
+### 23.16 The macro was the bug, and XMIT_DIRECT was unreachable with the ports added live - 2026-09-14
 
 The hand extraction ran beside the macro on the same packets. One window,
 363290 packets, 99.9% IPv6:
@@ -3314,8 +3339,10 @@ and every `would_redirect` - was an artefact of the instrument.
 
 #### What this settles
 
-- **23.3 stands.** Every flow on this box is `FLOW_OFFLOAD_XMIT_NEIGH`, measured
-  now rather than argued. `would_redirect` is zero and always was. The
+- **23.3 stands for every configuration measured to this point.** Every flow
+  measured so far is `FLOW_OFFLOAD_XMIT_NEIGH`, measured now rather than argued,
+  and `would_redirect` is zero in every window up to here. 23.17 changes that
+  with the fw4 template. The
   retraction in 23.13 is withdrawn, and so is 23.14's "a floor, not a figure":
   there was no floor.
 - **The `dir`/`xmit_type` reads are fixed, not just diagnosed.** `read_bits()`
@@ -3712,6 +3739,11 @@ latency is still the only poor number here.
 **Do not run `gro-backlog-ab.sh --napi` or `--threaded`.** Both are gated behind
 `NAPI_I_ACCEPT_A_REBOOT=1`. Two runs, two dead WANs, two reboots, and no
 mechanism to show for it.
+
+> **Superseded on a tree carrying 871, 2026-09-15 - see 24.14.** The toggle is
+> inert on this build, proven on hardware: the write succeeds, reads back 1, and
+> creates no kthread. What follows is what happened on a build without 871, and
+> the gate stays for anyone running one.
 
 W0002 asks whether threading the gro_cells NAPI on `wwan0` reduces latency under
 load. The test toggles `/sys/class/net/wwan0/threaded` and measures throughput,
@@ -5316,10 +5348,10 @@ vendor SDK with its sparse checkout materialised.
 It was prompted by a fair challenge - that I had never once searched outside the
 tree in this round, and that I had asserted a hardware impossibility from a line
 in my own patch header. Both were true. The sweep overturned one of my claims,
-confirmed two, and produced a maintainer statement a month old that changes the
-calculus for the whole XDP-on-the-modem question.
+confirmed two, and turned up a maintainer statement a month old that anyone
+submitting XDP-on-the-modem work will need to know about.
 
-### 24.1 The position that matters: upstream has declined to make XDP work on non-Ethernet devices, in August 2026
+### 24.1 The upstream position on record: XDP on non-Ethernet devices, declined in August 2026
 
 `[PATCH net-next] net: xdp: don't assume an Ethernet header in generic XDP`,
 Jiayuan Chen, posted 2026-08-13, is the closest thing to this tree's whole
@@ -5489,7 +5521,8 @@ into a `frag_list` via `mhi_net_skb_agg()` (`mhi_wwan_mbim.c:366`, called
 at `:437` and `:452`). `mhi_mbim_rx()` then issues three
 `skb_copy_bits()` calls per datagram against a chained skb, and `skb_copy_bits()`
 re-walks `skb_walk_frags` from the head every time. **That is O(n^2) in chain
-length.** Smaller MRU means more chaining means slower. **E1/E2.**
+length.** Smaller MRU means more chaining means slower. **E2** - read from
+source. Whether the chaining path ever fires on this box is unmeasured.
 
 This also raises a question worth a counter on the live box: whether the modem
 ever exceeds 32 KB and triggers the chaining path *today*. If it fires at all,
@@ -5612,6 +5645,9 @@ with TOPS, and the conclusion survives.
 
 But completing the table is what matters, because MT7987 turns out to be the
 interesting case rather than the control:
+
+> **Superseded by the fuller table in 24.15**, which is read from `soc_data`
+> across the tree rather than assembled here, and corrects one row.
 
 | SoC | `.version` | `ppe_num` | RX descriptor | `tops`/`npu`/`pce` DT node |
 |---|---|---|---|---|
@@ -5838,10 +5874,11 @@ tree, and the next sweep will surface them again.
 * **W0026's payoff grading is unchanged.** Nothing here revisits the measurement
   that undercut "the modem path is CPU-bound by the copy": both cores at 20-26%
   at ~250 Mbps.
-* **The upstream calculus is worse than it was.** Three maintainers stated a
+* **What a submission is up against is now known.** Three maintainers stated a
   month ago that XDP is Ethernet-only and that the answer for non-Ethernet
-  devices is tc-BPF. A native-XDP-on-cellular series is now first-of-kind against
-  a stated position, not merely unprecedented.
+  devices is tc-BPF. A native-XDP-on-cellular series is first-of-kind against a
+  stated position rather than merely unprecedented. That bears on how it is
+  received, not on whether it works - 893 measured that it does.
 * **WED moves from E3 to E2 and stays closed.** So does the modem-as-PPE-ingress
   question, with a corrected mechanism and a new instrument hazard attached.
 * **One new open item**: whether the modem ever exceeds the 32 KB MRU today and
@@ -6028,9 +6065,10 @@ is exactly what would make the shared config's dead `=y` line live -
 driver-claimed range exclusive, and `mtk_eth_soc` claims this entire window
 through `devm_platform_ioremap_resource()`. The probe would read nothing.
 
-#### 873, written and dropped
+#### An mtk_eth_soc register probe, written and dropped
 
-Before the config route was understood I wrote a temporary patch, 873, that read
+Before the config route was understood I wrote a temporary, unnumbered patch that
+read
 the same fourteen offsets from inside `mtk_eth_soc` through the ioremap
 `mtk_probe()` already holds, exposed at `/sys/kernel/debug/mtk_fe_probe`. It
 worked on paper - applied at `--fuzz=0` against the fully patched tree, compiled
@@ -6510,8 +6548,9 @@ all three core-net patches coexist: 871's four `NAPI_STATE_NO_THREAD` sites in
 helper was compiled standalone and checked on IPv4, IPv6, a junk nibble and a
 zero-length frame.
 
-**Not built, not flashed, and not reproducible on this box yet** - nothing on
-`wwan0` reaches the native path until 893 is built, which is the whole point.
+**Not reproducible on this box yet.** 893 is built and flashed (24.18), so the
+native path exists on `wwan0` now; what has not run is the cpumap redirect that
+exercises this patch - T0059.
 893 is written (24.17) and its verification plan reproduces this deliberately:
 redirect into a cpumap with 873 reverted, confirm the drop, reapply, confirm the
 recovery.
@@ -6580,11 +6619,12 @@ break on such a device - cpumap Rx and `ndo_xdp_xmit` - turned out to be
 exactly 873 and the XDP_TX limitation above, which is a point in his favour and
 worth saying plainly.
 
-**Status: E2, applies at `--fuzz=0` over 870 through 892. Not built, not
-flashed, not measured.** It shares `mhi_wwan_mbim.c` with 890, 891 and 892 and
-must apply after them. The cpumap payoff is gated on 873 (W0045). The
-verification plan is five tests, T0056 through T0060 on the matrix, against a
-build (B0011) that does not exist yet.
+**Status: E1 for the two tests 24.18 ran, E2 for the rest. Applies at
+`--fuzz=0` over 870 through 892.** It shares `mhi_wwan_mbim.c` with 890, 891 and
+892 and must apply after them. The cpumap payoff is gated on 873 (W0045). The
+verification plan is five tests, T0056 through T0060 on the matrix, against
+build B0011, which is flashed: T0056 and T0060 are closed in 24.18, and T0057
+through T0059 are open.
 
 **One thing this makes stale**: `x3000/docs/verify-xdp.sh` tests the generic
 hook 893 replaces. Its attach steps still work - a program still attaches - but
@@ -6665,5 +6705,10 @@ while `ping` reports replies, is a generator that never ran.
 Two things follow. First, a counter must be shown to move before any derived
 measurement is believed - which is why `verify-xdp.sh` now gates every BPF
 counter behind an observed rx_packets delta rather than assuming the traffic
-happened. Second, never discard a generator's output and status. Both changes
-are in the durable script rather than in the next one-off.
+happened. The gate is `bs_traffic_gate` in `boxstate.sh`, called from
+`verify-xdp.sh`; it refuses to report success if the interface moved no
+packets in either direction. The program this section measures with is
+`bpf/xdp_tail_probe.bpf`, sha256
+`2e34ea12f2189b307f6ccfcee5daf55f1632554ac6d6272a68d812198f639f31`. Second,
+never discard a generator's output and status. Both changes are in the durable
+script rather than in the next one-off.

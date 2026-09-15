@@ -12,7 +12,7 @@ The GL.iNet stock firmware ships an old OpenWrt 21.02 + kernel 5.4
 + a vendor-patched `pcie_mhi` driver that's never been upstreamed.
 Vanilla OpenWrt 25.12 (kernel 6.12) supports the rest of the device
 out of the box but needs four small fixes before the modem actually
-comes up, stays up under load, and lets us keep using our own AT
+comes up, stays up under load, and leaves the AT ports usable by the tools that need them
 helpers alongside ModemManager:
 
 1. **`mhi_pci_generic` doesn't recognise the RM520N-GL's PCI ID.**
@@ -20,7 +20,7 @@ helpers alongside ModemManager:
    vendor ID + a Qualcomm subvendor ID (0x17cb / 0x0308 / 0x17cb /
    0x5201) instead of Quectel's own. Mainline `mhi_pci_generic`
    doesn't list that combination, so the modem never enumerates as
-   an MHI device. We carry a 12-line kernel patch under
+   an MHI device. This tree carries a 12-line kernel patch under
    `target/linux/generic/pending-6.12/gl-x3000-quectel-pci-id.patch`
    that adds it.
 
@@ -30,7 +30,7 @@ helpers alongside ModemManager:
    the modem firmware sees a malformed TLP and resets, and the host
    gets stuck spinning on `[14] CmpltTO` AER interrupts. Only a host
    reboot recovers — runtime sysfs toggles like `power/control=on`
-   reach the device too late. We pin `pcie_port_pm=off` in the
+   reach the device too late. `pcie_port_pm=off` is pinned in the
    chosen bootargs (`target/linux/mediatek/dts/mt7981a-glinet-gl-x3000-xe3000-common.dtsi`)
    so the kernel never tries to take the link down.
 
@@ -66,15 +66,15 @@ helpers alongside ModemManager:
    shell scripts that call `mmcli --report-kernel-event`. There's no
    equivalent of udev's `ID_MM_DEVICE_IGNORE` blacklist in this
    build, so MM grabs every tty it sees — including the RM520N's
-   USB-side `/dev/ttyUSB[0-3]` (DIAG/NMEA/AT/AT2), which our
+   USB-side `/dev/ttyUSB[0-3]` (DIAG/NMEA/AT/AT2), which the
    `quectel-5g-tools` helpers (`5g-info`, `5g-monitor`, `5g-lock`,
-   `5g-led-bars`) need to talk raw AT to. We patch the tty hotplug
+   `5g-led-bars`) need to talk raw AT to. The tty hotplug script is patched
    script via `x3000/patches/0001-modemmanager-tty-honour-ignore-tty.patch`
    to honour an `/etc/modemmanager/ignore-tty` allow-list (shipped
    by `quectel-5g-tools`) so MM keeps managing only the MHI control
    surface (`/dev/wwan0at0`, `/dev/wwan0mbim0`).
 
-4. **curl autodetects the brotli we keep around for android-tools.**
+4. **curl autodetects the brotli kept around for android-tools.**
    `android-tools` pulls libbrotli into staging, OpenWrt's curl
    Makefile has no DEPENDS line for it, and curl's configure happily
    links libcurl against `libbrotlidec.so.1` if it sees the headers
@@ -96,7 +96,8 @@ and `/etc/modules.d/` only -- never from `/proc/cmdline` -- so a kernel
 bootarg would be silently ignored. Of those two, `/etc/modules.d/` is the
 one to use: `/etc/modules.conf` is a ubox conffile, so once modified it
 survives every flash and a later image can no longer change the value.
-Hence `x3000/files-common/etc/modules.d/mhi-doorbell`.
+Anything set this way therefore goes in a drop-in under
+`/etc/modules.d/`.
 
 ## What's different from a stock OpenWrt 25.12 build
 
@@ -142,7 +143,7 @@ And adds:
     `5g-lock`, `modem-debug` reading `/dev/ttyUSB2`; the `5g-led-bars`
     procd daemon driving the panel signal LEDs from PCC/SCC NR-RSRP;
     a Prometheus collector; the `/etc/modemmanager/ignore-tty`
-    config telling our patched MM hotplug script which tty ports
+    config telling the patched MM hotplug script which tty ports
     to leave alone).
   * **pciutils + usbutils** (lspci / lsusb baked in for diagnosing
     modem PCIe / USB topology).
@@ -361,40 +362,61 @@ x3000/
 ├── docs/               Reference documents. One subject per file, and the
                         named file is the authority for that subject —
                         follow the pointer rather than re-deriving.
-│   ├── lean-overlay.md            Inventory: what the overlay adds, why,
-                                   where each lever lives, what stays out
-                                   on purpose, and the known gaps.
-│   ├── xdp-methods-tested.md      XDP / eBPF / GRO / BTF on this
-                                   hardware. Every method tried and what
-                                   it measured, the feature interaction
-                                   matrix, the resolved source-citation
-                                   index, and the kernel line-number
-                                   offsets this build carries.
-│   ├── qos-latency-research.md    Queueing, pacing and congestion-control
-                                   research, appended by round and dated.
-                                   Predates the file above; for offload,
-                                   XDP and flow-table claims that one wins.
-│   ├── downlink-stall.md          The wwan0 downlink stall: captures,
-                                   analysis, and how it was settled.
-│   ├── wan-stall-runbook.md       What to do when the WAN hangs. Capture
-                                   first; do not fix it.
-│   ├── mhi-upstream-report.md     Draft report of the MHI doorbell
-                                   deadlock for the MHI maintainers.
-│   ├── mbim-upstream-plan.md      Plan for sending 890 and 891 to netdev,
-                                   with the reviewer answers worked out.
-│   ├── verify-xdp.sh              On-router verifier for the 870-893 XDP
-                                   platform. Extend this rather than
-                                   writing another one-off sampler.
-│   ├── verify-xdp-sources.md      The BPF programs it loads, and their
-                                   checksums.
-│   ├── bpf/                       Their compiled objects, fetched by the
-                                   script at run time.
-│   ├── gro-backlog-ab.sh          Load-driven A/B harness for GRO and
-                                   the receive backlog. Needs real WAN
-                                   traffic to mean anything.
-│   ├── modem-nv-state.md          Settings that live in the modem's own
-                                   NV, not in this repo.
-│   └── cake-wan.init              Reference cake shaper. NOT installed.
+│   ├── lean-overlay.md               Inventory: what the overlay adds, why,
+                                      where each lever lives, what stays out
+                                      on purpose, and the known gaps.
+│   ├── xdp-methods-tested.md         XDP / eBPF / GRO / BTF on this hardware.
+                                      The canonical record: every method tried
+                                      and what it measured, the feature
+                                      interaction matrix, the resolved
+                                      source-citation index, and the kernel
+                                      line-number offsets this build carries.
+│   ├── native-xdp-wwan-design.md     Design note for the native XDP hook on
+                                      the modem receive path, with its
+                                      verification plan.
+│   ├── qos-latency-research.md       Queueing, pacing and congestion-control
+                                      research, appended by round and dated. A
+                                      record of its period, not of the current
+                                      build; where it and the two files above
+                                      disagree, they win.
+│   ├── downlink-stall.md             The wwan0 downlink stall: captures,
+                                      analysis, and how it was settled. Owns
+                                      every number in that cluster.
+│   ├── wan-stall-runbook.md          What to do when the WAN hangs. Capture
+                                      first; do not fix it.
+│   ├── mhi-upstream-report.md        Draft report of the MHI doorbell
+                                      deadlock for the MHI maintainers. A copy
+                                      by construction, so it can be pasted
+                                      into mail.
+│   ├── mbim-upstream-plan.md         Plan for sending the MBIM GRO and XDP
+                                      work to netdev, with the reviewer
+                                      answers worked out.
+│   ├── modem-nv-state.md             Settings that live in the modem’s own
+                                      NV, not in this repo.
+│   ├── boxstate.sh                   Shared preflight and state reader. Run
+                                      this first; the other scripts source it.
+│   ├── verify-xdp.sh                 On-router verifier for the XDP platform.
+                                      Extend this rather than writing another
+                                      one-off sampler.
+│   ├── verify-xdp-sources.md         The BPF programs it loads, their sources
+                                      and their checksums.
+│   ├── xdp-ft-wwan.sh                Flowtable-driven XDP fast-path harness
+                                      for the modem WAN.
+│   ├── xdp-ft-wwan-sources.md        Its BPF source, build recipe and
+                                      checksums.
+│   ├── bpf/                          The compiled objects, fetched by the
+                                      scripts at run time.
+│   ├── gro-backlog-ab.sh             Load-driven A/B harness for GRO and the
+                                      receive backlog. Needs real WAN traffic
+                                      to mean anything.
+│   ├── flowtable-ports.sh            Rebuilds the flowtable with the bridge
+                                      ports in it.
+│   ├── fe-probe.sh                   Frame-engine register reader. Read only.
+│   ├── wifi-encap.sh                 Toggles the AP’s 802.3 encap offload for
+                                      A/B runs.
+│   ├── wifiload.py                   Wi-Fi load generator. Runs on a PC, not
+                                      the router.
+│   └── cake-wan.init                 Reference cake shaper. NOT installed.
 ├── prepare.sh          Variant-aware tree setup: feeds-local/, feeds.conf,
                         composes .config and files/ from common + variant
                         sources, applies x3000/patches/ with `-F 0`.
@@ -413,10 +435,9 @@ x3000/
 ├── config.private.local *(optional, gitignored)* extra CONFIG_PACKAGE_…
                         lines for your private build. Appended to .config
                         after config.private.
-├── files-common/       Rootfs overlay shipped in every variant. Holds
-                        etc/modules.d/mhi-doorbell, which enables the MHI
-                        doorbell workaround, the diagnostic tools under
-                        usr/bin/, and the sysctl and uci-defaults drop-ins.
+├── files-common/       Rootfs overlay shipped in every variant. Its
+                        contents come from this fork; the repo-root
+                        README.md lists them.
 ├── files-private/      Rootfs overlay only in private. Per-builder slot:
                         only .gitkeep is tracked, all contents are
                         gitignored, so each builder keeps their internal
@@ -435,25 +456,14 @@ target/linux/generic/pending-6.12/
 target/linux/mediatek/dts/
 └── mt7981a-glinet-gl-x3000-xe3000-common.dtsi   pcie_port_pm=off
                                                  (commit 4087faad55).
-target/linux/mediatek/patches-6.12/   My kernel patches. Numbered 99x so
-                        they sort last and stay obviously mine. 891
-                        applies after 890; the rest are independent.
-├── 870-tcp-bbr3.patch                     BBRv3.
-├── 890-net-wwan-mhi_wwan_mbim-gro-cells-rx.patch
-                                           Modem RX through gro_cells.
-├── 891-net-wwan-mhi_wwan_mbim-native-xdp.patch
-                                           XDP hook on the same path.
-├── 880-bus-mhi-host-optional-doorbell-write.patch
-                                           MHI doorbell writes.
-└── 892-net-wwan-mhi_wwan_mbim-validate-ndp-chain-and-datagram-bounds.patch
-                                           Modem input validation.
+target/linux/mediatek/patches-6.12/   This fork's own kernel patches, and
 package/network/config/firewall4/patches/
-└── 900-flowtable-fall-back-to-l3-device.patch
-                        Lets an L3-only interface, which is what
-                        ModemManager produces, into the flow table.
+                        its own firewall4 patch. Both are listed, with
+                        what each one does, in the repo-root README.md,
+                        which is where this fork's work belongs.
 ```
 
-What each of those six does and why it is worth carrying: **Patches and
+What each patch this fork adds does and why it is worth carrying: **Patches and
 Enhancements** in the repo-root `README.md`. Where each lever
 lives and how to confirm it in a running image:
 `x3000/docs/lean-overlay.md`.

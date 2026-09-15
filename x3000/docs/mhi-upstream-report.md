@@ -3,6 +3,14 @@
 Not sent yet. This is the report to send, kept here so the argument and
 the evidence stay in one place and stay revisable.
 
+**This file is a copy by construction.** It has to be self-contained when
+pasted into mail, so it restates evidence that `downlink-stall.md` owns: the
+09:26 capture block, the `states` dump, the Qualcomm DT binding quote, the
+mainline diff result, and the symptom's duration and onset threshold. A number
+here is corrected in `downlink-stall.md` first and then re-copied. That rule
+exists because it has already failed once - the MMIO-write cost was wrong here
+for a while and right everywhere else.
+
 ## Where it goes
 
     M:  Manivannan Sadhasivam <manivannan.sadhasivam@linaro.org>
@@ -138,7 +146,7 @@ A module parameter on `mhi`, default off, that downgrades `MHI_DB_BRST_ENABLE`
 channels to `MHI_DB_BRST_DISABLE` in `parse_ch_cfg()` so the doorbell is written
 unconditionally on every queued buffer. With it on, `db` tracks `wp` on every
 sample and the stalls stop; the box has held sustained 250+ Mbps in the band
-where it previously deadlocked. Cost is two MMIO writes per queued buffer.
+where it previously deadlocked. Cost is one MMIO write per queued buffer.
 
 I am not proposing that as the fix. It is a bisection tool.
 
@@ -161,7 +169,7 @@ The reverse direction has not been run. I have a clean capture of the deadlock
 with the workaround off, and sustained clean operation with it on, but not a
 controlled reproduction at matched throughput with it switched back off. A
 maintainer will reasonably ask for that, and it should be produced before
-sending. It is tracked here as task #90.
+sending. It is tracked in `downlink-stall.md` under "Still open".
 
 Also worth stating plainly: the pointer values above need
 `CONFIG_MHI_BUS_DEBUG=y` and `kernel.kptr_restrict=1`, since the driver's own

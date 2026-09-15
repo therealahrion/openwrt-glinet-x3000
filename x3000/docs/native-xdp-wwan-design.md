@@ -1,8 +1,10 @@
 # Native XDP on wwan0: design note
 
-Status: **written as 893. Nothing here is built, and nothing here is measured.**
-Every API contract below was read at `v6.12.103`; every statement about this
-tree's driver was read against the source after 890, 891 and 892 are applied.
+Status: **written as 893, built, flashed and measured.** Native XDP on
+`wwan0` is proven on this hardware, E1, 2026-09-15 - see `xdp-methods-tested.md`
+24.18. Every API contract below was read at `v6.12.103`; every statement about
+this tree's driver was read against the source after 890, 891 and 892 are
+applied, and 893 now sits on top of them.
 
 This supersedes the framing in W0026. It is not a page-pool rewrite.
 
@@ -49,9 +51,10 @@ wrapped in an skb *before* the program runs instead of after.
 
 ## What the driver has, and what it lacks
 
-Counted in the tree with the full series applied.
+Counted with 890, 891 and 892 applied and before 893. This is the gap 893
+closed: everything in the right-hand column is a symbol 893 adds.
 
-| present (891 built this) | count | missing | count |
+| present before 893 (891 built this) | count | missing then | count |
 |---|---|---|---|
 | `ndo_bpf` | 4 | `xdp_rxq_info_reg` | 0 |
 | `xdp_prog` | 12 | `xdp_init_buff` | 0 |
@@ -212,13 +215,16 @@ reviewable.
 
 ## Verification plan
 
-Nothing here is measured, so the plan matters more than the code. These are
-T0056 through T0060 on the matrix, against build B0011, which does not exist
-yet.
+These are T0056 through T0060 on the matrix, against build B0011. T0056 and
+T0060 are proven on hardware, E1, 2026-09-15; T0057, T0058 and T0059 are still
+open.
 
-1. **Attach a counting program and confirm the path is native**, not generic -
-   `bpftool prog show` reports the type, and the generic path's
-   `do_xdp_generic()` call disappears from the flow.
+1. **Attach a counting program and confirm the path is native**, not generic.
+   **Done - T0056, PASS, 15 Sep.** The method written here first was wrong:
+   891 and 893 both attach through the same `ndo_bpf`, so both report
+   `prog/xdp id N` and `bpftool prog show` cannot tell them apart. What works
+   is the tail probe in item 5, run twice - `bpf_xdp_adjust_tail(+64)` returns
+   `-EINVAL` on a native attach and `0` on a generic one.
 2. **XDP_DROP at rate**, with `/proc/net/dev` on `wwan0` showing packets
    received and nothing delivered upward, and CPU time in the DL tasklet
    compared against the same program under generic XDP. That difference is the
@@ -230,7 +236,9 @@ yet.
    survive; without 873 it will not, and confirming that failure first is a
    direct reproduction of W0045.
 5. **A program that grows the tail**, confirming `-EINVAL` rather than
-   corruption, given the allocation leaves no tail slack.
+   corruption, given the allocation leaves no tail slack. **Done - T0060,
+   PASS, 15 Sep:** the helper returned `18446744073709551594`, which is
+   `2**64 - 22`, i.e. `-EINVAL`. The object is `bpf/xdp_tail_probe.bpf`.
 
 ## Where this stands with upstream
 

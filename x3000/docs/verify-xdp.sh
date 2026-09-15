@@ -24,7 +24,7 @@ info() { printf '          %s\n' "$1"; }
 hdr()  { printf '\n===== %s =====\n' "$1"; }
 
 WANIF=${WANIF:-wwan0}
-D=/tmp/verify992a; rm -rf $D; mkdir -p $D
+D=/tmp/verify-xdp; rm -rf $D; mkdir -p $D
 
 # Capture flags NOW: gro_measure() uses `set --`, which would clobber "$@".
 for a in "$@"; do
@@ -178,7 +178,7 @@ hdr "0. identity"
 info "$(uname -srvm)"
 info "board: $(cat /tmp/sysinfo/model 2>/dev/null || echo unknown)"
 info "kernel build stamp: $(uname -v)   <- must match the HEAD this was built from"
-for f in $D/xdp_pass.o $D/xdp_drop.o $D/tc_rawip.o; do
+for f in $D/xdp_pass.o $D/xdp_drop.o $D/tc_rawip.o $D/xdp_tail_probe.o; do
 	[ -s "$f" ] || bad "missing $f -- put the .bpf files in $BPF_DIR, or allow the router to reach $BPF_URL"
 done
 [ -s $D/xdp_pass.o ] && ok "BPF objects available ($(wc -c < $D/xdp_pass.o) bytes for xdp_pass.o)"

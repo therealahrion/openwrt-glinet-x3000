@@ -1,10 +1,9 @@
 # BPF source for `xdp-ft-wwan.sh`
 
-Same arrangement as `verify-xdp-sources.md`, for the same reasons: the objects
-live in `bpf/` as `.bpf` files so the repo's blanket `*.o` rule does not swallow
-them, they ship as files rather than base64 because busybox here has no `base64`
-applet, and each source sits next to its object so the object is auditable and
-reproducible.
+Same arrangement as `verify-xdp-sources.md`, which owns the reasons for it and
+states them once. The difference is scale: this program is roughly 700 lines,
+where the objects in that file are a dozen each, so its source stays in `bpf/`
+rather than inline here.
 
 | file | what it is |
 |---|---|
@@ -19,7 +18,7 @@ prog loadall` fails the whole object when any single program in it fails to
 relocate, so while the fastpath could not relocate it took the probe down with
 it. That is fixed. What is still true, and is now the reason, is that
 `xdp_ft_probe.bpf` carries **no CO-RE relocations at all** where
-`xdp_ft_wwan.bpf` carries sixty-two: the probe reads nothing out of `struct
+`xdp_ft_wwan.bpf` carries sixty-six: the probe reads nothing out of `struct
 flow_offload_tuple`, only tests the returned pointer for NULL. If a kernel bump
 breaks the struct mirrors, the probe still answers whether the kfunc itself
 works. It is the canary, and canaries are kept in their own cage.
@@ -200,7 +199,7 @@ never needed to be trusted. `bpf_probe_read_kernel` is reachable from XDP under
 
 Removing the cast removes the object's only `TYPE_ID_TARGET` relocation. The
 remaining 27 were all `FIELD_*` and resolved unchanged. The current object, with
-both families, carries 62 — 40 `FIELD_BYTE_OFFSET`, 20 more for the two bitfield
+both families, carries 66 — 50 `FIELD_BYTE_OFFSET`, 4 `FIELD_BYTE_SIZE`, 4 each of the two bitfield
 reads, and 2 `TYPE_SIZE` — and still not one type-id relocation. A rebuild that
 produces one has reintroduced the bug.
 
@@ -212,7 +211,7 @@ probe read is the portable one.
 `bpf_core_type_size()` is safe where `bpf_core_type_id_kernel()` is not, and for
 exactly the same reason the field relocations are: its value comes from the
 layout, which every candidate agrees on, rather than from an index into one
-particular BTF. The object now carries two `TYPE_SIZE` relocations and no
+particular BTF. The object now carries four `TYPE_SIZE` relocations and no
 type-id relocation at all.
 
 ## `BPF_CORE_READ_BITFIELD_PROBED` is broken on this kernel
@@ -726,26 +725,21 @@ both ports, the egress ifindex and both MAC addresses — and checks every read
 before `commit()` touches a byte, which is the property described under *Reads
 are gathered before anything is written* above.
 
-Still open, in order of how much they matter:
+Still open:
 
-- **`would_redirect` is non-zero for the first time, and is not yet
-  trustworthy.** 221258 packets, 48% of an IPv6 window. The same window read
-  `tuple.dir` back as 2 or 3 on 41–50% of its lookups, which the kernel cannot
-  hold — `dir` is written once at `nf_flow_table_core.c:27` and then used as a
-  `container_of` index, so a 2 or 3 would fault the kernel before this program
-  saw it. Since `dir` selects the container walk and the NAT peer fields, a read
-  wrong half the time is not reliably right the rest of it. This revision adds
-  the counters that discriminate the candidates — `l3_ok`/`iif_ok` checked
-  against the packet, and `xmit_type` read from the same byte as the bad `dir`.
-  Nothing about the redirect should be believed until they come back.
-- **`XMIT_DIRECT` is reachable after all** — the claim above that it is not is
-  retracted; see `xdp-methods-tested.md` 23.13. The hardware-offload route at
-  `:168` is still closed by construction, but the `DEV_PATH_BRIDGE` route at
-  `:154` is open.
-- **Three variables move together** between the windows that redirect and the
-  ones that do not: address family, wired against WiFi, and which bridge port
-  the flow uses. One at a time will separate them; asserting the family
-  explanation now would repeat the mistake the 0.8% figure made.
 - **The rewrite has never executed.** Not once, in either family, so the
   checksum arithmetic has been through a compiler and a disassembler and
   nothing else.
+
+Three items that stood here have since been closed, in this file and in the
+canonical record, and are removed rather than left to mislead a reader who
+stops at the end:
+
+- The untrustworthy `would_redirect` figure was the broken bitfield macro, not
+  the traffic. Replaced by `read_bits()` — see *What replaced it* above, and
+  `xdp-methods-tested.md` 23.16.
+- `XMIT_DIRECT` is reachable, and which bridge port the flow uses is what
+  decides it — *Why nothing was XMIT_DIRECT, and what fixed it* above, and
+  23.17.
+- The three variables were separated one at a time: the bridge port decides it,
+  only wired ports qualify, and Wi-Fi is structural — 23.18.

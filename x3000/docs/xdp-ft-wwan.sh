@@ -20,7 +20,7 @@
 #
 # Two objects, for one reason that is still good. xdp_ft_probe.bpf reads nothing
 # out of struct flow_offload_tuple and so carries no CO-RE relocations at all,
-# while xdp_ft_wwan.bpf carries sixty-two. If a kernel bump breaks the struct
+# while xdp_ft_wwan.bpf carries sixty-six. If a kernel bump breaks the struct
 # mirrors, the probe still answers whether the kfunc itself works. The original
 # reason - that a relocation in the fastpath could not resolve and bpftool
 # loadall fails a whole object when one program fails - no longer applies.
